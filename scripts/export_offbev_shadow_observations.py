@@ -149,6 +149,9 @@ def main():
                     checked_write_image(path, view)
                     paths.append(str(path))
                 observations.append({"id": identifier, "region_mask": str(region_path), "scene_name": record.scene_name, "sample_token": record.token, "camera": camera_name, "official_split": args.split, "images": paths, "image_crops_xyxy": [tight, tight, context], "previous_context_crop_xyxy": context if previous_image is not None else None, "previous_sample_token": previous_sample_token, "previous_to_current_homography": previous_homography, "image": str(camera.image_path.resolve()), "timestamp": record.timestamp, "candidates": bank, "bev_bounds_xyxy": bounds, "visible_shadow_point_ratio": float(visible.mean()), "shadow_centroid_xy_ego": xy.mean(axis=0).tolist(), "label_source": "unlabeled", "observation_source": "segmenter_filtered_pseudo_mask" if segmenter is not None else "pseudo_shadow_mask", "caster_gt_used_for_observation": False})
+    for observation in observations:
+        observation.update(shadow_label="YES", shadow_label_source="geometry_weak",
+                           shadow_evidence={"method": observation["observation_source"], "is_shadow_gt": False})
     write_rows(output/"observations.jsonl", observations)
     write_json(output/"observation_protocol.json", {**vars(args), "observations": len(observations), "bounds": bounds, "candidates": "both shadow-axis directions, outside-region uncertainty cells; no caster GT used", "previous_frame_alignment": "ego-motion world ground only; no hidden-caster GT motion is supplied as input"})
 

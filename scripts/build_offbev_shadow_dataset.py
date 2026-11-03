@@ -136,6 +136,8 @@ def main():
                 raise FileNotFoundError("Missing off-BEV observation image")
             question = prompt+"\nNominal BEV [xmin,ymin,xmax,ymax] metres: "+json.dumps(bounds)+"\nOutside candidate regions (ego coordinates, metres): "+json.dumps(bank, separators=(",", ":"))+"\nReturn {\"decision\":\"POTENTIAL\",\"candidate_id\":\"H1\"} using a listed ID, or {\"decision\":\"ABSTAIN\",\"candidate_id\":null}."
             item = {**observation, "images": images, "task": "offbev_caster", "split": split, "prompt": question, "answer": answer, "label_source": source, "target_decision": decision, "valid_candidate_ids": valid_ids, "target_annotation_token": target["annotation_token"] if target else None, "target_instance_token": target["instance_token"] if target else None, "target_center_xy_ego": target["caster_center_ego"][:2] if target else None, "target_category": target["caster_category"] if target else None, "target_visibility": visibility, "supervision_note": "GT object existence/location does not itself establish a shadow-caster association"}
+            item["association_source"] = source
+            item["shadow_label_source"] = observation.get("shadow_label_source", "unlabeled")
             datasets[split].append(item)
             counts[f"{split}_{source}_{decision}"] += 1
     assert_disjoint(datasets["train"], datasets["dev"]+datasets["eval"])

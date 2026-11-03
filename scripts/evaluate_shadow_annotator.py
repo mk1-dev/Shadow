@@ -63,6 +63,10 @@ def main():
             signature = hashlib.sha256(json.dumps({"images": row["images"], "prompt": row["prompt"]}, sort_keys=True).encode()).hexdigest()
             target = row.get("annotation_target")
             results.append({"id": row["id"], "parent_id": row.get("parent_id"), "scene_name": row["scene_name"], "input_signature": signature, "target": target, "shadow_label_source": row["shadow_label_source"], "association_source": row["association_source"], "known_outside_caster": row.get("known_outside_caster", False), "prediction": prediction, "raw_answer": text, "parse_error": error, "region_mask": row.get("region_mask"), "shadow_mask_reference": row.get("region_mask") if prediction and prediction["shadow"] == "YES" else None, "valid_candidate_ids": row.get("valid_candidate_ids", []), "exterior_candidates": row.get("candidates", [])})
+    for result, row in zip(results, rows):
+        result["input_regime"] = row.get("input_regime", "unspecified")
+        result["shadow_evidence"] = row.get("shadow_evidence")
+        result["association_status"] = row.get("association_status", "unspecified")
     write_rows(output/"annotations.jsonl", results)
     write_json(output/"metrics.json", {**summarize(results), "manifest_sha256": digest(args.manifest), "model": args.model, "adapter": args.adapter, "in_sample_annotation": bool(overlap)})
 

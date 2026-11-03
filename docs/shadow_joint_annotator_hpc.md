@@ -5,6 +5,118 @@ temporal continuity. Caster association is part of each shadow annotation.
 Potential outside-BEV casters are an optional field in that same annotation,
 not a separate VLM detection task or an additional model.
 
+## Supervision policy update (2026-11-03)
+
+Rebuild the image bridge, region manifests and joint manifests in a NEW output
+root. Rebuilding only joint manifests from old data is safe, but legacy visible
+associations without supporting evidence become unresolved. Do not compare old
+and rebuilt metrics as if the inputs and evaluation targets were unchanged.
+
+- Object GT still supplies training/diagnostic crops and track motion. It does
+  not by itself supply a shadow decision or a shadow-caster association.
+- Visible associations use component-level footprint attachment competition,
+  shared across caster neighborhoods. Multiple similarly close vehicles remain
+  ambiguous. Unique attachments are explicitly `geometry_weak`, not GT; missing
+  trees/buildings/filtered vehicles remain a limitation of this candidate set.
+- Shadow provenance and association provenance are separate. Exterior object
+  matches cannot manufacture shadow YES. Legacy exterior rows with no shadow
+  evidence remain uncertain. New boundary exports explicitly record pseudo-mask
+  shadow evidence as weak, independently of object matching.
+- Dark observed-ground regions outside the existing pseudo mask are retained
+  as unlabeled candidates, not invented hard negatives. Frames without a
+  positive shadow are no longer automatically removed by the image bridge.
+- The RGB segmenter remains a global binary shadow model with partial masks,
+  not caster-conditioned instance segmentation. Repeated image records have
+  inverse-image-count supervised-loss weights; they are not merged, so each
+  track's separate temporal homography is retained.
+- Candidate order and IDs are permuted together with target/valid-ID mappings.
+  Model outputs record `gt_assisted_context` versus `observation_only` regimes.
+- Refinement keeps NO/UNCERTAIN/parse failures from creating new negatives;
+  overlapping YES/NO becomes unknown. Existing known GT pixels are protected.
+  Unreviewed existing positives may persist with segmentation support, but a new
+  positive requires a reviewed YES plus pixel support and cannot overwrite a
+  known negative. Rows without votes are retained and counted.
+
+Use new roots for preparation and model runs:
+
+```bash
+export SHADOW_ANNOTATION_ROOT=outputs/shadow_annotation_v3
+export SHADOW_DATA_ROOT=$SHADOW_ANNOTATION_ROOT/data
+export SHADOW_ANNOTATION_DATA_ROOT=$SHADOW_ANNOTATION_ROOT/joint
+export SHADOW_SEG_ROOT=$SHADOW_ANNOTATION_ROOT/segmenter
+export SHADOW_VLM_ROOT=$SHADOW_ANNOTATION_ROOT/vlm_lora
+export SHADOW_EVAL_ROOT=$SHADOW_ANNOTATION_ROOT/evaluation
+sbatch slurm/prepare_shadow_annotation.slurm
+# Wait for preparation and inspect data_check.json before training.
+```
+
+The default thresholds (attachment 1.5 m, competition margin 1.0 m) are initial
+engineering settings, not validated operating points. Freeze them on train/dev
+before final evaluation. `metrics.json` now includes source-specific negative
+false-positive rates, binary precision/positive recall, uncertain predictions
+and parse errors. These are still weak-label agreements when the source is weak.
+
+### Propose new regions before VLM inference
+
+After segmentation inference, create candidates from high-scoring pixels on
+observed ground, including pixels absent from the original positive mask:
+
+```bash
+python scripts/propose_shadow_annotation_regions.py \
+  --seg-predictions "$SHADOW_EVAL_ROOT/segmentation/predictions.jsonl" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/predicted_regions"
+python scripts/build_shadow_annotation_dataset.py \
+  --manifest "$SHADOW_ANNOTATION_ROOT/predicted_regions/manifest.jsonl" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/proposal_views" --seed 0
+python scripts/build_joint_shadow_annotation_dataset.py \
+  --region-data-root "$SHADOW_ANNOTATION_ROOT/proposal_views" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/proposal_joint" --seed 0
+python scripts/evaluate_shadow_annotator.py \
+  --model "$SHADOW_VLM_MODEL" --load-in-4bit \
+  --adapter "$SHADOW_VLM_ROOT/adapter" \
+  --manifest "$SHADOW_ANNOTATION_ROOT/proposal_joint/annotation_eval.jsonl" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/proposal_votes"
+python scripts/refine_shadow_annotations.py \
+  --seg-predictions "$SHADOW_EVAL_ROOT/segmentation/predictions.jsonl" \
+  --annotation-results "$SHADOW_ANNOTATION_ROOT/proposal_votes/annotations.jsonl" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/refined_eval"
+```
+
+New proposal targets stay unlabeled, so this manifest is for annotation inference,
+not SFT target generation. No observed-ground support means zero proposals and an
+explicit failure count, not an assumed ground mask. Review zero-proposal counts,
+new/removed positives and conflicting pixels. Evaluation-scene refined masks
+are diagnostic only and must never be fed back into training.
+
+### Cross-fit training-set expansion
+
+```bash
+python scripts/build_shadow_crossfit_folds.py \
+  --seg-data-root "$SHADOW_DATA_ROOT" \
+  --annotation-data-root "$SHADOW_ANNOTATION_DATA_ROOT" \
+  --output-root "$SHADOW_ANNOTATION_ROOT/crossfit" --folds 3 --seed 0
+```
+
+For each fold, independently train segmentation/VLM on its `*_train.jsonl`, use
+the train-derived `*_dev.jsonl` for selection, and infer only `*_heldout.jsonl`.
+The inference entry points already reject training-scene overlap. Concatenate
+each fold's unique heldout outputs once; do not reuse a single all-train model
+for every fold. This helper creates manifests, not an automatic training job.
+
+### HPC checks for the update
+
+```bash
+python -m compileall shadow_occ/annotation scripts
+python -m pytest tests/test_shadow_supervision_policy.py tests/test_shadow_annotation_pipeline.py tests/test_joint_shadow_annotation.py tests/test_shadow_annotation_temporal.py -q
+python scripts/check_shadow_annotation_data.py --data-root "$SHADOW_DATA_ROOT"
+python scripts/check_joint_shadow_annotation_data.py --data-root "$SHADOW_ANNOTATION_DATA_ROOT"
+```
+
+These checks and all model/data runs are to be executed on HPC. They were not
+executed locally. This update does not add an external pretrained shadow model,
+does not validate the thresholds, and does not finish OCC geometry-label
+reintegration or the later replacement of GT tracks with predicted tracks.
+
 ```text
 nuScenes GT objects/tracks + images + ground/temporal evidence
   -> shadow segmentation and region observations

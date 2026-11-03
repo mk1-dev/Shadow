@@ -43,6 +43,23 @@ def test_nonoverlapping_ground_disables_temporal_supervision():
     assert not observation["details"]["lighting_comparable"]
 
 
+def test_moving_shadow_reports_ground_darkening_recovery_and_motion_advantage():
+    previous = np.full((32, 32, 3), 160, np.uint8)
+    current = previous.copy()
+    previous[8:16, 8:16] = 60
+    current[8:16, 16:24] = 60
+    old_target = np.zeros((32, 32), np.uint8)
+    target = old_target.copy()
+    old_target[8:16, 8:16] = 1
+    target[8:16, 16:24] = 1
+    matrices = {"world_previous_to_current": np.eye(3), "caster_previous_to_current": np.array([[1, 0, 8], [0, 1, 0], [0, 0, 1]]), "caster_speed_mps": 2.0}
+    ground = np.ones(target.shape, bool)
+    details = temporal_observations(current, previous, target, old_target, ground, ground, matrices)["details"]
+    assert details["onset_pixels"] == details["recovery_pixels"] == 64
+    assert details["onset_darkening_ratio"] == details["recovery_brightening_ratio"] == 1.0
+    assert details["motion_alignment_advantage"] == 1.0
+
+
 def test_identity_sampling_grid_uses_pixel_centers():
     grid, valid = sampling_grid(np.eye(3), (16, 24), (16, 24), (16, 24))
     np.testing.assert_allclose(grid[0, 0], [-1+1/24, -1+1/16], atol=1e-6)

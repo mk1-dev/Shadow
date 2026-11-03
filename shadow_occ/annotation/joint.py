@@ -93,7 +93,23 @@ def summarize(rows):
         if not selected:
             continue
         correct = sum(row["prediction"] is not None and row["prediction"]["shadow"] == row["target"]["shadow"] for row in selected)
-        result["by_shadow_source"][source] = {"labeled": len(selected), "shadow_decision_agreement": correct/len(selected), "shadow_confusion": shadow_confusion(selected)}
+        positive = [row for row in selected if row["target"]["shadow"] == "YES"]
+        negative = [row for row in selected if row["target"]["shadow"] == "NO"]
+        says_yes = lambda row: row["prediction"] is not None and row["prediction"]["shadow"] == "YES"
+        tp = sum(says_yes(row) for row in positive)
+        fp = sum(says_yes(row) for row in negative)
+        result["by_shadow_source"][source] = {
+            "labeled": len(selected), "shadow_decision_agreement": correct/len(selected),
+            "shadow_confusion": shadow_confusion(selected),
+            "positive_targets": len(positive), "negative_targets": len(negative),
+            "uncertain_targets": len(selected)-len(positive)-len(negative),
+            "positive_recall": tp/len(positive) if positive else None,
+            "negative_false_positive_rate": fp/len(negative) if negative else None,
+            "binary_precision": tp/(tp+fp) if tp+fp else None,
+            "uncertain_prediction_rate": sum(row["prediction"] is not None and row["prediction"]["shadow"] == "UNCERTAIN" for row in selected)/len(selected),
+            "parse_errors": sum(row["prediction"] is None for row in selected),
+            "metric_scope": "agreement with this source; weak labels are not shadow ground truth",
+        }
     for source in sorted({row["association_source"] for row in rows}):
         visible = [row for row in rows if row["association_source"] == source and (row.get("target") or {}).get("caster", {}).get("state") == "visible"]
         outside = [row for row in rows if row["association_source"] == source and (row.get("known_outside_caster") or (row.get("target") or {}).get("caster", {}).get("state") == "outside_bev")]
@@ -106,4 +122,6 @@ def summarize(rows):
             outside_hits += int(prediction is not None and prediction["shadow"] == "YES" and prediction["caster"]["state"] == "outside_bev" and prediction["caster"].get("outside_candidate_id") in row.get("valid_candidate_ids", []))
         result["by_association_source"][source] = {"visible_associations": len(visible), "visible_box_recall_iou50": visible_hits/len(visible) if visible else None, "outside_associations": len(outside), "outside_candidate_bank_recall": sum(bool(row.get("valid_candidate_ids")) for row in outside)/len(outside) if outside else None, "outside_region_recall": outside_hits/len(outside) if outside else None}
     result["interpretation"] = "One GT-constrained shadow annotation model; object boxes, weak shadow masks and association GT retain separate provenance"
+    result["input_regimes"] = {regime: sum(row.get("input_regime", "unspecified") == regime for row in rows)
+                               for regime in sorted({row.get("input_regime", "unspecified") for row in rows})}
     return result

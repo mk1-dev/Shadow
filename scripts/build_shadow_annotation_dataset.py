@@ -105,9 +105,11 @@ def main() -> None:
             "label_source": row.get("label_source", "unlabeled"),
             "caster_source": row.get("caster_source", "none"),
         }
-        for key in ("sample_token", "camera", "group", "pair_id", "annotation_token", "instance_token", "caster_bbox_xyxy", "caster_category", "association_source", "ego_to_img", "ego_to_global", "timestamp", "temporal_status", "ground_z_ego"):
+        for key in ("sample_token", "camera", "group", "pair_id", "annotation_token", "instance_token", "caster_bbox_xyxy", "caster_category", "association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "ground_support", "ego_to_img", "ego_to_global", "timestamp", "temporal_status", "ground_z_ego"):
             if key in row:
                 common[key] = row[key]
+        if common.get("ground_support"):
+            common["ground_support"] = str(resolve_path(common["ground_support"], base))
         temporal_image, temporal_overlap = None, None
         if row.get("temporal"):
             temporal = dict(row["temporal"])
@@ -177,6 +179,9 @@ def main() -> None:
             else:
                 label = "IGNORE"
             item = {**common, "id": region_id, "parent_id": identifier, "task": "shadow", "region_id": region["id"], "region_mask": str(region_path), "context_crop_xyxy": context, "images": [str(path) for path in paths], "prompt": region_prompt, "temporal_context": has_context, "answer": label if label != "IGNORE" else None, "label_source": source, "known_fraction": known_fraction, "positive_fraction": positive_fraction}
+            for key in ("association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "shadow_evidence", "proposal_source"):
+                if key in region:
+                    item[key] = region[key]
             vlm[split].append(item)
             counts[f"{split}_shadow_{label}"] += 1
         if row.get("caster_source") == "annotation_gt" and row.get("caster_bbox_xyxy"):
@@ -189,6 +194,9 @@ def main() -> None:
             counts[f"{split}_caster"] += 1
     assert_disjoint(segments["train"], segments["dev"] + segments["eval"])
     for split in segments:
+        image_counts = Counter(row["image"] for row in segments[split])
+        for row in segments[split]:
+            row["sample_weight"] = 1.0/image_counts[row["image"]]
         write_rows(output / f"seg_{split}.jsonl", segments[split])
         write_rows(output / f"vlm_{split}.jsonl", vlm[split])
     write_json(output / "dataset_protocol.json", {"input_sha256": {path: digest(path) for path in args.manifest}, "casters_sha256": digest(args.casters) if args.casters else None, "prompt_sha256": digest(args.prompt), "seed": args.seed, "dev_fraction": args.dev_fraction, "positive_fraction": args.positive_fraction, "negative_fraction": args.negative_fraction, "min_known_fraction": args.min_known_fraction, "no_temporal_context": args.no_temporal_context, "min_temporal_region_overlap": args.min_temporal_region_overlap, "excluded_scenes": sorted(excluded), "scenes": scene_splits, "counts": dict(counts)})

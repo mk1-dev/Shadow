@@ -119,6 +119,10 @@ def temporal_observations(current_bgr, previous_bgr, current_target, previous_ta
     before = (current_target == 1) & shared_caster
     repeated = before & (caster_target == 1)
     world_repeated = (current_target == 1) & (world_target == 1) & shared_world
+    onset = shared_world & (current_target == 1) & (world_target == 0)
+    recovery = shared_world & (current_target == 0) & (world_target == 1)
+    comparison = shared_world & shared_caster & (current_target == 1) & (world_target != 255) & (caster_target != 255)
+    motion_advantage = float(((caster_target[comparison] == 1).astype(np.float32)-(world_target[comparison] == 1)).mean()) if comparison.any() else None
     details = {
         "mode": mode, "background_points": int(background.sum()),
         "shared_world_pixels": int(shared_world.sum()), "shared_caster_pixels": int(shared_caster.sum()),
@@ -130,5 +134,10 @@ def temporal_observations(current_bgr, previous_bgr, current_target, previous_ta
         "repeated_shadow_small_change_ratio": float((np.abs(delta_l[world_repeated]) < 6.0).mean()) if world_repeated.any() else None,
         "small_change_threshold_L": 6.0,
         "consistency_weight_sum": float(weight.sum()),
+        "onset_pixels": int(onset.sum()), "recovery_pixels": int(recovery.sum()),
+        "onset_darkening_ratio": float((delta_l[onset] < -6.0).mean()) if onset.any() and light_ok else None,
+        "recovery_brightening_ratio": float((delta_l[recovery] > 6.0).mean()) if recovery.any() and light_ok else None,
+        "motion_alignment_comparison_pixels": int(comparison.sum()),
+        "motion_alignment_advantage": motion_advantage if light_ok else None,
     }
     return {"previous_world": previous_world, "previous_caster": previous_caster, "previous_target_caster": caster_target, "shared_caster": shared_caster, "shared_world": shared_world, "delta_l": delta_l, "delta_chroma": delta_chroma, "photometric_confidence": photometric, "weight": weight, "details": details}

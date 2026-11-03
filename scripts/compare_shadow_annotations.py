@@ -25,7 +25,7 @@ def main():
     if set(a) != set(b) or len(a) != len(a_rows) or len(b) != len(b_rows):
         raise ValueError("Annotation runs must contain identical unique IDs")
     for key in a:
-        for field in ("target", "shadow_label_source", "association_source", "scene_name", "input_signature"):
+        for field in ("target", "shadow_label_source", "association_source", "scene_name", "input_signature", "input_regime", "known_outside_caster", "valid_candidate_ids"):
             if a[key].get(field) != b[key].get(field):
                 raise ValueError(f"Different targets or inputs: {key}/{field}")
     paired = {}

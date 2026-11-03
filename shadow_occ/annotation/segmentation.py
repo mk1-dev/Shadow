@@ -70,7 +70,10 @@ class ShadowDataset(Dataset):
             rgb = (rgb-np.array([0.485, 0.456, 0.406], np.float32))/np.array([0.229, 0.224, 0.225], np.float32)
             return torch.from_numpy(rgb.transpose(2, 0, 1).copy())
 
-        return {"image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"]}
+        sample_weight = float(row.get("sample_weight", 1.0))
+        if not np.isfinite(sample_weight) or not 0 < sample_weight <= 1:
+            raise ValueError("sample_weight must be in (0, 1]")
+        return {"image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"], "sample_weight": sample_weight}
 
 
 def build_segmenter(backbone_weights=None):
@@ -236,6 +239,7 @@ def train_main():
                     predictions = model(inputs)["out"]
                     logits = predictions[:images.shape[0]]
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
+                    weights = weights*batch["sample_weight"].to(device)
                     loss = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights)
                     if use_temporal:
                         previous = predictions[images.shape[0]:]

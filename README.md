@@ -6,6 +6,11 @@ outside-BEV caster when supported. Segmentation and temporal light evidence
 provide its observations. The main workflow is
 [docs/shadow_joint_annotator_hpc.md](docs/shadow_joint_annotator_hpc.md).
 
+The 2026-11-03 supervision update separates shadow evidence from caster
+associations, retains ambiguous regions, adds reviewed segmentation proposals
+and scene cross-fit manifests. Rebuild data in a new output root; see the
+supervision-policy update and HPC checks in the main workflow document.
+
 Low-level shadow segmentation, temporal evidence and legacy region-verification
 details are documented in [docs/shadow_annotation_hpc.md](docs/shadow_annotation_hpc.md).
 

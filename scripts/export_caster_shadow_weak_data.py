@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from shadow_occ.annotation.data import checked_write_image, read_rows, write_rows
+from shadow_occ.annotation.supervision import competing_association
 from shadow_occ.config import load_config
 from shadow_occ.data.nuscenes_adapter import NuScenesAdapter
 from shadow_occ.geometry.bev import BEVGrid
@@ -41,7 +42,14 @@ def main():
     parser.add_argument("--min-region-area", type=int, default=50)
     parser.add_argument("--max-regions-per-class", type=int, default=3)
     parser.add_argument("--context-metres", type=float, default=6.0)
+    parser.add_argument("--max-attachment-metres", type=float, default=1.5)
+    parser.add_argument("--association-margin-metres", type=float, default=1.0)
+    parser.add_argument("--max-uncertain-regions", type=int, default=3)
     args = parser.parse_args()
+    if min(args.max_attachment_metres, args.association_margin_metres) <= 0:
+        raise ValueError("Association attachment and margin must be positive")
+    if args.max_uncertain_regions < 0:
+        raise ValueError("max-uncertain-regions must be nonnegative")
     cfg = load_config(args.config)
     grid = BEVGrid.from_config(cfg.bev)
     output = Path(args.output_root).resolve()
@@ -101,7 +109,16 @@ def main():
         checked_write_image(support_path, support.astype(np.uint8)*255)
         light = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[..., 0]
         bright = light >= np.percentile(light[support], args.bright_percentile)
-        full_shadow = cv2.warpPerspective((pseudo & forward).astype(np.uint8), projection@grid_to_ego, (width, height), flags=cv2.INTER_NEAREST) > 0
+        local_light = cv2.GaussianBlur(light.astype(np.float32), (0, 0), max(15.0, min(light.shape)*0.18))
+        dark = light/np.maximum(local_light, 1.0) < 0.85
+        count, bev_components = cv2.connectedComponents(pseudo.astype(np.uint8), connectivity=8)
+        projected_components = cv2.warpPerspective((bev_components*forward).astype(np.float32), projection@grid_to_ego, (width, height), flags=cv2.INTER_NEAREST).astype(np.int32)
+        full_shadow = projected_components > 0
+        associations = {
+            index: competing_association(points[..., :2][bev_components == index], casters,
+                                         args.max_attachment_metres, args.association_margin_metres)
+            for index in range(1, count)
+        }
         shadow_buffer = cv2.dilate(full_shadow.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
         for caster in casters:
             center = np.asarray(caster["caster_center_ego"])
@@ -112,25 +129,43 @@ def main():
             target[local & support & bright & ~shadow_buffer] = 0
             target[local & support & full_shadow] = 1
             proposals = []
-            for index, mask in enumerate(sorted(components(full_shadow & local & (object_mask == 0), args.min_region_area), key=lambda m: int(m.sum()), reverse=True)):
+            component_sizes = np.bincount(projected_components[local & (object_mask == 0)], minlength=count)
+            component_order = np.argsort(-component_sizes, kind="stable")
+            for index in component_order:
+                if index == 0:
+                    continue
+                if component_sizes[index] < args.min_region_area:
+                    break
+                mask = (projected_components == index) & local & (object_mask == 0)
+                if mask.sum() < args.min_region_area:
+                    continue
                 if np.count_nonzero(mask & support)/mask.sum() >= args.min_ground_fraction:
-                    proposals.append((f"positive_{index}", mask, "YES"))
+                    evidence = dict(associations[index])
+                    if evidence["associated_annotation_token"] != caster["annotation_token"]:
+                        evidence["association_status"] = "ambiguous" if evidence["association_status"] == "ambiguous" else "not_this_caster"
+                    proposals.append((f"positive_{index}", mask, "YES", evidence))
                     if len(proposals) >= args.max_regions_per_class:
                         break
             # Bright-ground examples are weak negatives, never shadow GT.
             for index, mask in enumerate(sorted(components(target == 0, args.min_region_area), key=lambda m: int(m.sum()), reverse=True)[:args.max_regions_per_class]):
-                proposals.append((f"negative_{index}", mask, "NO"))
+                proposals.append((f"negative_{index}", mask, "NO", {"association_status": "not_applicable", "association_source": "unresolved"}))
+            for index, mask in enumerate(sorted(components(local & support & dark & ~shadow_buffer & ~bright, args.min_region_area), key=lambda m: int(m.sum()), reverse=True)[:args.max_uncertain_regions]):
+                proposals.append((f"uncertain_{index}", mask, "IGNORE", {"association_status": "unsupported", "association_source": "unresolved"}))
             if not (target == 1).any() or not (target == 0).any():
-                counters["missing_positive_or_negative"] += 1
+                counters["without_both_pixel_classes"] += 1
+            if not (target != 255).any() and not proposals:
+                counters["no_pixel_or_region_evidence"] += 1
                 continue
             stem = hashlib.sha256(caster["id"].encode()).hexdigest()[:24]
             mask_path = output/"targets"/f"{stem}.png"
             checked_write_image(mask_path, target)
             regions = []
-            for region_id, mask, label in proposals:
+            for region_id, mask, label, evidence in proposals:
                 mask_file = output/"regions"/f"{stem}_{region_id}.png"
                 checked_write_image(mask_file, mask.astype(np.uint8)*255)
-                regions.append({"id": region_id, "mask": str(mask_file), "shadow_label": label, "label_source": "geometry_weak"})
+                regions.append({"id": region_id, "mask": str(mask_file), "shadow_label": label, "label_source": "geometry_weak",
+                                "shadow_evidence": {"method": "projected_pseudo_mask" if label == "YES" else "bright_observed_ground" if label == "NO" else "unresolved_dark_ground", "is_shadow_gt": False}, **evidence})
+                counters["association_"+evidence["association_status"]] += 1
             rows.append({**caster, "shadow_mask": str(mask_path), "mask_encoding": "trimap", "label_source": "geometry_weak", "regions": regions, "ground_support": str(support_path), "z0_assumption": True, "ground_z_ego": args.ground_z})
             counters["examples"] += 1
             counters["regions"] += len(regions)

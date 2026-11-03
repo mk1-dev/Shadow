@@ -79,7 +79,8 @@ class SFTDataset(Dataset):
     def __getitem__(self, index):
         row = self.rows[index]
         encoded = encode_example(self.processor, row, row["answer"], self.max_length)
-        weight = self.weak_weight if row["label_source"] in WEAK_SOURCES else 1.0
+        sources = {row["label_source"], row.get("shadow_label_source"), row.get("association_source")}
+        weight = self.weak_weight if sources & WEAK_SOURCES else 1.0
         if self.decision_weights:
             decision = parse_annotation(row["answer"], row.get("candidates", []))["shadow"]
             weight *= self.decision_weights.get(decision, 1.0)
