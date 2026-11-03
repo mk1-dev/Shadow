@@ -1,0 +1,15 @@
+# Store upload archives in the parent directory.
+*.zip
+
+# Local Python and test artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+
+# Generated experiment outputs.
+/outputs/
+/outputs_*/

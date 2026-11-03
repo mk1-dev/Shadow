@@ -1,5 +1,14 @@
 # Shadow-OCC
 
+The VLM is the **GT-constrained shadow annotator**. Its single annotation contains
+the shadow region decision and caster association, including a possible
+outside-BEV caster when supported. Segmentation and temporal light evidence
+provide its observations. The main workflow is
+[docs/shadow_joint_annotator_hpc.md](docs/shadow_joint_annotator_hpc.md).
+
+Low-level shadow segmentation, temporal evidence and legacy region-verification
+details are documented in [docs/shadow_annotation_hpc.md](docs/shadow_annotation_hpc.md).
+
 Runnable nuScenes + Occ3D code for testing whether temporal shadow geometry can
 provide a weak 3D cue for BEV occupancy, especially at long range.
 

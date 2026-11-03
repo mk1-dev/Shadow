@@ -1,0 +1,39 @@
+#!/bin/bash
+#SBATCH -J shadow_offbev_data
+#SBATCH -p debugpc
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --mem=48G
+#SBATCH --cpus-per-task=4
+#SBATCH --time=1-00:00:00
+#SBATCH -o logs/shadow_offbev_data_%j.out
+#SBATCH -e logs/shadow_offbev_data_%j.err
+
+set -euo pipefail
+source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
+conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
+cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
+export PYTHONUNBUFFERED=1
+ROOT_OUT="${SHADOW_OFFBEV_ROOT:-outputs/shadow_offbev}"
+NUSC_ROOT="${SHADOW_NUSC_ROOT:-/public/home/eng_zhihongli/project/data/nuscenes-full}"
+MASK_ROOT="${SHADOW_OFFBEV_MASK_ROOT:-outputs_temporal/shadow_labels}"
+EXCLUSIONS=()
+if [[ -n "${SHADOW_EXCLUDE_SCENES:-}" ]]; then
+  EXCLUSIONS=(--exclude-scenes "$SHADOW_EXCLUDE_SCENES")
+fi
+for SPLIT in train val; do
+  python scripts/export_nuscenes_caster_gt.py \
+    --dataroot "$NUSC_ROOT" --split "$SPLIT" \
+    --max-distance 100 --min-lidar-points 0 --include-offscreen \
+    --max-samples "${SHADOW_OFFBEV_EXPORT_SAMPLES:-1000}" \
+    --output "$ROOT_OUT/casters_$SPLIT.jsonl" "${EXCLUSIONS[@]}"
+  python scripts/export_offbev_shadow_observations.py \
+    --dataroot "$NUSC_ROOT" --split "$SPLIT" --label-root "$MASK_ROOT" \
+    --max-samples "${SHADOW_OFFBEV_EXPORT_SAMPLES:-1000}" \
+    --output-root "$ROOT_OUT/observations_$SPLIT" "${EXCLUSIONS[@]}"
+done
+python scripts/build_offbev_shadow_dataset.py \
+  --observations "$ROOT_OUT/observations_train/observations.jsonl" "$ROOT_OUT/observations_val/observations.jsonl" \
+  --casters "$ROOT_OUT/casters_train.jsonl" "$ROOT_OUT/casters_val.jsonl" \
+  --teach-ambiguous-abstention --output-root "$ROOT_OUT/data" --seed 0
+python scripts/check_offbev_shadow_data.py --data-root "$ROOT_OUT/data"
