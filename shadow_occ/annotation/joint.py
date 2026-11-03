@@ -56,14 +56,44 @@ def bbox_iou(a, b):
     return float(intersection/max(area_a+area_b-intersection, 1e-12))
 
 
+def shadow_confusion(rows):
+    counts = {"true_positive": 0, "false_positive": 0, "false_negative": 0, "true_negative": 0, "unclassified": 0}
+    for row in rows:
+        target = row.get("target")
+        prediction = row.get("prediction")
+        target_decision = (target or {}).get("shadow")
+        predicted_decision = (prediction or {}).get("shadow")
+        if target_decision not in {"YES", "NO"}:
+            continue
+        if predicted_decision not in {"YES", "NO"}:
+            counts["unclassified"] += 1
+        elif target_decision == predicted_decision == "YES":
+            counts["true_positive"] += 1
+        elif target_decision == "NO" and predicted_decision == "YES":
+            counts["false_positive"] += 1
+        elif target_decision == "YES" and predicted_decision == "NO":
+            counts["false_negative"] += 1
+        else:
+            counts["true_negative"] += 1
+    positive = counts["true_positive"] + counts["false_negative"]
+    negative = counts["true_negative"] + counts["false_positive"]
+    counts["positive_recall"] = counts["true_positive"]/positive if positive else None
+    counts["negative_specificity"] = counts["true_negative"]/negative if negative else None
+    if positive and negative:
+        counts["balanced_accuracy"] = (counts["positive_recall"]+counts["negative_specificity"])/2
+    else:
+        counts["balanced_accuracy"] = None
+    return counts
+
+
 def summarize(rows):
-    result = {"examples": len(rows), "parse_errors": sum(row["prediction"] is None for row in rows), "by_shadow_source": {}, "by_association_source": {}}
+    result = {"examples": len(rows), "parse_errors": sum(row["prediction"] is None for row in rows), "shadow_confusion": shadow_confusion(rows), "by_shadow_source": {}, "by_association_source": {}}
     for source in sorted({row["shadow_label_source"] for row in rows}):
         selected = [row for row in rows if row["shadow_label_source"] == source and row.get("target") is not None]
         if not selected:
             continue
         correct = sum(row["prediction"] is not None and row["prediction"]["shadow"] == row["target"]["shadow"] for row in selected)
-        result["by_shadow_source"][source] = {"labeled": len(selected), "shadow_decision_agreement": correct/len(selected)}
+        result["by_shadow_source"][source] = {"labeled": len(selected), "shadow_decision_agreement": correct/len(selected), "shadow_confusion": shadow_confusion(selected)}
     for source in sorted({row["association_source"] for row in rows}):
         visible = [row for row in rows if row["association_source"] == source and (row.get("target") or {}).get("caster", {}).get("state") == "visible"]
         outside = [row for row in rows if row["association_source"] == source and (row.get("known_outside_caster") or (row.get("target") or {}).get("caster", {}).get("state") == "outside_bev")]

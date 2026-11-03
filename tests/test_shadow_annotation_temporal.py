@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from shadow_occ.annotation.temporal import ground_homographies, sampling_grid, temporal_observations
+from shadow_occ.annotation.temporal import ground_homographies, sampling_grid, temporal_observations, warp
 
 
 def record(center, timestamp, instance="vehicle-a"):
@@ -10,7 +10,7 @@ def record(center, timestamp, instance="vehicle-a"):
 
 def test_caster_and_world_alignment_are_separate():
     matrices = ground_homographies(record([1, 0, 0], 500000), record([0, 0, 0], 0))
-    np.testing.assert_allclose(matrices["world_previous_to_current"], np.eye(3))
+    np.testing.assert_allclose(matrices["world_previous_to_current"], np.eye(3), atol=1e-12)
     point = matrices["caster_previous_to_current"] @ np.array([16, 12, 1])
     np.testing.assert_allclose(point[:2]/point[2], [26, 12])
     assert matrices["caster_speed_mps"] == 2.0
@@ -47,6 +47,12 @@ def test_identity_sampling_grid_uses_pixel_centers():
     grid, valid = sampling_grid(np.eye(3), (16, 24), (16, 24), (16, 24))
     np.testing.assert_allclose(grid[0, 0], [-1+1/24, -1+1/16], atol=1e-6)
     assert valid.all()
+
+
+def test_warp_accepts_json_serialized_homography():
+    image = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    warped = warp(image, np.eye(3).tolist(), image.shape)
+    np.testing.assert_array_equal(warped, image)
 
 
 def test_segmentation_dice_stays_finite_for_large_half_precision_masks():

@@ -13,3 +13,4 @@ __pycache__/
 # Generated experiment outputs.
 /outputs/
 /outputs_*/
+/logs/

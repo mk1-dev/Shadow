@@ -58,7 +58,7 @@ installation. Install a matching PyTorch/torchvision pair with CUDA support,
 then install the package and annotation dependencies:
 
 ```bash
-cd /public/home/eng_zhihongli/project/Shadow
+cd /public/home/eng_zhihongli/project/Shadow_update
 pip install -e .
 pip install -r requirements-annotation.txt
 mkdir -p logs
@@ -161,7 +161,7 @@ python scripts/check_shadow_annotation_data.py \
   --data-root outputs/shadow_annotation/data
 ```
 
-Or submit `sbatch slurm/prepare_shadow_annotation.slurm` on `debugpc`.
+Or submit `sbatch slurm/prepare_shadow_annotation.slurm` on `Intel`.
 Its default export cap is 1000 samples per official split; change
 `SHADOW_EXPORT_SAMPLES` to control the pilot size. Counts can shrink substantially
 after visibility/ground/mask checks. Confirm nonempty train/dev/eval and both

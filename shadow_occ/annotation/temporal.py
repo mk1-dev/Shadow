@@ -44,7 +44,10 @@ def yaw_difference_degrees(a, b) -> float:
 
 
 def warp(array, homography, shape, nearest=False, border=0):
-    return cv2.warpPerspective(array, homography, (shape[1], shape[0]), flags=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=border)
+    matrix = np.asarray(homography, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError("Homography must be a finite 3x3 matrix")
+    return cv2.warpPerspective(array, matrix, (shape[1], shape[0]), flags=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=border)
 
 
 def sampling_grid(homography, current_shape, previous_shape, resized_shape):

@@ -65,7 +65,7 @@ The main scripts are `build_joint_shadow_annotation_dataset.py`,
 caster-task inputs are rejected for this unified task.
 
 ```bash
-cd /public/home/eng_zhihongli/project/Shadow
+cd /public/home/eng_zhihongli/project/Shadow_update
 mkdir -p logs
 export SHADOW_VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct
 
@@ -106,6 +106,10 @@ visible caster's normalized box. Rebuild region manifests with the latest
 `build_shadow_annotation_dataset.py` when using older exports without it;
 otherwise that annotation correctly falls back to an unresolved caster.
 Exterior observations should include `region_mask` for returning pixel labels.
+`--balance-shadow` derives YES/NO/UNCERTAIN weights from the training split and
+applies them to training and validation loss; the weights are recorded in
+`training_protocol.json`. This prevents the writer from selecting a checkpoint
+that only predicts the dominant decision.
 
 ```bash
 python scripts/train_shadow_vlm.py \
@@ -114,7 +118,7 @@ python scripts/train_shadow_vlm.py \
   --train outputs/shadow_annotation/joint_v2/annotation_train.jsonl \
   --dev outputs/shadow_annotation/joint_v2/annotation_dev.jsonl \
   --output-root outputs/shadow_annotation/annotator_v2 \
-  --load-in-4bit --allow-weak-labels --seed 0
+  --load-in-4bit --allow-weak-labels --balance-shadow --seed 0
 python scripts/evaluate_shadow_annotator.py \
   --model /path/to/Qwen3-VL-8B-Instruct --load-in-4bit \
   --adapter outputs/shadow_annotation/annotator_v2/adapter \
@@ -154,10 +158,31 @@ root/tip/direction targets and preserving ignore masks.
 
 ```bash
 python -m compileall shadow_occ/annotation scripts
-python -m pytest tests/test_joint_shadow_annotation.py tests/test_shadow_annotation_temporal.py -q
+python -m pytest tests -q
 python scripts/check_joint_shadow_annotation_data.py --data-root outputs/shadow_annotation/joint
 ```
 
-No model validation, test execution or HPC submission was run locally.
+Validated on 2026-11-03 with `shadow_annotator` (`torch 2.6.0+cu124`,
+`transformers 4.57.6`, `peft 0.21.2`, `bitsandbytes 0.50.2`): all tests passed,
+a 1000-sample nuScenes pilot produced non-empty train/dev/eval splits, and
+Qwen3-VL-8B completed 4-bit LoRA training/evaluation on one 24 GiB RTX 4090.
+Peak observed device memory was 13.12 GiB. The pilot contained zero
+`outside_bev` training examples, so increase the pilot or use boundary-focused
+sampling before claiming that state is trainable.
+
+The first unweighted pilot exposed a majority-class failure: its adapter parsed
+all held-out examples but predicted `NO/none` for all 67, giving 86.6% raw
+agreement and 50% balanced accuracy. A one-epoch `--balance-shadow` diagnostic
+raised visible-caster IoU50 recall from 0% to 77.8% on 9 positives, but produced
+43 false positives out of 58 negatives and only 51.8% balanced accuracy. These
+pilot results validate the execution path, not production annotation quality.
+Use balanced accuracy, positive recall and negative specificity alongside raw
+agreement; do not select an annotator by weighted validation loss alone.
+
+The batch partition was pending under scheduler priority during validation;
+the same training entry point ran through `srun` on an explicitly selected
+RTX 4090. Use `sbatch` for managed production runs when the partition grants
+the request immediately.
+
 The earlier binary verifier and standalone exterior selector remain legacy
 diagnostic entry points; they are not the recommended main training workflow.

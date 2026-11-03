@@ -1,8 +1,9 @@
-# Install separately from the existing OCC environment; match torchvision to torch.
-torch>=2.6
-torchvision>=0.21
-transformers>=4.57,<5
-peft>=0.17
-accelerate>=1.0
+# Install separately from the existing OCC environment. These ranges are
+# validated together for Qwen3-VL 4-bit LoRA on the RTX 4090 nodes.
+torch>=2.6,<2.7
+torchvision>=0.21,<0.22
+transformers>=4.57,<4.58
+peft>=0.17,<0.22
+accelerate>=1.0,<2
 Pillow>=10
-bitsandbytes>=0.47; platform_system == "Linux"
+bitsandbytes>=0.47,<0.51; platform_system == "Linux"

@@ -11,7 +11,10 @@ ASSOCIATION_GT = {"manual_caster_association_gt", "synthetic_caster_association_
 
 def footprint_status(corners, bounds) -> str:
     xmin, ymin, xmax, ymax = bounds
-    polygon = cv2.convexHull(np.asarray(corners, dtype=np.float32)[:, :2])
+    points = np.ascontiguousarray(np.asarray(corners, dtype=np.float32)[:, :2])
+    if points.shape[0] < 3:
+        raise ValueError("Caster footprint needs at least three corners")
+    polygon = cv2.convexHull(points)
     rectangle = np.asarray([[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]], dtype=np.float32)
     intersection, _ = cv2.intersectConvexConvex(polygon, rectangle)
     area = float(cv2.contourArea(polygon))

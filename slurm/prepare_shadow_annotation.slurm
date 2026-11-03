@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J shadow_annotation_data
-#SBATCH -p debugpc
+#SBATCH -p Intel
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --mem=48G

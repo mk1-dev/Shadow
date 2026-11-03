@@ -101,6 +101,24 @@ shadow_occ/
 tests/                         Synthetic smoke test
 ```
 
+## Local nuScenes-mini annotation
+
+`run_local_annotation.py` builds a six-camera keyframe manifest from a local
+nuScenes-mini directory and launches a dependency-free browser annotation UI:
+
+```bash
+python run_local_annotation.py \
+  --dataroot /path/to/nuscenes-mini \
+  --work-dir /path/to/shadow_mini_annotation
+```
+
+The UI supports image decisions, camera filters, bounding boxes, freehand
+multi-stroke shapes, zoom/pan, autosave, resume, and latest-record JSONL export.
+Use boxes for first-pass screening and freehand shapes for accepted shadows or
+ambiguous boundaries. See
+[LOCAL_ANNOTATION_README.md](LOCAL_ANNOTATION_README.md) for Windows commands,
+output schema, and optional camera/scene/frame controls.
+
 ## 3. Data preparation
 
 ### nuScenes

@@ -57,7 +57,7 @@ Use the annotation environment and dependencies described in
 its temporal training; those are still the front end.
 
 ```bash
-cd /public/home/eng_zhihongli/project/Shadow
+cd /public/home/eng_zhihongli/project/Shadow_update
 mkdir -p logs
 export SHADOW_VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct
 export SHADOW_OFFBEV_ROOT=outputs/shadow_offbev_v1

@@ -20,6 +20,17 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 DATA_ROOT="${SHADOW_ANNOTATION_DATA_ROOT:-outputs/shadow_annotation/joint}"
 OUTPUT_ROOT="${SHADOW_VLM_ROOT:-outputs/shadow_annotation/vlm_lora}"
+EXTRA_ARGS=()
+if [[ -n "${SHADOW_MAX_STEPS:-}" ]]; then
+  EXTRA_ARGS+=(--max-steps "$SHADOW_MAX_STEPS")
+fi
+
+GPU_MONITOR_PID=""
+if [[ -n "${SHADOW_GPU_LOG:-}" ]]; then
+  nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits --loop-ms=2000 > "$SHADOW_GPU_LOG" &
+  GPU_MONITOR_PID=$!
+  trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
+fi
 
 python scripts/train_shadow_vlm.py \
   --model "${SHADOW_VLM_MODEL:?Set SHADOW_VLM_MODEL to the local Qwen3-VL directory}" \
@@ -28,5 +39,5 @@ python scripts/train_shadow_vlm.py \
   --dev "$DATA_ROOT/annotation_dev.jsonl" \
   --output-root "$OUTPUT_ROOT" \
   --load-in-4bit --max-pixels 147456 --max-length 4096 \
-  --epochs 3 --accumulation 16 \
-  --allow-weak-labels --weak-weight 0.25 --seed 0
+  --epochs "${SHADOW_EPOCHS:-3}" --accumulation "${SHADOW_ACCUMULATION:-16}" \
+  --allow-weak-labels --weak-weight 0.25 --balance-shadow --seed 0 "${EXTRA_ARGS[@]}"

@@ -69,8 +69,9 @@ def encode_example(processor, row, answer=None, max_length=4096):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, rows, processor, max_length, weak_weight):
+    def __init__(self, rows, processor, max_length, weak_weight, decision_weights=None):
         self.rows, self.processor, self.max_length, self.weak_weight = rows, processor, max_length, weak_weight
+        self.decision_weights = decision_weights or {}
 
     def __len__(self):
         return len(self.rows)
@@ -78,8 +79,20 @@ class SFTDataset(Dataset):
     def __getitem__(self, index):
         row = self.rows[index]
         encoded = encode_example(self.processor, row, row["answer"], self.max_length)
-        encoded["example_weight"] = self.weak_weight if row["label_source"] in WEAK_SOURCES else 1.0
+        weight = self.weak_weight if row["label_source"] in WEAK_SOURCES else 1.0
+        if self.decision_weights:
+            decision = parse_annotation(row["answer"], row.get("candidates", []))["shadow"]
+            weight *= self.decision_weights.get(decision, 1.0)
+        encoded["example_weight"] = weight
         return encoded
+
+
+def shadow_decision_weights(rows, maximum=10.0):
+    decisions = Counter(parse_annotation(row["answer"], row.get("candidates", []))["shadow"] for row in rows)
+    total = sum(decisions.values())
+    if not total or not decisions:
+        raise ValueError("Cannot balance an empty annotation dataset")
+    return {decision: min(maximum, total/(len(decisions)*count)) for decision, count in sorted(decisions.items())}
 
 
 def one_example_collator(items):
@@ -115,6 +128,7 @@ def train_main():
     parser.add_argument("--caster-ratio", type=float, default=0.0, help="Legacy diagnostic tasks only; unified annotation incorporates caster GT into each annotation target")
     parser.add_argument("--weak-weight", type=float, default=0.25)
     parser.add_argument("--allow-weak-labels", action="store_true")
+    parser.add_argument("--balance-shadow", action="store_true", help="Balance YES/NO/UNCERTAIN weights using the training split")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     from peft import LoraConfig, get_peft_model
@@ -159,6 +173,7 @@ def train_main():
         return shadow + casters[:int(len(shadow)*args.caster_ratio)]
 
     train, dev = select(train_all), select(dev_all)
+    decision_weights = shadow_decision_weights(train) if args.balance_shadow else {}
     output = Path(args.output_root)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new LoRA output directory")
@@ -180,11 +195,11 @@ def train_main():
             return (loss, outputs) if return_outputs else loss
 
     training = TrainingArguments(output_dir=str(output), per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=args.accumulation, num_train_epochs=args.epochs, max_steps=args.max_steps, learning_rate=args.lr, bf16=True, gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}, eval_strategy="epoch", save_strategy="epoch", save_total_limit=2, logging_steps=10, warmup_ratio=0.05, weight_decay=0.01, remove_unused_columns=False, label_names=["labels"], report_to="none", dataloader_num_workers=0, ddp_find_unused_parameters=False, seed=args.seed, load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False, prediction_loss_only=True)
-    trainer = WeightedTrainer(model=model, args=training, train_dataset=SFTDataset(train, processor, args.max_length, args.weak_weight), eval_dataset=SFTDataset(dev, processor, args.max_length, args.weak_weight), data_collator=one_example_collator)
+    trainer = WeightedTrainer(model=model, args=training, train_dataset=SFTDataset(train, processor, args.max_length, args.weak_weight, decision_weights), eval_dataset=SFTDataset(dev, processor, args.max_length, args.weak_weight, decision_weights), data_collator=one_example_collator)
     trainer.model_accepts_loss_kwargs = False
     if trainer.is_world_process_zero():
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output/"training_protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted({row['scene_name'] for row in train}), "dev_scenes": sorted({row['scene_name'] for row in dev}), "target_modules": targets, "training_rows": len(train), "dev_rows": len(dev)})
+        write_json(output/"training_protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted({row['scene_name'] for row in train}), "dev_scenes": sorted({row['scene_name'] for row in dev}), "target_modules": targets, "training_rows": len(train), "dev_rows": len(dev), "shadow_decision_weights": decision_weights})
     trainer.train()
     trainer.save_model(str(output/"adapter"))
     if trainer.is_world_process_zero():
