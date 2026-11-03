@@ -1,0 +1,313 @@
+SHADOW_OCC_AGENT_CONTEXT.json{
+  "schema_version": "1.0",
+  "document_type": "agent_handoff_conversation_summary",
+  "generated_at": "2026-10-12",
+  "language": "zh-CN",
+  "scope_note": "这是此前对话的结构化摘要，保留了项目决策、实现状态、实验结果、故障记录和后续任务；不是逐字聊天转录。",
+  "project": {
+    "name": "ShadowOcc",
+    "local_workspace": "E:/VLA_baseline/mulit_VLA/Shadow",
+    "remote_workspace": "/public/home/eng_zhihongli/project/Shadow",
+    "remote_nuscenes_root": "/public/home/eng_zhihongli/project/data/nuscenes-full",
+    "remote_occ3d_root": "/public/home/eng_zhihongli/project/data/Occ3D-nuScenes",
+    "conda_environment": "shadow_occ",
+    "target_venue": "ICRA",
+    "proposed_title": "ShadowOcc: Temporal Shadow Geometry as a Weak 3D Cue for Camera-Based Occupancy Prediction",
+    "central_question": "时序影子几何是否能为纯视觉 BEV occupancy prediction 提供额外的弱三维线索。"
+  },
+  "research_design": {
+    "inputs": [
+      "至少两帧、默认三帧的 nuScenes 六相机图像",
+      "camera intrinsics/extrinsics",
+      "ego-motion",
+      "训练阶段可选 LiDAR/Occ3D 几何监督"
+    ],
+    "pipeline": [
+      "图像特征提取",
+      "BEVFormer-style camera-to-BEV cross attention",
+      "ego-motion BEV alignment",
+      "temporal self-attention",
+      "Shadow Geometry Head",
+      "U_shadow gated shadow and height-prior fusion",
+      "binary and semantic occupancy decoding"
+    ],
+    "shadow_outputs": [
+      "P_shadow",
+      "V_shadow",
+      "P_tip",
+      "P_root",
+      "P_caster",
+      "H_prior",
+      "U_shadow",
+      "F_shadow"
+    ],
+    "losses": [
+      "L_occ",
+      "L_semantic",
+      "L_shadow_geometry",
+      "L_temporal_consistency",
+      "L_shadow_motion_smooth",
+      "L_caster_shadow_geometry",
+      "L_render_shadow",
+      "L_uncertainty_gating"
+    ],
+    "main_evaluation": [
+      "Occupancy_mIoU",
+      "Occupied_IoU",
+      "Free_IoU",
+      "Semantic_mIoU",
+      "RayIoU",
+      "HeightPrior_corr",
+      "HeightPrior_MAE",
+      "0-20m / 20-40m / 40-60m distance-stratified metrics"
+    ]
+  },
+  "data_boundary": {
+    "pseudo_shadow_main_source": "nuScenes images + LIDAR_TOP + calibration + ego pose",
+    "pseudo_shadow_geometry_source": "nuscenes_lidar",
+    "occupancy_supervision": "Occ3D-nuScenes",
+    "final_evaluation": "Occ3D-nuScenes",
+    "inference_inputs": "camera images + calibration + ego-motion; no LiDAR or Occ3D input",
+    "occ3d_shadow_mode": "仅作为 oracle/diagnostic，不应作为主结果的 shadow-label geometry source",
+    "annotations_json_required": false,
+    "manual_shadow_ground_truth_available": false,
+    "manual_gt_policy": "没有人工 shadow GT 时，不宣称 shadow segmentation accuracy；使用时序/几何一致性、扰动实验和下游 OCC 增益构成证据链。"
+  },
+  "implemented_modules": {
+    "shadow_candidate": [
+      "HSV low-illumination mask",
+      "Lab temporal difference",
+      "local exposure compensation",
+      "ground-plane alignment using calibration and ego-motion",
+      "multi-camera projection into BEV"
+    ],
+    "temporal_geometry": [
+      "connected-component geometry",
+      "root/tip/direction/length extraction",
+      "global-coordinate shadow tracking",
+      "caster/root stability",
+      "tip motion and smoothness",
+      "temporal reliability"
+    ],
+    "model": [
+      "self-contained BEVFormer-style encoder",
+      "temporal BEV alignment and fusion",
+      "Shadow Geometry Head",
+      "H_prior causally connected to OCC fusion",
+      "U_shadow gated residual fusion",
+      "binary occupancy head",
+      "semantic occupancy head"
+    ],
+    "distributed_execution": [
+      "DDP training",
+      "multi-GPU evaluation",
+      "DistributedSampler",
+      "cross-rank metric reduction",
+      "find_unused_parameters for ablations"
+    ],
+    "diagnostics": [
+      "sample-level label-generation progress",
+      "projection and temporal-light diagnostics",
+      "pseudo-label component statistics",
+      "optional manual shadow-mask evaluator",
+      "experiment comparison and delta table",
+      "multi-seed mean/std summarizer"
+    ]
+  },
+  "important_code_fixes": [
+    {
+      "issue": "旧 baseline 关闭了 fusion，但没有关闭 shadow_loss_weight，因此不是真正 camera-only baseline。",
+      "resolution": "configs/baseline.yaml 现在关闭 use_shadow/use_shadow_fusion/use_height_prior/use_uncertainty_gate，并将所有 shadow-related loss weights 设为 0。",
+      "impact": "旧 baseline checkpoint 不能用于最终论文对比，必须重新训练。"
+    },
+    {
+      "issue": "旧 H_prior 只参与 loss 和评测，没有进入 OCC。",
+      "resolution": "H_prior 已加入 HeightPriorFusion，并受 U_shadow gate 控制。",
+      "impact": "旧 full checkpoint 不能作为最终 H_prior 因果实验结果，必须重新训练。"
+    },
+    {
+      "issue": "旧 ablation_no_gate 实际关闭了整个 shadow fusion。",
+      "resolution": "现在保留 shadow fusion，只将 uncertainty gate 替换为全 1 gate。"
+    },
+    {
+      "issue": "DDP baseline/ablation 出现 Expected to have finished reduction 和 unused parameter indices。",
+      "resolution": "DDP 使用 find_unused_parameters=True。"
+    },
+    {
+      "issue": "训练时报 KeyError: temporal_prev_P_caster。",
+      "resolution": "模型输出已加入 temporal_prev_P_caster；远端必须同步 shadow_occ/models/bevformer_occ.py 与 train.py。"
+    },
+    {
+      "issue": "make_shadow_labels 多进程长期显示 0%。",
+      "resolution": "增加 outputs/.../label_progress/{scene}.json 和 sample-level progress monitor；内存有限时建议 1-2 workers。"
+    }
+  ],
+  "configuration_files": {
+    "configs/default.yaml": "完整 ShadowOcc",
+    "configs/baseline.yaml": "严格 camera-only baseline",
+    "configs/ablation_no_gate.yaml": "保留 shadow fusion，移除 U_shadow gate",
+    "configs/ablation_no_temporal.yaml": "关闭 temporal difference 和 temporal consistency loss；需要匹配的 no-temporal label directory",
+    "configs/ablation_no_height.yaml": "不把 H_prior 输入 OCC fusion",
+    "configs/ablation_no_render.yaml": "关闭 rendered-shadow loss",
+    "configs/oracle_caster.yaml": "使用 nuScenes annotation caster 的诊断上界，不作为主结果"
+  },
+  "main_scripts": {
+    "scripts/make_shadow_labels.py": "生成 pseudo shadow labels",
+    "scripts/train_bevformer_occ.py": "训练入口，支持 --seed 和 DDP",
+    "scripts/evaluate_bevformer_occ.py": "OCC/semantic/ray/height/pseudo-shadow 评测",
+    "scripts/evaluate_shadow_projection.py": "投影和时序光照诊断",
+    "scripts/evaluate_shadow_height_corr.py": "shadow length 与 pseudo height 相关性预检查",
+    "scripts/evaluate_shadow_labels.py": "标签覆盖率、组件和时序统计",
+    "scripts/evaluate_shadow_annotations.py": "可选人工 shadow mask precision/recall/F1/IoU",
+    "scripts/compare_experiments.py": "baseline/full/ablation 指标及 delta 对比",
+    "scripts/summarize_seeds.py": "多 seed mean/std"
+  },
+  "generated_label_layout": {
+    "npz": "outputs_temporal/shadow_labels/{scene_name}/{sample_token}.npz",
+    "json": "outputs_temporal/shadow_labels/{scene_name}/{sample_token}.json",
+    "progress": "outputs_temporal/label_progress/{scene_name}.json",
+    "fields": [
+      "shadow_mask",
+      "shadow_root_heatmap",
+      "shadow_tip_heatmap",
+      "shadow_caster_heatmap",
+      "shadow_direction",
+      "shadow_length",
+      "height_target",
+      "shadow_reliability",
+      "rendered_shadow_prior",
+      "components"
+    ]
+  },
+  "observed_results": {
+    "old_full_result_not_final": {
+      "Occupancy_mIoU": 0.5385753852121641,
+      "Occupied_IoU": 0.1257621624624841,
+      "Free_IoU": 0.9513886079618441,
+      "Semantic_mIoU": 0.04770752468819902,
+      "RayIoU": 0.26879923498515196,
+      "HeightPrior_corr": 0.27385158487035155,
+      "HeightPrior_MAE": 1.8700202290424004,
+      "RayIoU_by_distance": {
+        "0-20m": 0.6220882460593198,
+        "20-40m": 0.17479291515617795,
+        "40-60m": 0.00951654373995803
+      },
+      "status": "仅作历史参考；生成于 H_prior 真正接入 fusion 之前。"
+    },
+    "old_baseline_result_invalid_for_final_claim": {
+      "Occupancy_mIoU": 0.5366501769427341,
+      "RayIoU": 0.2559283381632546,
+      "Semantic_mIoU": 0.04881712563293967,
+      "HeightPrior_corr": 0.26319633993330777,
+      "status": "旧 baseline 训练时仍可能包含 shadow loss，不能用于最终因果对比。"
+    },
+    "shadow_projection_diagnostics": {
+      "samples": 34149,
+      "cameras": 204894,
+      "reprojection_p95_px_mean": 4.64993636075599e-11,
+      "projected_ground_points_mean": 1923.4071031850615,
+      "temporal_overlap_pixels_mean": 1070999.6579450837,
+      "temporal_selected_ground_points_mean": 585.2878610403428,
+      "temporal_selected_ground_point_ratio": 0.30429744180061347,
+      "light_difference_mean": 2.867981887963212,
+      "interpretation": "round-trip reprojection 接近 0 只证明投影实现自洽，不证明真实 shadow label 准确。"
+    }
+  },
+  "known_errors_and_causes": [
+    {
+      "error": "No module named shadow_occ",
+      "cause": "未从仓库根目录运行或未 pip install -e .",
+      "fix": "cd repository root; pip install -e ."
+    },
+    {
+      "error": "BrokenProcessPool with oom-kill",
+      "cause": "label workers 每个都加载 nuScenes 元数据和图像，10-20 workers 内存过高",
+      "fix": "使用 --num-workers 1 或 2，并分配足够内存"
+    },
+    {
+      "error": "evaluate_shadow_height_corr.py: unrecognized arguments --num-workers",
+      "cause": "--num-workers 仅属于 make_shadow_labels.py",
+      "fix": "评估相关性命令移除 --num-workers"
+    },
+    {
+      "error": "Permission denied under /public/home/eng_Zhihongli",
+      "cause": "路径大小写错误；正确用户名是 eng_zhihongli",
+      "fix": "修正 configs/output-root 路径大小写"
+    },
+    {
+      "error": "Database version not found: .../nuscenes/v1.0-trainval",
+      "cause": "dataroot 指向错误",
+      "fix": "使用 /public/home/eng_zhihongli/project/data/nuscenes-full"
+    },
+    {
+      "error": "Occ3D label not found for sample",
+      "cause": "Occ3D root/layout 不匹配或样本缺失",
+      "fix": "确认 /public/home/eng_zhihongli/project/data/Occ3D-nuScenes/gts/{scene}/{token}/labels.npz"
+    },
+    {
+      "error": "CUDA initialization: CUDA unknown error",
+      "cause": "Slurm GPU 环境、CUDA_VISIBLE_DEVICES 或动态库路径未正确传入",
+      "fix": "在 GPU allocation 内检查 nvidia-smi、torch.cuda.is_available()、torch.cuda.device_count()；复用已验证可用的训练环境变量"
+    },
+    {
+      "error": "Starting evaluation ... rank 0/2 when expecting one process",
+      "cause": "仍由 torchrun 两进程启动或继承了 WORLD_SIZE/RANK 环境变量",
+      "fix": "单卡/CPU 评测使用 plain python，并清理分布式环境变量"
+    }
+  ],
+  "recommended_remote_commands": {
+    "generate_labels": "python scripts/make_shadow_labels.py --config configs/default.yaml --dataroot /public/home/eng_zhihongli/project/data/nuscenes-full --geometry-source nuscenes_lidar --output-root outputs_temporal --num-workers 2",
+    "projection_diagnostics": "python scripts/evaluate_shadow_projection.py --label-root outputs_temporal/shadow_labels --output-root outputs_temporal",
+    "label_statistics": "python scripts/evaluate_shadow_labels.py --label-root outputs_temporal/shadow_labels --output-root outputs_temporal",
+    "train_full_seed0_two_gpu": "CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/train_bevformer_occ.py --config configs/default.yaml --dataroot /public/home/eng_zhihongli/project/data/nuscenes-full --occ-root /public/home/eng_zhihongli/project/data/Occ3D-nuScenes --shadow-label-root outputs_temporal/shadow_labels --output-root outputs/full_seed0 --seed 0 --device cuda",
+    "train_baseline_seed0_two_gpu": "CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/train_bevformer_occ.py --config configs/baseline.yaml --dataroot /public/home/eng_zhihongli/project/data/nuscenes-full --occ-root /public/home/eng_zhihongli/project/data/Occ3D-nuScenes --output-root outputs/baseline_seed0 --seed 0 --device cuda",
+    "evaluate_full_two_gpu": "CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/evaluate_bevformer_occ.py --config configs/default.yaml --dataroot /public/home/eng_zhihongli/project/data/nuscenes-full --occ-root /public/home/eng_zhihongli/project/data/Occ3D-nuScenes --shadow-label-root outputs_temporal/shadow_labels --output-root outputs/full_seed0 --checkpoint outputs/full_seed0/checkpoints/bevformer_occ_shadow_epoch_011.pth --device cuda",
+    "evaluate_cpu_pattern": "python scripts/evaluate_bevformer_occ.py --config CONFIG --dataroot NUSCENES --occ-root OCC3D --output-root OUTPUT --checkpoint CHECKPOINT --device cpu"
+  },
+  "paper_experiment_matrix": [
+    "camera-only baseline",
+    "full ShadowOcc",
+    "no uncertainty gate",
+    "no temporal difference/consistency",
+    "no height-prior fusion",
+    "no rendered-shadow loss",
+    "oracle caster diagnostic",
+    "seeds 0/1/2 for baseline and full",
+    "distance-stratified OCC/RayIoU",
+    "calibration and ego-motion perturbation",
+    "qualitative success/failure cases",
+    "runtime, memory, parameters and FPS"
+  ],
+  "current_evidence_assessment": {
+    "idea_status": "有潜力，框架已跑通，但尚未形成 ICRA 级因果证据。",
+    "strongest_current_evidence": "时序标签生成完成、BEV shadow head 和 gated fusion 已实现、历史结果显示小幅 RayIoU 差异。",
+    "main_missing_evidence": "修正后的严格 baseline 与 full 模型尚需重新训练并在相同 seed/split/epoch 下比较。",
+    "far_range_status": "历史 40-60m RayIoU 约 0.01，尚不能支撑远距离提升主张。",
+    "semantic_status": "历史 Semantic_mIoU 约 0.05，语义 OCC 能力仍弱。"
+  },
+  "next_actions_in_priority_order": [
+    "将最新代码同步到服务器；不要上传 __pycache__。",
+    "使用修正后的 configs/baseline.yaml 重新训练 baseline seed 0。",
+    "使用 H_prior 已接入 fusion 的 configs/default.yaml 重新训练 full seed 0。",
+    "使用同一官方 train/val split、epoch、batch size 和 checkpoint epoch 评测两者。",
+    "运行 compare_experiments.py，首先确认 Occupied_IoU、RayIoU 和分距离指标是否稳定提升。",
+    "若 seed 0 有正增益，再运行 seed 1/2 并使用 summarize_seeds.py。",
+    "依次训练 no_gate、no_temporal、no_height、no_render 消融。",
+    "没有人工 shadow GT 时，补充跨视角一致性、几何扰动和定性失败案例；明确 shadow label 为 weak pseudo supervision。"
+  ],
+  "validation_status": {
+    "local_compileall": "passed",
+    "local_pytest": "5 passed",
+    "local_model_smoke": "not run because local Windows environment did not have torch installed",
+    "required_server_validation": "python scripts/train_bevformer_occ.py --smoke and a small train/eval run in conda env shadow_occ"
+  },
+  "agent_guidance": [
+    "不要把旧 baseline/full 数字作为最终论文结果。",
+    "不要把接近零的 round-trip reprojection error 描述为真实标定精度。",
+    "不要声称 shadow segmentation accuracy，除非获得人工或独立 GT。",
+    "不要让 Occ3D 参与主方法的 pseudo shadow-label generation；主路径保持 geometry_source=nuscenes_lidar。",
+    "推理阶段应保持 camera-only，并明确 LiDAR/Occ3D 只用于训练监督或标签构造。",
+    "所有论文比较必须使用匹配的数据划分、seed、epoch 和评测实现。"
+  ]
+}

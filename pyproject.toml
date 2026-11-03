@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadow-occ"
+version = "0.1.0"
+description = "Pseudo shadow geometry labels and height-prior heads for nuScenes + Occ3D occupancy experiments."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "opencv-python>=4.7",
+  "PyYAML>=6.0",
+  "tqdm>=4.65",
+  "nuscenes-devkit>=1.1.11",
+  "pyquaternion>=0.9.9",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.scripts]
+shadow-occ = "shadow_occ.cli:main"
+shadow-occ-train = "shadow_occ.train:main"
+shadow-occ-eval = "shadow_occ.evaluate:main"
+
+[tool.setuptools.packages.find]
+include = ["shadow_occ*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

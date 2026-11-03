@@ -1,0 +1,5 @@
+# Shadow branch without uncertainty-gated fusion.
+model:
+  use_shadow: true
+  use_shadow_fusion: true
+  use_uncertainty_gate: false

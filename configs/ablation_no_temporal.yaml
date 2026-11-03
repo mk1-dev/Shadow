@@ -1,0 +1,11 @@
+# Shadow branch with temporal consistency disabled.
+model:
+  use_shadow: true
+  use_shadow_fusion: true
+
+shadow:
+  # This setting applies when generating the matching label directory.
+  use_temporal_difference: false
+
+train:
+  temporal_loss_weight: 0.0

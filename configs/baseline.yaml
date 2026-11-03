@@ -1,0 +1,26 @@
+# Camera-only temporal OCC baseline. Keep the same backbone, split and
+# optimizer as default.yaml, but disable shadow fusion and shadow objectives.
+data:
+  geometry_source: nuscenes_lidar
+  scene_names: []
+  train_scene_names: []
+  val_scene_names: []
+  use_annotation_caster: false
+
+model:
+  use_shadow: false
+  use_shadow_fusion: false
+  use_height_prior: false
+  use_uncertainty_gate: false
+
+train:
+  # Strict camera-only baseline: no shadow target or shadow regularizer can
+  # contribute to the optimization objective.
+  shadow_loss_weight: 0.0
+  temporal_loss_weight: 0.0
+  motion_smooth_loss_weight: 0.0
+  caster_geometry_loss_weight: 0.0
+  render_loss_weight: 0.0
+  uncertainty_loss_weight: 0.0
+  seed: 0
+  deterministic: false

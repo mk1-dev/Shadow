@@ -1,0 +1,5 @@
+# Shadow branch without feeding the predicted height prior into OCC fusion.
+model:
+  use_shadow: true
+  use_shadow_fusion: true
+  use_height_prior: false

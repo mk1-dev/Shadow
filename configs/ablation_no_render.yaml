@@ -1,0 +1,7 @@
+# Shadow model without the fixed-sun rendered-shadow auxiliary objective.
+model:
+  use_shadow: true
+  use_shadow_fusion: true
+
+train:
+  render_loss_weight: 0.0

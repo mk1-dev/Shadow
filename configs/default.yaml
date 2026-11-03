@@ -1,0 +1,114 @@
+data:
+  version: v1.0-trainval
+  dataroot: E:/datasets/nuscenes
+  occ_root: E:/datasets/Occ3D-nuScenes
+  output_root: E:/VLA_baseline/mulit_VLA/Shadow/outputs
+  geometry_source: nuscenes_lidar  # keep Occ3D out of pseudo shadow-label generation
+  shadow_label_root:
+  image_size: [256, 704]
+  num_frames: 3
+  cams:
+    - CAM_FRONT
+    - CAM_FRONT_LEFT
+    - CAM_FRONT_RIGHT
+    - CAM_BACK
+    - CAM_BACK_LEFT
+    - CAM_BACK_RIGHT
+  scene_names: []
+  train_scene_names: []
+  val_scene_names: []
+  max_samples:
+  occ_frame: ego
+  use_annotation_caster: false
+
+occ:
+  # Common Occ3D-nuScenes label ids use 17 for free and 255 for ignore.
+  num_classes: 18
+  free_label: 17
+  ignore_label: 255
+  semantic_eval_class_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  z_axis: 2
+  voxel_size: [0.4, 0.4, 0.4]
+  pc_range: [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+  ground_class_ids: [11, 12, 13, 14, 15]
+  object_class_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+bev:
+  x_min: -40.0
+  x_max: 40.0
+  y_min: -40.0
+  y_max: 40.0
+  resolution: 0.4
+
+shadow:
+  dark_percentile: 28.0
+  max_dark_value: 130
+  min_saturation: 0
+  morph_kernel: 5
+  min_component_area: 8
+  min_length_m: 1.2
+  min_elongation: 1.8
+  min_track_age: 2
+  root_height_threshold_m: 0.6
+  heatmap_sigma: 1.8
+  sun_direction_xy: [1.0, -1.0]
+  sun_elevation_deg: 35.0
+  render_height_threshold_m: 0.6
+  caster_match_distance_m: 6.0
+  use_temporal_difference: true
+  temporal_diff_percentile: 65.0
+  min_temporal_l_diff: 6.0
+  max_temporal_chroma_diff: 18.0
+  temporal_dilate_kernel: 9
+  exposure_compensation: true
+  temporal_min_overlap: 32
+  caster_max_motion_m: 0.75
+  tip_max_motion_m: 3.0
+  tip_smoothness_sigma_m: 1.5
+  ground_plane_z_offset_m: 0.0
+
+lidar:
+  ground_margin_m: 0.25
+  min_points_per_cell: 2
+  min_height_m: 0.15
+  max_height_m: 5.0
+
+eval:
+  distance_bins_m:
+    - [0.0, 20.0]
+    - [20.0, 40.0]
+    - [40.0, 60.0]
+
+model:
+  bev_channels: 128
+  image_feature_channels: 128
+  num_bev_layers: 2
+  num_heads: 4
+  shadow_hidden_channels: 128
+  z_anchors: [0.4, 1.2, 2.0, 3.2]
+  dropout: 0.1
+  use_shadow: true
+  use_shadow_fusion: true
+  use_height_prior: true
+  use_uncertainty_gate: true
+
+train:
+  batch_size: 1
+  num_workers: 0
+  epochs: 12
+  lr: 0.0002
+  weight_decay: 0.01
+  log_interval: 10
+  save_interval: 1
+  resume:
+  device: cuda
+  occ_loss_weight: 1.0
+  semantic_loss_weight: 1.0
+  shadow_loss_weight: 1.0
+  temporal_loss_weight: 1.0
+  motion_smooth_loss_weight: 0.2
+  caster_geometry_loss_weight: 0.2
+  render_loss_weight: 0.5
+  uncertainty_loss_weight: 1.0
+  seed: 0
+  deterministic: false

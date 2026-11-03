@@ -1,0 +1,554 @@
+# Shadow-OCC
+
+Runnable nuScenes + Occ3D code for testing whether temporal shadow geometry can
+provide a weak 3D cue for BEV occupancy, especially at long range.
+
+The implemented main pipeline is:
+
+```text
+nuScenes images + calibration + ego pose + LIDAR_TOP
+  -> dark-region candidates
+  -> ground projection to a shared BEV grid
+  -> ego-motion alignment and temporal tracking
+  -> root / tip / direction / length / reliability labels
+  -> temporal BEVFormer-style encoder
+  -> Shadow Geometry Head
+  -> U_shadow-gated fusion
+  -> binary and semantic occupancy heads
+  -> Occ3D-style evaluation
+```
+
+This repository contains a self-contained BEVFormer-style implementation. It
+does not require `mmcv`, `mmdet3d`, or an external BEVFormer checkout.
+
+## 1. Data boundary
+
+The main experiment keeps pseudo-label construction separate from benchmark
+evaluation:
+
+```text
+Shadow pseudo labels: nuScenes images + LIDAR_TOP + calibration + ego pose
+OCC supervision:      Occ3D labels
+Final evaluation:     Occ3D labels
+```
+
+The default `data.geometry_source` is `nuscenes_lidar`. The `occ3d` geometry
+source is an oracle/diagnostic mode and should not be used as the main result,
+because it uses Occ3D geometry while constructing shadow candidates.
+
+Current implementation status:
+
+| Module | Status |
+|---|---|
+| Dark regions and multi-camera BEV projection | Implemented |
+| Ego-motion BEV alignment and temporal fusion | Implemented |
+| Component filtering and basic tracking | Implemented |
+| Root, tip, direction, length, reliability | Implemented |
+| `P_shadow/P_root/P_tip/P_caster/V_shadow/H_prior/U_shadow` | Implemented |
+| U_shadow-gated OCC fusion | Implemented |
+| OCC and semantic OCC training | Implemented |
+| Temporal caster consistency loss | Connected to training |
+| Per-range Occupancy mIoU | Implemented |
+| Two-GPU training and evaluation | Implemented |
+| SAM2/SAM2Long | Not included |
+| GroundingDINO | Not included; caster defaults to a root proxy |
+| DINOv2 feature consistency | Not included |
+| Official Occ3D leaderboard evaluator parity | Not included |
+
+`rendered_shadow_prior` is an approximate fixed-sun BEV ray-cast prior, not a
+full differentiable renderer.
+
+## 2. Repository layout
+
+```text
+configs/
+  default.yaml                 Full Shadow-OCC configuration
+  baseline.yaml                Camera-only OCC baseline
+  ablation_no_gate.yaml        Fuse shadow without U_shadow gating
+  ablation_no_temporal.yaml    Disable temporal consistency loss
+  ablation_no_height.yaml      Remove H_prior from OCC fusion
+  ablation_no_render.yaml      Remove rendered-shadow loss
+  oracle_caster.yaml           Annotation-based caster diagnostic upper bound
+
+scripts/
+  make_shadow_labels.py        Generate pseudo shadow labels
+  train_bevformer_occ.py       Training entry point
+  evaluate_bevformer_occ.py    OCC evaluation entry point
+  evaluate_shadow_height_corr.py  Shadow geometry precheck
+  evaluate_shadow_labels.py       Pseudo-label/component statistics
+  evaluate_shadow_annotations.py  Optional manual shadow-mask evaluation
+  compare_experiments.py           Matched experiment table and deltas
+  summarize_seeds.py               Mean/std over repeated seeds
+
+shadow_occ/
+  data/                        nuScenes, Occ3D, and LiDAR adapters
+  geometry/                    BEV grid, projection, transforms
+  shadow/                      Dark masks, labels, tracking, rendering
+  models/                      BEVFormer-style model, head, losses
+  metrics/                     Occupancy, Semantic, RayIoU, height metrics
+  train.py                     Training implementation
+  evaluate.py                  Evaluation implementation
+
+tests/                         Synthetic smoke test
+```
+
+## 3. Data preparation
+
+### nuScenes
+
+Use the full `v1.0-trainval` nuScenes release:
+
+```text
+/data/nuscenes/
+  samples/
+  sweeps/
+  maps/
+  v1.0-trainval/
+```
+
+The metadata must describe the six cameras and `LIDAR_TOP` sensor.
+
+### Occ3D-nuScenes
+
+Occ3D is required for OCC training and final evaluation. The loader supports:
+
+```text
+/data/Occ3D-nuScenes/gts/{scene_name}/{sample_token}/labels.npz
+/data/Occ3D-nuScenes/{scene_name}/{sample_token}/labels.npz
+/data/Occ3D-nuScenes/{sample_token}/labels.npz
+/data/Occ3D-nuScenes/labels/{sample_token}.npz
+```
+
+Each `labels.npz` must contain one of:
+
+```text
+semantics, semantic, labels, voxel_label
+```
+
+Optional visibility arrays are supported: `mask_camera` and `mask_lidar`.
+The default label convention is semantic classes `0..16`, free `17`, ignore
+`255`.
+
+`annotations.json` is not required by the main pipeline. nuScenes metadata and
+Occ3D `labels.npz` are sufficient. Sample annotations are disabled by default.
+
+## 4. Ubuntu installation
+
+Install a PyTorch build compatible with the server CUDA driver, then install
+this package:
+
+```bash
+cd /public/home/USER/project/Shadow
+source /public/home/USER/anaconda3/etc/profile.d/conda.sh
+conda activate shadow_occ
+pip install -e .
+```
+
+Verify the environment:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+python -m pytest -q
+python scripts/train_bevformer_occ.py --smoke
+```
+
+For a Slurm job on two RTX 4090 GPUs:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export LD_LIBRARY_PATH=/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
+export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
+unset PYTORCH_CUDA_ALLOC_CONF
+```
+
+Do not use the Windows paths in `default.yaml` on Linux. Pass Linux paths on
+the command line as shown below.
+
+## 5. Configuration
+
+Important defaults in `configs/default.yaml`:
+
+```yaml
+data:
+  version: v1.0-trainval
+  geometry_source: nuscenes_lidar
+  num_frames: 3
+  occ_frame: ego
+
+model:
+  use_shadow: true
+  use_shadow_fusion: true
+
+train:
+  batch_size: 1       # per-GPU batch size under DDP
+  num_workers: 0
+  epochs: 12
+```
+
+The default BEV range is `[-40, 40]m x [-40, 40]m` with `0.4m` resolution,
+which gives a `200 x 200` BEV map. The default OCC grid has 16 height bins.
+
+With empty `data.scene_names`, training uses the official nuScenes `train`
+scenes and evaluation uses the official `val` scenes. An explicit `--scene`
+is useful for debugging, but is not a valid paper split.
+
+## 6. Generate shadow labels
+
+The main path uses LiDAR and images. It does not use Occ3D to create the
+pseudo shadow labels.
+
+Small check:
+
+```bash
+python scripts/make_shadow_labels.py \
+  --config configs/default.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --geometry-source nuscenes_lidar \
+  --output-root outputs_quick \
+  --scene scene-0001 --max-samples 100 --num-workers 1
+```
+
+Full generation:
+
+```bash
+python scripts/make_shadow_labels.py \
+  --config configs/default.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --geometry-source nuscenes_lidar \
+  --output-root outputs --num-workers 2
+```
+
+The process pool is scene-level. Each worker loads nuScenes tables and images,
+so use 1 or 2 workers when memory is limited; 10 or 15 workers can trigger
+OOM kills. With multiple workers, the progress bar is sample-level and shows
+active scene progress. Per-scene state is also written under
+`outputs/label_progress/`, which is useful for diagnosing a slow or failed
+scene.
+
+Output:
+
+```text
+outputs/shadow_labels/{scene_name}/{sample_token}.npz
+outputs/shadow_labels/{scene_name}/{sample_token}.json
+outputs/run_config.json
+```
+
+The label files contain `shadow_mask`, root/tip/caster heatmaps, direction,
+length, reliability, `rendered_shadow_prior`, temporal light confidence, and
+component metadata. The default caster is a root-based proxy, not a
+GroundingDINO detection.
+
+The label generator now uses the previous frame when available. It warps the
+previous camera image to the current image on the calibrated ground plane,
+performs robust local exposure compensation, computes Lab `L/a/b` changes,
+and combines the temporal candidate with the current HSV dark mask. The
+component tracker measures caster/root stability and shadow-tip motion in
+global coordinates. Each label JSON also records image-ground round-trip
+reprojection statistics.
+
+To summarize these diagnostics after label generation:
+
+```bash
+python scripts/evaluate_shadow_projection.py \
+  --label-root outputs/shadow_labels \
+  --output-root outputs
+```
+
+This writes `outputs/metrics/shadow_projection_metrics.json`. Re-run
+`make_shadow_labels.py` after enabling or changing these settings; old label
+files do not contain temporal-difference fields.
+
+Summarize component and temporal-label statistics:
+
+```bash
+python scripts/evaluate_shadow_labels.py \
+  --label-root outputs/shadow_labels \
+  --output-root outputs
+```
+
+This reports nonempty-label ratio, component count, length/elongation,
+caster stability, tip motion, temporal selection ratio, and mean light
+difference. These are diagnostics for generated pseudo labels, not ground
+truth shadow accuracy.
+
+## 7. Shadow geometry precheck
+
+```bash
+python scripts/evaluate_shadow_height_corr.py \
+  --config configs/default.yaml \
+  --label-root outputs/shadow_labels \
+  --output-root outputs
+```
+
+This writes `outputs/metrics/shadow_height_corr.json` and reports component
+shadow-length versus root-neighborhood height correlation for 0-20m, 20-40m,
+40-60m, and all ranges.
+
+For LiDAR-generated labels this is a LiDAR pseudo-height precheck. It is not
+the final Occ3D height metric. After model training, use `HeightPrior_corr`
+to compare predicted `H_prior` with independently loaded Occ3D `H_occ`.
+
+## 8. Fast training and validation
+
+Create a one-epoch debug configuration:
+
+```bash
+cp configs/default.yaml configs/quick.yaml
+sed -i 's/^  epochs: 12$/  epochs: 1/' configs/quick.yaml
+sed -i 's/^  num_workers: 0$/  num_workers: 2/' configs/quick.yaml
+```
+
+Train 100 samples on two GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/train_bevformer_occ.py \
+  --config configs/quick.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs_quick \
+  --shadow-label-root outputs_quick/shadow_labels \
+  --scene scene-0001 --max-samples 100 --device cuda
+```
+
+The checkpoint is:
+
+```text
+outputs_quick/checkpoints/bevformer_occ_shadow_epoch_000.pth
+```
+
+Quick functional evaluation on the same scene:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/evaluate_bevformer_occ.py \
+  --config configs/quick.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs_quick \
+  --checkpoint outputs_quick/checkpoints/bevformer_occ_shadow_epoch_000.pth \
+  --scene scene-0001 --max-samples 20 --device cuda
+```
+
+This only verifies the pipeline. It is not a paper result. For a quick
+generalization check, remove `--scene` so the official val split is used:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/evaluate_bevformer_occ.py \
+  --config configs/quick.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs_quick \
+  --checkpoint outputs_quick/checkpoints/bevformer_occ_shadow_epoch_000.pth \
+  --max-samples 200 --device cuda
+```
+
+## 9. Formal training and two-GPU evaluation
+
+After the quick run succeeds, generate labels for all required samples and
+train with the full configuration:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/train_bevformer_occ.py \
+  --config configs/default.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs \
+  --shadow-label-root outputs/shadow_labels \
+  --device cuda
+```
+
+Evaluate the official val split on two GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/evaluate_bevformer_occ.py \
+  --config configs/default.yaml \
+  --dataroot /data/nuscenes \
+  --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs \
+  --checkpoint outputs/checkpoints/bevformer_occ_shadow_epoch_011.pth \
+  --device cuda
+```
+
+The evaluator uses `DistributedSampler`, reduces metric state across ranks,
+and only rank 0 writes the result file. Do not launch two independent full
+evaluators against the same output directory.
+
+Use `--seed` to make repeated runs comparable:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/train_bevformer_occ.py \
+  --config configs/default.yaml --seed 0 \
+  --dataroot /data/nuscenes --occ-root /data/Occ3D-nuScenes \
+  --output-root outputs/full_seed0 \
+  --shadow-label-root outputs/shadow_labels --device cuda
+```
+
+## 10. Metrics
+
+Results are written to `outputs/metrics/occ3d_metrics.json`:
+
+```text
+Occupancy_mIoU
+Occupancy_mIoU_by_distance
+Occupied_IoU
+Free_IoU
+Semantic_mIoU
+Semantic_IoU_by_class
+RayIoU
+RayIoU_by_distance
+HeightPrior_corr
+HeightPrior_MAE
+HeightPrior_corr_by_distance
+PseudoShadow_shadow_F1
+PseudoShadow_direction_cosine
+PseudoShadow_reliability_MAE
+samples_per_second
+```
+
+The paper-facing report should include overall and 0-20m, 20-40m, 40-60m
+Occupancy mIoU, RayIoU, Semantic mIoU, and HeightPrior correlation. The local
+RayIoU implementation is an ego-centric ray-space metric; use the official
+Occ3D evaluator separately for leaderboard-comparable numbers.
+
+## 11. Baseline and ablations
+
+Recommended experiments:
+
+| Experiment | Config | Purpose |
+|---|---|---|
+| Camera-only baseline | `configs/baseline.yaml` | Remove shadow fusion and shadow losses |
+| Full Shadow-OCC | `configs/default.yaml` | Main method |
+| No gate | `configs/ablation_no_gate.yaml` | Fuse shadow without U_shadow |
+| No temporal loss | `configs/ablation_no_temporal.yaml` | Test temporal consistency |
+| No height prior | `configs/ablation_no_height.yaml` | Test whether H_prior affects OCC |
+| No render loss | `configs/ablation_no_render.yaml` | Test OCC-to-shadow auxiliary loss |
+| Oracle caster | `configs/oracle_caster.yaml` | Diagnostic upper bound only |
+
+Use separate output roots, for example `outputs/baseline`, `outputs/full`,
+`outputs/no_gate`, and `outputs/no_temporal`. The key claim is the difference
+between Full Shadow-OCC and the camera-only baseline, especially at 40-60m.
+
+The baseline is strict: `model.use_shadow=false` and every shadow-related
+loss weight is zero. Older checkpoints trained before this setting was added
+must not be used as the paper baseline. The full model now feeds `H_prior`
+into the confidence-gated OCC fusion; retrain the full model after changing
+this code.
+
+Compare matched evaluations:
+
+```bash
+python scripts/compare_experiments.py \
+  --experiment baseline=outputs/baseline/metrics/occ3d_metrics.json \
+  --experiment full=outputs/full/metrics/occ3d_metrics.json \
+  --experiment no_gate=outputs/no_gate/metrics/occ3d_metrics.json \
+  --experiment no_temporal=outputs/no_temporal/metrics/occ3d_metrics.json \
+  --experiment no_height=outputs/no_height/metrics/occ3d_metrics.json \
+  --output-root outputs/experiment_comparison
+```
+
+The first experiment is treated as the baseline and every `delta_*` column is
+computed against it. Use the same official train/val split, epoch count,
+seed, and checkpoint epoch for all rows.
+
+Summarize three repeated runs:
+
+```bash
+python scripts/summarize_seeds.py \
+  --experiment baseline=outputs/baseline_s0/metrics/occ3d_metrics.json,outputs/baseline_s1/metrics/occ3d_metrics.json,outputs/baseline_s2/metrics/occ3d_metrics.json \
+  --experiment full=outputs/full_s0/metrics/occ3d_metrics.json,outputs/full_s1/metrics/occ3d_metrics.json,outputs/full_s2/metrics/occ3d_metrics.json \
+  --output-root outputs/seed_summary
+```
+
+For a small manually labelled shadow set, create an `annotations.json` file:
+
+```json
+{
+  "annotations": [
+    {
+      "scene_name": "scene-0001",
+      "sample_token": "...",
+      "mask_path": "masks/sample.png"
+    }
+  ]
+}
+```
+
+The mask can be a PNG, NPY array, or inline 2D `mask` list. Evaluate it with:
+
+```bash
+python scripts/evaluate_shadow_annotations.py \
+  --annotations annotations.json \
+  --label-root outputs/shadow_labels \
+  --output-root outputs
+```
+
+## 12. Architecture and losses
+
+Input:
+
+```text
+I_(t-2), I_(t-1), I_t
+camera projection matrices
+ego-to-global transforms
+```
+
+Model:
+
+```text
+image CNN
+  -> BEV queries and camera-projection cross-attention
+  -> per-frame BEV features
+  -> ego-motion BEV alignment
+  -> temporal self-attention
+  -> Shadow Geometry Head
+  -> U_shadow-gated [shadow feature + H_prior] fusion
+  -> occupancy decoders
+```
+
+Shadow outputs:
+
+```text
+P_shadow, P_root, P_tip, P_caster
+V_shadow, H_prior, U_shadow, F_shadow
+```
+
+Training losses:
+
+```text
+L_occ + L_semantic + L_shadow_geometry
+      + L_temporal_consistency + L_shadow_motion_smooth
+      + L_caster_shadow_geometry + L_render_shadow
+      + L_uncertainty_gating
+```
+
+The temporal constraint keeps caster bases stable after BEV warping; it does
+not force shadow tips and boundaries to be identical across frames.
+
+## 13. Troubleshooting
+
+`No module named shadow_occ`: run from the repository root or execute
+`pip install -e .`.
+
+`BrokenProcessPool` or OOM during label generation: reduce `--num-workers` to
+1 or 2.
+
+`Occ3D label not found`: check the actual layout with:
+
+```bash
+find /data/Occ3D-nuScenes -name labels.npz | head
+```
+
+`CUDA unknown error`: check `CUDA_VISIBLE_DEVICES`, `nvidia-smi`, and
+`torch.cuda.device_count()`. Do not change `CUDA_VISIBLE_DEVICES` after Python
+has started. In Slurm, run inside the allocated GPU job.
+
+Without Occ3D, the project can still generate nuScenes-only shadow labels and
+run the length/pseudo-height precheck, but it cannot train the current OCC
+target or report Occupancy mIoU, RayIoU, and Semantic mIoU.

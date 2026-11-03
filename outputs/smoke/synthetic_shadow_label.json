@@ -1,0 +1,32 @@
+{
+  "num_components": 1,
+  "components": [
+    {
+      "component_id": 1,
+      "area": 64,
+      "centroid_xy": [
+        4.800000000000001,
+        1.7763568394002505e-15
+      ],
+      "root_xy": [
+        1.8000000000000007,
+        -0.5999999999999979
+      ],
+      "tip_xy": [
+        7.800000000000001,
+        -0.5999999999999979
+      ],
+      "direction_xy": [
+        1.0,
+        0.0
+      ],
+      "length_m": 6.0,
+      "elongation": 4.123105625617663,
+      "mean_height_near_root": 2.799999952316284,
+      "reliability": 1.0,
+      "track_id": null,
+      "track_age": 1,
+      "stable": false
+    }
+  ]
+}
