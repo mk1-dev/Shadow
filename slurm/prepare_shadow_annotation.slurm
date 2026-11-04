@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J shadow_annotation_data
-#SBATCH -p Intel
+# CPU-only preparation: keep it on the GPU partition without requesting a GPU.
+#SBATCH -p NV_RTX4090
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --mem=48G
