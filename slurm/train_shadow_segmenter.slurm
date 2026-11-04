@@ -18,10 +18,15 @@ export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 DATA_ROOT="${SHADOW_DATA_ROOT:-outputs/shadow_annotation/data}"
 OUTPUT_ROOT="${SHADOW_SEG_ROOT:-outputs/shadow_annotation/segmenter}"
+INIT_ARGS=()
+if [[ -n "${SHADOW_SEG_INIT_CHECKPOINT:-}" ]]; then
+  INIT_ARGS+=(--init-checkpoint "$SHADOW_SEG_INIT_CHECKPOINT")
+fi
 
 torchrun --standalone --nproc_per_node=2 scripts/train_shadow_segmenter.py \
   --train "$DATA_ROOT/seg_train.jsonl" \
   --dev "$DATA_ROOT/seg_dev.jsonl" \
   --output-root "$OUTPUT_ROOT" \
-  --epochs 10 --batch-size 2 --accumulation 4 --temporal-weight 0.2 --seed 0 \
-  --allow-weak-labels
+  --epochs "${SHADOW_SEG_EPOCHS:-10}" --batch-size "${SHADOW_SEG_BATCH_SIZE:-2}" \
+  --accumulation "${SHADOW_SEG_ACCUMULATION:-4}" --temporal-weight "${SHADOW_SEG_TEMPORAL_WEIGHT:-0.2}" \
+  --seed 0 --allow-weak-labels "${INIT_ARGS[@]}"

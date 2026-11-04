@@ -1,7 +1,8 @@
 # Shadow annotator: decision diagnostics before expansion
 
-Date: 2026-11-04. All commands below run on HPC, not the local Windows workspace.
-No new training, tests or data/model evaluation were executed locally.
+Date: 2026-11-04. Commands below are the HPC workflow. The code paths and unit
+tests were synchronized in `Shadow_update`; model/data evaluation still runs on
+HPC.
 
 After a passing diagnosis, the optional
 [controlled offline self-training pilot](shadow_self_training_hpc.md) provides
@@ -28,7 +29,7 @@ cumulative exposure, not a distributed estimate of all workers' samples. One GPU
 is the intended VLM configuration. Unknown metadata is never guessed into GT.
 
 ```bash
-cd /public/home/eng_zhihongli/project/Shadow
+cd /public/home/eng_zhihongli/project/Shadow_update
 conda activate shadow_annotator
 mkdir -p logs
 DATA=outputs/shadow_annotation/joint

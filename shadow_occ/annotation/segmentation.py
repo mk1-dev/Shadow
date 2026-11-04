@@ -98,10 +98,13 @@ def masked_loss(logits, target, dice_weight, weights=None):
     return loss.sum()/(count > 0).sum().clamp_min(1)
 
 
-def temporal_loss(current, previous, grid, weight):
+def temporal_loss(current, previous, grid, weight, sample_weight=None):
     previous_probability = F.grid_sample(previous.sigmoid().detach().float(), grid.float(), mode="bilinear", padding_mode="zeros", align_corners=False)[:, 0]
     error = (current[:, 0].sigmoid().float()-previous_probability).abs()
-    return (error*weight).sum()/weight.sum().clamp_min(1)
+    values = (error*weight).flatten(1).sum(1)/weight.flatten(1).sum(1).clamp_min(1)
+    if sample_weight is not None:
+        values = values*sample_weight.to(device=values.device, dtype=values.dtype).reshape(-1)
+    return values.mean()
 
 
 def evaluate(model, rows, size, device, rank=0, world=1):
@@ -243,7 +246,7 @@ def train_main():
                     loss = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights)
                     if use_temporal:
                         previous = predictions[images.shape[0]:]
-                        loss = loss + args.temporal_weight*temporal_loss(logits, previous, batch["temporal_grid"].to(device), batch["temporal_weight"].to(device))
+                        loss = loss + args.temporal_weight*temporal_loss(logits, previous, batch["temporal_grid"].to(device), batch["temporal_weight"].to(device), weights)
                     loss = loss/window
                 scaler.scale(loss).backward()
             if boundary:

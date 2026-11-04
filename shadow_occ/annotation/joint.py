@@ -57,7 +57,7 @@ def bbox_iou(a, b):
 
 
 def shadow_confusion(rows):
-    counts = {"true_positive": 0, "false_positive": 0, "false_negative": 0, "true_negative": 0, "unclassified": 0}
+    counts = {"target_yes": 0, "target_no": 0, "true_positive": 0, "false_positive": 0, "false_negative": 0, "true_negative": 0, "unclassified": 0}
     for row in rows:
         target = row.get("target")
         prediction = row.get("prediction")
@@ -65,6 +65,7 @@ def shadow_confusion(rows):
         predicted_decision = (prediction or {}).get("shadow")
         if target_decision not in {"YES", "NO"}:
             continue
+        counts["target_yes" if target_decision == "YES" else "target_no"] += 1
         if predicted_decision not in {"YES", "NO"}:
             counts["unclassified"] += 1
         elif target_decision == predicted_decision == "YES":
@@ -75,8 +76,7 @@ def shadow_confusion(rows):
             counts["false_negative"] += 1
         else:
             counts["true_negative"] += 1
-    positive = counts["true_positive"] + counts["false_negative"]
-    negative = counts["true_negative"] + counts["false_positive"]
+    positive, negative = counts["target_yes"], counts["target_no"]
     counts["positive_recall"] = counts["true_positive"]/positive if positive else None
     counts["negative_specificity"] = counts["true_negative"]/negative if negative else None
     if positive and negative:

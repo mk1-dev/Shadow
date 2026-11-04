@@ -19,7 +19,8 @@ def competing_association(shadow_xy, casters, max_attachment=1.5, min_margin=1.0
         corners = caster.get("caster_corners_ego")
         if corners is None:
             continue
-        footprint = cv2.convexHull(np.asarray(corners, np.float32)[:, :2])
+        footprint_xy = np.ascontiguousarray(np.asarray(corners, np.float32)[:, :2])
+        footprint = cv2.convexHull(footprint_xy)
         if len(shadow) < 3 or len(footprint) < 3:
             continue
         intersection, _ = cv2.intersectConvexConvex(shadow, footprint)

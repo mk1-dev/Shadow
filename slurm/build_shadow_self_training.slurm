@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J shadow_self_label_pilot
-#SBATCH -p debugpc
+#SBATCH -p Intel
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --mem=32G

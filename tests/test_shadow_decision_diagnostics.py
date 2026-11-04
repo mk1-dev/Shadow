@@ -116,7 +116,7 @@ def test_cli_freezes_dev_policy_and_rejects_a_different_eval_scorer(tmp_path):
     script = root/"scripts"/"analyze_shadow_decision_scores.py"
     dev, evaluation = tmp_path/"dev.jsonl", tmp_path/"eval.jsonl"
     write_rows(dev, [row("YES", 0.9), row("NO", 0.1, 1)])
-    write_rows(evaluation, [row("YES", 0.8, split="eval"), row("NO", 0.2, 1, split="eval")])
+    write_rows(evaluation, [row("YES", 0.8, 2, split="eval"), row("NO", 0.2, 3, split="eval")])
     subprocess.run([sys.executable, str(script), "fit-dev", "--scores", str(dev), "--output-root", str(tmp_path/"fit"), "--bootstrap", "0"], check=True, cwd=root)
     calibration = tmp_path/"fit"/"calibration.json"
     subprocess.run([sys.executable, str(script), "evaluate", "--scores", str(evaluation), "--calibration", str(calibration), "--output-root", str(tmp_path/"evaluation"), "--bootstrap", "0"], check=True, cwd=root)

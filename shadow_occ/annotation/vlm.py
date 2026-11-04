@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import hashlib
 import json
 import math
@@ -14,9 +14,11 @@ import torch
 from torch.utils.data import Dataset
 
 from shadow_occ.annotation.data import GT_SOURCES, WEAK_SOURCES, assert_disjoint, digest, read_rows, write_rows
+from shadow_occ.annotation.diagnostics import balance_audit, example_weight, temporal_multiplier
 from shadow_occ.annotation.metrics import region_summary
 from shadow_occ.annotation.offbev import ASSOCIATION_GT, choices
 from shadow_occ.annotation.joint import parse as parse_annotation
+from shadow_occ.annotation.objectives import assistant_token_groups, component_loss
 from shadow_occ.utils.io import write_json
 
 
@@ -42,7 +44,7 @@ def load_model(args, training=False):
     return model, processor
 
 
-def encode_example(processor, row, answer=None, max_length=4096):
+def encode_example(processor, row, answer=None, max_length=4096, return_groups=False):
     images = []
     for path in row["images"]:
         with Image.open(path) as image:
@@ -61,6 +63,9 @@ def encode_example(processor, row, answer=None, max_length=4096):
         result = dict(full)
         result["labels"] = full["input_ids"].clone()
         result["labels"][:, :prefix_length] = -100
+        if return_groups:
+            groups = assistant_token_groups(processor.tokenizer, full_text, answer, full["input_ids"][0, prefix_length:].tolist())
+            result["token_groups"] = torch.cat([torch.zeros(prefix_length, dtype=groups.dtype), groups])[None]
         if not (result["labels"] != -100).any():
             raise ValueError("No supervised assistant tokens")
     if result["input_ids"].shape[1] > max_length:
@@ -69,31 +74,49 @@ def encode_example(processor, row, answer=None, max_length=4096):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, rows, processor, max_length, weak_weight, decision_weights=None):
+    def __init__(self, rows, processor, max_length, weak_weight, decision_weights=None, loss_mode="component", temporal_policy=None):
+        if loss_mode not in {"component", "sequence"}:
+            raise ValueError("loss_mode must be component or sequence")
         self.rows, self.processor, self.max_length, self.weak_weight = rows, processor, max_length, weak_weight
         self.decision_weights = decision_weights or {}
+        self.loss_mode, self.temporal_policy = loss_mode, temporal_policy
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, index):
         row = self.rows[index]
-        encoded = encode_example(self.processor, row, row["answer"], self.max_length)
-        sources = {row["label_source"], row.get("shadow_label_source"), row.get("association_source")}
-        weight = self.weak_weight if sources & WEAK_SOURCES else 1.0
+        encoded = encode_example(self.processor, row, row["answer"], self.max_length, return_groups=self.loss_mode == "component")
+        weight = example_weight(row, self.weak_weight)
+        if self.temporal_policy is not None:
+            weight *= temporal_multiplier(row, self.temporal_policy)
         if self.decision_weights:
-            decision = parse_annotation(row["answer"], row.get("candidates", []))["shadow"]
+            decision = self.decision(row)
             weight *= self.decision_weights.get(decision, 1.0)
+        else:
+            decision = self.decision(row)
         encoded["example_weight"] = weight
+        encoded["target_decision"] = decision
+        if self.loss_mode == "component":
+            active = bool(row.get("association_supervision_enabled", True))
+            if not active:
+                keep = encoded["token_groups"][0] == 1
+                encoded["labels"][0, ~keep] = -100
+            encoded["association_active"] = active
         return encoded
 
+    def decision(self, row):
+        return parse_annotation(row["answer"], row.get("candidates", []))["shadow"]
 
-def shadow_decision_weights(rows, maximum=10.0):
+
+def shadow_decision_weights(rows, maximum=10.0, power=1.0):
     decisions = Counter(parse_annotation(row["answer"], row.get("candidates", []))["shadow"] for row in rows)
     total = sum(decisions.values())
     if not total or not decisions:
         raise ValueError("Cannot balance an empty annotation dataset")
-    return {decision: min(maximum, total/(len(decisions)*count)) for decision, count in sorted(decisions.items())}
+    if not 0 < power <= 1 or maximum < 1:
+        raise ValueError("Class balancing needs 0 < power <= 1 and maximum >= 1")
+    return {decision: min(maximum, (total/(len(decisions)*count))**power) for decision, count in sorted(decisions.items())}
 
 
 def one_example_collator(items):
@@ -101,6 +124,10 @@ def one_example_collator(items):
         raise ValueError("Use micro-batch size 1; increase gradient accumulation for the effective batch")
     item = dict(items[0])
     item["example_weight"] = torch.tensor(item["example_weight"], dtype=torch.float32)
+    if "token_groups" in item:
+        item["token_groups"] = torch.as_tensor(item["token_groups"], dtype=torch.long)
+    if "association_active" in item:
+        item["association_active"] = torch.tensor(item["association_active"], dtype=torch.bool)
     return item
 
 
@@ -130,13 +157,25 @@ def train_main():
     parser.add_argument("--weak-weight", type=float, default=0.25)
     parser.add_argument("--allow-weak-labels", action="store_true")
     parser.add_argument("--balance-shadow", action="store_true", help="Balance YES/NO/UNCERTAIN weights using the training split")
+    parser.add_argument("--balance-power", type=float, default=0.5, help="Tempered inverse-frequency exponent")
+    parser.add_argument("--max-class-weight", type=float, default=5.0)
+    parser.add_argument("--loss-mode", choices=["component", "sequence"], default="component")
+    parser.add_argument("--decision-loss-weight", type=float, default=1.0)
+    parser.add_argument("--association-loss-weight", type=float, default=0.5)
+    parser.add_argument("--format-loss-weight", type=float, default=0.1)
+    parser.add_argument("--temporal-policy", help="Optional frozen, dev-validated temporal weighting policy")
+    parser.add_argument("--init-adapter", help="Optional existing LoRA adapter used as a warm start")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import Trainer, TrainingArguments, set_seed
 
     if not 0 <= args.caster_ratio <= 1 or not 0 < args.weak_weight <= 1:
         raise ValueError("Invalid auxiliary ratio or weak-label weight")
+    if min(args.decision_loss_weight, args.association_loss_weight, args.format_loss_weight) < 0:
+        raise ValueError("Component loss weights cannot be negative")
+    if args.loss_mode == "component" and args.primary_task != "shadow_annotation":
+        raise ValueError("Component loss is defined for the unified shadow annotation task")
     train_all, dev_all = read_rows(args.train), read_rows(args.dev)
     if bool(args.auxiliary_train) != bool(args.auxiliary_dev):
         raise ValueError("Supply both auxiliary train and dev manifests")
@@ -174,36 +213,73 @@ def train_main():
         return shadow + casters[:int(len(shadow)*args.caster_ratio)]
 
     train, dev = select(train_all), select(dev_all)
-    decision_weights = shadow_decision_weights(train) if args.balance_shadow else {}
+    decision_weights = shadow_decision_weights(train, args.max_class_weight, args.balance_power) if args.balance_shadow else {}
+    balance_report = balance_audit(train, decision_weights, args.weak_weight)
+    temporal_policy = json.loads(Path(args.temporal_policy).read_text(encoding="utf-8")) if args.temporal_policy else None
     output = Path(args.output_root)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new LoRA output directory")
     set_seed(args.seed)
     model, processor = load_model(args, training=True)
-    # Explicit full module names prevent matching Qwen's visual attention blocks.
-    targets = [name for name, _ in model.named_modules() if ".language_model." in name and name.rsplit(".", 1)[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}]
-    if not targets:
-        raise ValueError("No language attention modules found; inspect this model's module names")
-    model = get_peft_model(model, LoraConfig(task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=2*args.lora_rank, lora_dropout=0.05, target_modules=targets, bias="none"))
+    initialization = None
+    if args.init_adapter:
+        adapter_path = Path(args.init_adapter)
+        adapter_config = json.loads((adapter_path/"adapter_config.json").read_text(encoding="utf-8"))
+        targets = adapter_config.get("target_modules")
+        protocol_path = adapter_path.parent/"training_protocol.json"
+        initialization = json.loads(protocol_path.read_text(encoding="utf-8")) if protocol_path.is_file() else {"training_protocol_missing": True}
+        model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
+    else:
+        # Explicit full module names prevent matching Qwen's visual attention blocks.
+        targets = [name for name, _ in model.named_modules() if ".language_model." in name and name.rsplit(".", 1)[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}]
+        if not targets:
+            raise ValueError("No language attention modules found; inspect this model's module names")
+        model = get_peft_model(model, LoraConfig(task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=2*args.lora_rank, lora_dropout=0.05, target_modules=targets, bias="none"))
     model.enable_input_require_grads()
     model.print_trainable_parameters()
 
+    objective_weights = {"decision": args.decision_loss_weight, "association": args.association_loss_weight, "format": args.format_loss_weight}
+
     class WeightedTrainer(Trainer):
+        def __init__(self, *trainer_args, **trainer_kwargs):
+            super().__init__(*trainer_args, **trainer_kwargs)
+            self.loss_counts, self.loss_sums = Counter(), defaultdict(float)
+
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             weight = inputs.pop("example_weight")
+            decision = inputs.pop("target_decision", "unknown")
+            groups = inputs.pop("token_groups", None)
+            association_active = inputs.pop("association_active", None)
             outputs = model(**inputs)
-            loss = outputs.loss*weight
+            if args.loss_mode == "component":
+                if groups is None:
+                    raise ValueError("Component loss requires token groups")
+                active_weights = dict(objective_weights)
+                if association_active is not None and not bool(association_active.any()):
+                    active_weights["association"] = 0.0
+                loss, _ = component_loss(outputs.logits, inputs["labels"], groups, float(weight.detach().cpu()), active_weights)
+            else:
+                loss = outputs.loss*weight
+            if self.model.training:
+                self.loss_counts[decision] += 1
+                self.loss_sums[decision] += float(loss.detach().cpu())
             return (loss, outputs) if return_outputs else loss
 
     training = TrainingArguments(output_dir=str(output), per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=args.accumulation, num_train_epochs=args.epochs, max_steps=args.max_steps, learning_rate=args.lr, bf16=True, gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}, eval_strategy="epoch", save_strategy="epoch", save_total_limit=2, logging_steps=10, warmup_ratio=0.05, weight_decay=0.01, remove_unused_columns=False, label_names=["labels"], report_to="none", dataloader_num_workers=0, ddp_find_unused_parameters=False, seed=args.seed, load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False, prediction_loss_only=True)
-    trainer = WeightedTrainer(model=model, args=training, train_dataset=SFTDataset(train, processor, args.max_length, args.weak_weight, decision_weights), eval_dataset=SFTDataset(dev, processor, args.max_length, args.weak_weight, decision_weights), data_collator=one_example_collator)
+    trainer = WeightedTrainer(model=model, args=training, train_dataset=SFTDataset(train, processor, args.max_length, args.weak_weight, decision_weights, args.loss_mode, temporal_policy), eval_dataset=SFTDataset(dev, processor, args.max_length, args.weak_weight, loss_mode=args.loss_mode), data_collator=one_example_collator)
     trainer.model_accepts_loss_kwargs = False
     if trainer.is_world_process_zero():
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output/"training_protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted({row['scene_name'] for row in train}), "dev_scenes": sorted({row['scene_name'] for row in dev}), "target_modules": targets, "training_rows": len(train), "dev_rows": len(dev), "shadow_decision_weights": decision_weights})
+        write_json(output/"balance_audit.json", balance_report)
+        write_json(output/"training_protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted({row['scene_name'] for row in train}), "dev_scenes": sorted({row['scene_name'] for row in dev}), "target_modules": targets, "training_rows": len(train), "dev_rows": len(dev), "shadow_decision_weights": decision_weights, "balance_audit": balance_report, "objective_weights": objective_weights, "initialization": initialization})
     trainer.train()
     trainer.save_model(str(output/"adapter"))
     if trainer.is_world_process_zero():
+        loss_audit = {"scope": "rank-0 cumulative weighted training loss; not a distributed estimate", "classes": {decision: {"calls": trainer.loss_counts[decision], "mean_weighted_loss": trainer.loss_sums[decision]/trainer.loss_counts[decision]} for decision in sorted(trainer.loss_counts)}}
+        write_json(output/"loss_audit.json", loss_audit)
+        protocol = json.loads((output/"training_protocol.json").read_text(encoding="utf-8"))
+        protocol["loss_audit"] = loss_audit
+        write_json(output/"training_protocol.json", protocol)
         processor.save_pretrained(output/"adapter")
 
 

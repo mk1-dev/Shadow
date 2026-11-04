@@ -4,31 +4,31 @@ import re
 
 
 def assistant_token_groups(tokenizer, full_text, answer, supervised_ids):
-    """Align text offsets to the processor's supervised suffix, not image tokens."""
+    """Align response offsets to the supervised suffix, not image placeholder tokens."""
     import torch
 
-    start = full_text.rfind(answer)
-    if start < 0:
+    if answer not in full_text:
         raise ValueError("Assistant answer absent from chat template")
-    raw = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
+    raw = tokenizer(answer, add_special_tokens=False, return_offsets_mapping=True)
     offsets, ids = raw["offset_mapping"], raw["input_ids"]
-    first = next((i for i, (a, b) in enumerate(offsets) if b > start and a < start+len(answer)), None)
-    if first is None or ids[first:] != supervised_ids:
+    supervised = list(supervised_ids)
+    if len(ids) > len(supervised) or supervised[:len(ids)] != list(ids):
         raise ValueError("Token offset alignment failed; check model/processor versions")
     match = re.search(r'"shadow"\s*:\s*"(YES|NO|UNCERTAIN)"', answer)
     if match is None:
         raise ValueError("Component loss/scoring requires a JSON shadow decision")
-    decision_start, decision_end = start+match.start(1), start+match.end(1)+1
+    decision_start, decision_end = match.start(1), match.end(1)+1
     caster = re.search(r'"caster"\s*:', answer)
-    caster_start = start+caster.end() if caster else start+len(answer)
+    caster_start = caster.end() if caster else len(answer)
     groups = []
-    for a, b in offsets[first:]:
+    for a, b in offsets:
         if b > decision_start and a < decision_end:
             groups.append(1)
-        elif b > caster_start and a < start+len(answer):
+        elif b > caster_start and a < len(answer):
             groups.append(2)
         else:
             groups.append(3)
+    groups.extend([3]*(len(supervised)-len(groups)))
     if 1 not in groups:
         raise ValueError("No shadow-decision tokens found")
     return torch.tensor(groups, dtype=torch.long)

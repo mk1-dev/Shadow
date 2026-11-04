@@ -1,6 +1,7 @@
 # Controlled offline self-annotation pilot
 
-Date: 2026-11-04. Implementation only; all tests/data/model runs remain on HPC.
+Date: 2026-11-04. Implementation and unit tests are synchronized in
+`Shadow_update`; data/model runs remain on HPC.
 This extends the SAME GT-constrained shadow annotator and RGB segmenter. It does
 not add another VLM detection task and does not replace segmentation.
 
@@ -215,9 +216,7 @@ python -m compileall shadow_occ/annotation scripts
 python -m pytest tests/test_shadow_self_training.py tests/test_shadow_decision_diagnostics.py tests/test_shadow_supervision_policy.py tests/test_shadow_annotation_pipeline.py tests/test_shadow_annotation_temporal.py -q
 ```
 
-These tests and model/data runs were NOT executed locally. Prior 29-passed
-results do not cover the new paths. Run a small real-model prefix/QLoRA/student
-smoke test before allocating a full job. This pilot does not fix missing true
-shadow GT, create independent positives from duplicates, complete outside-BEV
-training coverage, merge full OCC geometry targets, or establish that shadow
-cues improve occupancy.
+Run a small real-model prefix/QLoRA/student smoke test before allocating a full
+job. This pilot does not fix missing true shadow GT, create independent positives
+from duplicates, complete outside-BEV training coverage, merge full OCC geometry
+targets, or establish that shadow cues improve occupancy.
