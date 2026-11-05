@@ -128,7 +128,8 @@ def round_inputs(tmp_path):
         np.savez_compressed(path, probability=probability)
         segments.append({"id": identifier, "scene_name": "pool", "split": "train", "official_split": "train", "camera": "CAM_FRONT", "instance_token": "car-a",
                          "image": str(image_path), "target": str(target_path), "ground_support": str(ground_path), "probability": str(path), "label_source": "geometry_weak",
-                         "probability_sha256": digest(path), "source_image_sha256": digest(image_path), "source_target_sha256": digest(target_path), "source_ground_sha256": digest(ground_path)})
+                         "probability_sha256": digest(path), "source_image_sha256": digest(image_path), "source_target_sha256": digest(target_path), "source_ground_sha256": digest(ground_path),
+                         "segmenter_readiness": {"noncollapsed": True, "approved_for_relabeling": False}})
     temporal = {"previous_id": "previous", "lighting_comparable": True, "mode": "static", "world_previous_to_current": np.eye(3).tolist(), "caster_previous_to_current": np.eye(3).tolist()}
     score = {**segments[-1], "id": "candidate", "parent_id": "current", "task": "shadow_annotation", "images": [str(image_path)]*3, "region_mask": str(mask_path),
              "prompt": "Judge the region", "annotation_target": None, "answer": None, "scorer_id": "teacher", "scoring_version": SCORING_VERSION, "score": 0.99, "in_sample_annotation": False, "temporal": temporal}

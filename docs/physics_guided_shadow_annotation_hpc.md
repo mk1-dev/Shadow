@@ -55,8 +55,13 @@ offset and LiDAR scan motion are not fully compensated, and remain limitations.
 
 Visibility is **sparse local planar support**, not semantic ground GT. Supports
 are dilated by three working pixels, depth-tested, and exclude projections of
-all annotated objects, not just candidate vehicles. A box straddling the camera
-near plane invalidates that view's support instead of drawing an unsafe polygon.
+all annotated objects, not just candidate vehicles. Boxes straddling the camera
+near plane are clipped at positive depth before projection, then intersected
+with the image viewport (including the exclusion margin). Only their local
+projected regions remove ground support; an off-screen box no longer invalidates
+the whole view. `ground_evidence` records `objects_crossing_near_plane`,
+`near_plane_objects_clipped` and `object_exclusion_pixels` for auditing. Invalid
+nonfinite box geometry rejects the pair instead of being silently ignored.
 Missing annotations, vegetation, road slopes and reflective surfaces can still
 invalidate the approximation. No inferred dense ground beyond local support.
 
@@ -271,6 +276,11 @@ training or request GPUs. Default paths include the Slurm job ID.
 
 ### Gate Details
 
+The current implementation is `three-frame-track-contrast-v2`; read
+[the v2 changes and related-work boundaries](shadow_track_contrast_v2.md).
+Rebuild flow evidence: old archives without `receiver-support-v2` are rejected
+by the new label builder. Do not overwrite an earlier experiment directory.
+
 - Join only identical middle camera records, images, timestamps, projections,
   scene and official split. Reject inconsistent local planes and track states.
 - Align the first pair's maps to the middle camera using world-ground geometry.
@@ -278,24 +288,33 @@ training or request GPUs. Default paths include the Slurm job ID.
 - Require onset and recovery evidence in the same component, but NOT at exactly
   the same pixels: the entering and leaving edges can be spatially disjoint.
   `same_patch_cycle` separately counts stronger darken-then-recover evidence.
-- Appearance and chroma candidates come from Stage 2. Forward/backward flow
-  provides correspondence-quality support; neither flow disagreement nor box
-  velocity equality supplies a positive label.
+- Appearance and chroma candidates come from Stage 2. Forward/backward flow,
+  texture and agreement with ground geometry validate receiver anchors. Local
+  support may cover a changing boundary within the SAME observed ground patch;
+  completely unobserved/textureless patches stay unsupported. Neither flow
+  disagreement nor box velocity equality supplies a positive label.
 - Test 96 fixed world-ray directions (24 azimuths, four elevations), holding
   each direction fixed across the three interpolated boxes. Ray/plane
   intersections use box corners at their actual world heights.
 - Compare middle observed coverage, onset against newly covered receiver, and
   recovery against receiver no longer covered. Require a margin over competing
   casters, including competing explanations under different light hypotheses.
+  Also require the real order to beat the hardest of five wrong-time permutations
+  and a frozen-middle trajectory by `--minimum-temporal-gain` (default 0.1).
+  These controls are explanations, NOT negative shadow labels or causal renders.
 - A caster cannot support its own scene-light hypothesis. Require at least two
-  OTHER distinct GT tracks, with disjoint camera-frame sets from the queried
-  window. Repeated windows of one track cannot count twice. This is still a
+  OTHER distinct GT tracks, with disjoint camera frames AND physical sample sets
+  from the query. Exclude every near-best candidate owner, not just the winner.
+  Repeated windows of one track cannot count twice. This is still a
   weak internal-consistency gate, NOT independent shadow validation.
 - Full GT box volumes overestimate silhouettes. Their projections constrain
   selection; they NEVER become the output mask. Only observed middle-image
-  component pixels inside the accepted plausible volume can receive a positive
+  component pixels inside ALL near-best plausible volumes can receive a positive
   label. The unsupported tail of a partially covered component stays IGNORE,
   and an intersection below the minimum area is rejected.
+- Shadow existence and ownership are separate decisions. An ambiguous owner
+  yields `YES` + `unresolved` when the observed shadow passes the independent
+  gates; it does not automatically turn a supported shadow into IGNORE.
 - Rasterize only candidate bounding regions and cache projected box polygons
   within each window, rather than repeating full-image volume rasterization.
 
@@ -346,7 +365,9 @@ views 4-5 are earlier/later GROUND-aligned context, not caster translation.
 `--no-temporal-context` removes these extra views for an input ablation without
 changing the annotation targets. Geometry/GT diagnostic arrows are not inputs.
 The future view is an **offline annotation** input; this is not a causal online
-model or evidence of deployment without GT-assisted cropping.
+model or evidence of GT-free deployment. Default crop bounds now depend only on
+the observed region; GT-expanded context requires `--context-policy gt-assisted`.
+GT still constrains offline candidate selection, visibility and weak targets.
 
 **Training is not automatically ready:** this protocol exports NO negative
 pixels or NO regions. Existing segmenter class-coverage checks intentionally

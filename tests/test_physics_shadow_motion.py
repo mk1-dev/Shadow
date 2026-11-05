@@ -8,7 +8,7 @@ import pytest
 from shadow_occ.annotation.physics_motion import (
     EvidenceConfig, decompose_object_motion, exposure_fit, fit_ground_plane,
     forward_backward_evidence, ground_correspondence, ground_homography,
-    interpolate_box_state, pair_evidence, plane_basis, project_world,
+    interpolate_box_state, pair_evidence, plane_basis, project_world, receiver_flow_evidence,
 )
 
 
@@ -137,6 +137,54 @@ def test_flow_disagreement_alone_does_not_create_shadow_evidence():
     assert not report["stable_dark_candidate"].any()
 
 
+def test_textureless_ground_does_not_invent_receiver_support_from_zero_flow():
+    lightness = np.full((32, 48), 50, np.float32)
+    flow = np.zeros((32, 48, 2), np.float32)
+    result = receiver_flow_evidence(lightness, np.ones_like(lightness, bool), flow, flow,
+                                    np.ones_like(lightness, bool), EvidenceConfig())
+    assert not result["receiver_flow_anchor"].any()
+    assert not result["receiver_flow_supported"].any()
+
+
+def test_receiver_neighbours_can_validate_registration_when_boundary_flow_fails():
+    yy, xx = np.indices((40, 48))
+    lightness = (30+xx).astype(np.float32)
+    flow = np.zeros((40, 48, 2), np.float32)
+    reliable = np.ones_like(lightness, bool)
+    reliable[18:22, 22:26] = False
+    config = EvidenceConfig(receiver_texture_L=0.5)
+    result = receiver_flow_evidence(lightness, np.ones_like(reliable), flow, flow, reliable, config)
+    assert not result["receiver_flow_anchor"][19, 23]
+    assert result["receiver_flow_supported"][19, 23]
+    assert result["receiver_flow_support_count"][19, 23] >= config.receiver_support_min_pixels
+
+
+def test_neighbour_votes_do_not_cross_disconnected_ground_components():
+    _, xx = np.indices((40, 48))
+    lightness = (30+xx).astype(np.float32)
+    visible = np.ones_like(lightness, bool)
+    visible[:, 23] = False
+    reliable = np.zeros_like(visible)
+    reliable[:, :23] = True
+    flow = np.zeros((40, 48, 2), np.float32)
+    result = receiver_flow_evidence(lightness, visible, flow, flow, reliable,
+                                    EvidenceConfig(receiver_texture_L=0.5))
+    assert result["receiver_flow_supported"][20, 22]
+    assert not result["receiver_flow_supported"][:, 24:].any()
+    assert not result["receiver_flow_supported"][:, 23].any()
+
+
+def test_large_flow_residual_is_not_receiver_registration_support():
+    _, xx = np.indices((40, 48))
+    lightness = (30+xx).astype(np.float32)
+    geometric = np.zeros((40, 48, 2), np.float32)
+    flow = geometric.copy()
+    flow[..., 0] = 10
+    result = receiver_flow_evidence(lightness, np.ones_like(lightness, bool), flow, geometric,
+                                    np.ones_like(lightness, bool), EvidenceConfig(receiver_texture_L=0.5))
+    assert not result["receiver_flow_supported"].any()
+
+
 def test_pair_residual_sign_reports_onset_and_recovery_without_labels():
     first, second = image_pair()
     result = evidence(first, second)
@@ -223,6 +271,87 @@ def test_camera_resize_projection_uses_pixel_centers():
     uv, _, valid = project_world([[10, 20, 1]], matrix)
     assert valid.all()
     np.testing.assert_allclose(uv[0], [(10+0.5)*0.5-0.5, (20+0.5)*448/900-0.5])
+
+
+def box_corners(x, y, z):
+    return np.array([[a, b, c] for a in x for b in y for c in z], dtype=np.float64)
+
+
+def ground_support_with_boxes(boxes):
+    exporter = load_script("export_nuscenes_motion_pairs")
+    yy, xx = np.indices((64, 96))
+    points = np.c_[((xx-48)*10/30).ravel(), (-(yy-32)*10/30).ravel(), np.zeros(xx.size)]
+    return exporter.observed_ground(points, np.ones(len(points), bool), projection(),
+                                    np.array([0, 0, 1, 0]), (64, 96), boxes, support_radius=0)
+
+
+def test_offscreen_near_plane_box_does_not_remove_ground():
+    baseline, _ = ground_support_with_boxes([])
+    support, report = ground_support_with_boxes([box_corners([20, 22], [-1, 1], [9, 11])])
+    assert baseline[4:-4, 4:-4].all()
+    np.testing.assert_array_equal(support, baseline)
+    assert report["objects_crossing_near_plane"] == 1
+    assert report["near_plane_objects_clipped"] == 0
+    assert report["object_exclusion_pixels"] == 0
+
+
+def test_visible_near_plane_box_only_removes_its_projected_region():
+    support, report = ground_support_with_boxes([box_corners([0.2, 0.4], [-0.2, 0.2], [9, 11])])
+    assert support[32, 20]
+    assert not support[32, 70]
+    assert 0 < report["object_exclusion_pixels"] < support.size
+    assert report["near_plane_objects_clipped"] == 1
+
+
+def test_box_enclosing_camera_can_legitimately_exclude_whole_view():
+    support, report = ground_support_with_boxes([box_corners([-1, 1], [-1, 1], [9, 11])])
+    assert not support.any()
+    assert report["object_exclusion_pixels"] == support.size
+
+
+def test_box_behind_camera_does_not_remove_ground():
+    baseline, _ = ground_support_with_boxes([])
+    support, report = ground_support_with_boxes([box_corners([-1, 1], [-1, 1], [11, 12])])
+    np.testing.assert_array_equal(support, baseline)
+    assert report["object_exclusion_pixels"] == 0
+    assert report["objects_crossing_near_plane"] == 0
+
+
+def test_front_box_still_excludes_visible_ground():
+    support, report = ground_support_with_boxes([box_corners([2, 4], [-2, 2], [0, 1])])
+    assert not support[32, 58]
+    assert support[32, 20]
+    assert report["object_exclusion_pixels"] > 0
+    assert report["near_plane_objects_clipped"] == 0
+
+
+def test_just_offscreen_box_retains_the_exclusion_margin():
+    support, report = ground_support_with_boxes([box_corners([16, 17], [-1, 1], [0, 1])])
+    assert not support[32, 95]
+    assert support[32, 80]
+    assert report["object_exclusion_pixels"] > 0
+
+
+def test_object_polygon_is_corner_order_independent_and_viewport_clipped():
+    exporter = load_script("export_nuscenes_motion_pairs")
+    corners = box_corners([0.2, 0.4], [-0.2, 0.2], [9, 11])
+    first, crossing = exporter.object_image_polygon(corners, projection(), (64, 96))
+    second, _ = exporter.object_image_polygon(corners[[7, 2, 5, 0, 6, 1, 4, 3]], projection(), (64, 96))
+    masks = [np.zeros((64, 96), np.uint8) for _ in range(2)]
+    for mask, polygon in zip(masks, (first, second)):
+        cv2.fillConvexPoly(mask, polygon, 1)
+        assert (polygon[..., 0] >= -3).all() and (polygon[..., 0] <= 98).all()
+        assert (polygon[..., 1] >= -3).all() and (polygon[..., 1] <= 66).all()
+    assert crossing
+    np.testing.assert_array_equal(*masks)
+
+
+def test_nonfinite_object_corners_fail_closed():
+    exporter = load_script("export_nuscenes_motion_pairs")
+    corners = box_corners([-1, 1], [-1, 1], [0, 1])
+    corners[0, 0] = np.nan
+    with pytest.raises(ValueError, match="invalid_object_projection"):
+        exporter.object_image_polygon(corners, projection(), (64, 96))
 
 
 def test_stage2_pair_validation_rejects_wrong_camera_time_and_training_data():

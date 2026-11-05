@@ -79,6 +79,7 @@ python scripts/evaluate_shadow_annotator.py \
 python scripts/refine_shadow_annotations.py \
   --seg-predictions "$SHADOW_EVAL_ROOT/segmentation/predictions.jsonl" \
   --annotation-results "$SHADOW_ANNOTATION_ROOT/proposal_votes/annotations.jsonl" \
+  --allow-weak-pilot \
   --output-root "$SHADOW_ANNOTATION_ROOT/refined_eval"
 ```
 
@@ -257,6 +258,7 @@ than forced into a positive/negative label.
 python scripts/refine_shadow_annotations.py \
   --seg-predictions outputs/shadow_annotation/evaluation/segmentation/predictions.jsonl \
   --annotation-results outputs/shadow_annotation/evaluation/tuned/annotations.jsonl \
+  --allow-weak-pilot \
   --output-root outputs/shadow_annotation/refined
 ```
 
@@ -265,6 +267,13 @@ annotations already carry their source-image mask reference and require a
 sample/camera join for later BEV geometry-label integration. Neither output
 should be substituted for complete OCC geometry labels without rebuilding the
 root/tip/direction targets and preserving ignore masks.
+
+The recovery update blocks collapsed/legacy-unvalidated segmenter predictions
+from proposal/refinement paths. `--allow-weak-pilot` is an explicit experimental
+opt-in AFTER independent teacher diagnostics, not evidence of approval. See
+[the 2026-11-06 recovery notes](shadow_track_contrast_v2.md) before retrying a
+fresh segmenter or VLM run. New macro decision-NLL and corrected weighting make
+new total training losses incomparable to the old scalar loss.
 
 ## HPC validation
 

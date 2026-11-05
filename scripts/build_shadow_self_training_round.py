@@ -15,6 +15,7 @@ from shadow_occ.annotation.data import GT_SOURCES, assert_disjoint, checked_writ
 from shadow_occ.annotation.diagnostics import decision
 from shadow_occ.annotation.self_training import pseudo_annotation, teacher_gate, temporal_agreement, validate_policy
 from shadow_occ.annotation.teacher_provenance import cached_digest, input_provenance
+from shadow_occ.annotation.readiness import require_prediction_for_proposals
 from shadow_occ.utils.io import write_json
 
 
@@ -72,6 +73,9 @@ def main():
     scores, _ = indexed(args.teacher_scores)
     _, generated = indexed(args.teacher_annotations)
     _, segments = indexed(args.seg_predictions)
+    if args.mode == "build":
+        for row in segments.values():
+            require_prediction_for_proposals(row)
     if not anchors or not seg_anchors or not dev or not seg_dev:
         raise ValueError("Original supervision and disjoint dev must remain present")
     if any(row.get("self_training") for row in anchors+seg_anchors):

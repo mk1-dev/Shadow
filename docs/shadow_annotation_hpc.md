@@ -318,6 +318,7 @@ Only after independent evaluation supports using the adapted annotator:
 python scripts/refine_shadow_annotations.py \
   --seg-predictions outputs/shadow_annotation/evaluation/segmentation/predictions.jsonl \
   --vlm-votes outputs/shadow_annotation/evaluation/tuned/votes.jsonl \
+  --allow-weak-pilot \
   --output-root outputs/shadow_annotation/refined_eval
 python scripts/export_refined_shadow_bev.py \
   --manifest outputs/shadow_annotation/refined_eval/manifest.jsonl \

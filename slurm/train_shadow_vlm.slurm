@@ -28,7 +28,7 @@ if [[ -n "${SHADOW_MAX_STEPS:-}" ]]; then
   EXTRA_ARGS+=(--max-steps "$SHADOW_MAX_STEPS")
 fi
 if [[ "${SHADOW_BALANCE:-1}" == "1" ]]; then
-  BALANCE_ARGS+=(--balance-shadow --balance-power "${SHADOW_BALANCE_POWER:-0.5}" --max-class-weight "${SHADOW_MAX_CLASS_WEIGHT:-5}")
+  BALANCE_ARGS+=(--balance-shadow --balance-power "${SHADOW_BALANCE_POWER:-1.0}" --max-class-weight "${SHADOW_MAX_CLASS_WEIGHT:-50}")
 fi
 if [[ -n "${SHADOW_INIT_ADAPTER:-}" ]]; then
   INIT_ARGS+=(--init-adapter "$SHADOW_INIT_ADAPTER")

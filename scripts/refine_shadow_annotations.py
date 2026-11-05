@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import GT_SOURCES, checked_write_image, read_rows, write_rows
 from shadow_occ.annotation.refinement import refine_target
+from shadow_occ.annotation.readiness import require_prediction_for_proposals
 from shadow_occ.utils.io import write_json
 
 
@@ -23,7 +24,10 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--pixel-threshold", type=float, default=0.7)
     parser.add_argument("--region-threshold", type=float, default=0.8)
+    parser.add_argument("--allow-weak-pilot", action="store_true", help="Explicit experimental relabeling after independent teacher diagnostics; not approval")
     args = parser.parse_args()
+    if not args.allow_weak_pilot:
+        raise ValueError("Refinement requires --allow-weak-pilot; unverified segmenter/VLM agreement is not ground truth")
     if not 0.5 < args.pixel_threshold <= 1 or not 0.5 < args.region_threshold <= 1:
         raise ValueError("Pixel and region thresholds must be in (0.5, 1]")
     output = Path(args.output_root).resolve()
@@ -53,6 +57,7 @@ def main():
         raise ValueError("Duplicate segmentation ID or annotation parent absent from predictions")
     rows, report = [], {"examples": 0, "accepted_regions": 0, "positive_pixels": 0, "no_votes": 0, "skipped_boundary_annotations": skipped_boundary}
     for index, row in enumerate(predictions):
+        require_prediction_for_proposals(row)
         if row["id"] not in groups:
             report["no_votes"] += 1
         with np.load(row["probability"], allow_pickle=False) as archive:

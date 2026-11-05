@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import checked_write_image, read_rows, resolve_path, write_rows
 from shadow_occ.utils.io import write_json
+from shadow_occ.annotation.readiness import require_prediction_for_proposals
 
 
 def main():
@@ -30,6 +31,7 @@ def main():
     rows, seen = [], set()
     counts = {"examples": 0, "regions": 0, "zero_proposal_examples": 0, "missing_ground_support": 0, "regions_touching_unknown": 0}
     for row in read_rows(args.seg_predictions):
+        require_prediction_for_proposals(row)
         if row["id"] in seen:
             raise ValueError("Duplicate segmentation parent ID")
         seen.add(row["id"])

@@ -58,12 +58,14 @@ def temporal_multiplier(row, policy):
     return 1.0
 
 
-def balance_audit(rows, weights, weak_weight):
+def balance_audit(rows, weights, weak_weight, temporal_policy=None):
     groups = {}
     for row in rows:
         label = decision(row) or "unlabeled"
         group = groups.setdefault(label, {"rows": 0, "sum_base_weight": 0.0, "sum_decision_weight": 0.0, "scenes": set(), "tracks": set(), "missing_track_rows": 0})
         base = example_weight(row, weak_weight)
+        if temporal_policy is not None:
+            base *= temporal_multiplier(row, temporal_policy)
         group["rows"] += 1
         group["sum_base_weight"] += base
         group["sum_decision_weight"] += base*weights.get(label, 1.0)
@@ -77,8 +79,30 @@ def balance_audit(rows, weights, weak_weight):
         group["unique_tracks"] = len(group.pop("tracks"))
         group["mean_decision_weight"] = group["sum_decision_weight"]/group["rows"]
         group["expected_sample_fraction"] = group["rows"]/len(rows)
+    mass = sum(group["sum_decision_weight"] for group in groups.values())
+    for group in groups.values():
+        group["effective_decision_mass_fraction"] = group["sum_decision_weight"]/mass if mass else None
     states = Counter((row.get("annotation_target") or (parse(row["answer"], row.get("candidates", [])) if row.get("answer") else {})).get("caster", {}).get("state", "unlabeled") for row in rows)
     return {"sampler": "ordinary shuffled/distributed sampler; no class oversampling", "rows": len(rows), "classes": groups, "caster_states": dict(states), "outside_training_supported": states["outside_bev"] > 0}
+
+
+def decision_loss_summary(records):
+    """Macro decision-token NLL, deduplicating distributed evaluation padding by ID."""
+    unique, groups = {}, {}
+    for identifier, label, loss in records:
+        if label not in {"YES", "NO", "UNCERTAIN"} or not math.isfinite(loss) or loss < 0:
+            raise ValueError("Invalid dev decision loss record")
+        if identifier in unique:
+            if unique[identifier][0] != label:
+                raise ValueError("Conflicting dev target IDs")
+            continue
+        unique[identifier] = (label, loss)
+        groups.setdefault(label, []).append(loss)
+    if not groups:
+        raise ValueError("No dev decision losses")
+    means = {label: float(np.mean(values)) for label, values in groups.items()}
+    return {"macro": float(np.mean(list(means.values()))), "by_class": means,
+            "counts": {label: len(values) for label, values in groups.items()}}
 
 
 def average_precision(labels, scores):

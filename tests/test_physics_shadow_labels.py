@@ -11,6 +11,7 @@ from shadow_occ.annotation.data import checked_write_image, digest, make_target,
 from shadow_occ.annotation.physics_labels import (
     LabelConfig, candidate_evidence, cast_box, footprint_mask, light_bank,
     middle_evidence, rank_hypotheses, receiver_points, select_with_independent_light,
+    select_shadow_and_caster, trajectory_contrast, factorized_shadow_decision,
     validate_window, window_tracks,
 )
 from shadow_occ.annotation.physics_motion import plane_basis
@@ -151,6 +152,63 @@ def test_identical_competing_caster_is_rejected_not_nearest_selected():
     assert not rankings[0]["passes"]
 
 
+def test_real_order_must_beat_frozen_and_wrong_time_explanations():
+    mask, maps, tracks, directions = moving_case()
+    footprints = [footprint_mask(p[1:], [0, 0, 1, 0], directions[0], projection(), mask.shape)
+                  for p in tracks[0]["points"]]
+    result = trajectory_contrast(footprints, mask, maps["onset"], maps["recovery"])
+    assert result["score"] == 1 and result["temporal_gain"] >= 0.1
+    reversed_result = trajectory_contrast(footprints[::-1], mask, maps["onset"], maps["recovery"])
+    assert reversed_result["temporal_gain"] < 0
+    frozen = trajectory_contrast([mask]*3, mask, maps["onset"], maps["recovery"])
+    assert frozen["temporal_gain"] == 0
+
+
+def test_ambiguous_caster_does_not_erase_independently_supported_shadow():
+    mask, maps, tracks, directions = moving_case()
+    tracks.append({**tracks[0], "instance_token": "second_car"})
+    hypotheses, _ = rank_hypotheses(mask, maps, tracks, [0, 0, 1, 0], plane_basis([0, 0, 1, 0]),
+                                    projection(), directions, LabelConfig())
+    candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["middle"],
+                 "hypotheses": hypotheses}
+    support = [vote("a", "other1"), vote("b", "other2")]
+    decision = select_shadow_and_caster(candidate, support, directions, LabelConfig())
+    assert decision["shadow_accepted"] and decision["association"] is None
+    assert {item["instance_token"] for item in decision["plausible_hypotheses"]} == {"car", "second_car"}
+
+
+def test_multicamera_same_physical_sample_is_not_independent_light_evidence():
+    target = {**vote("car", "front_middle"), "sample_tokens": ["s0", "s1", "s2"]}
+    pool = [{**vote(token, f"back_{token}"), "sample_tokens": ["s1", "s3", "s4"]}
+            for token in ("a", "b")]
+    assert not select_shadow_and_caster(target, pool, light_bank(), LabelConfig())["shadow_accepted"]
+
+
+def test_ambiguous_possible_owner_cannot_vote_for_its_own_shadow():
+    target = vote("car", "middle")
+    target["hypotheses"][0].update(passes=False, shadow_passes=True,
+        alternatives=[{"instance_token": "other_car", "score": 0.89, "light_id": 0}])
+    pool = [vote("other_car", "other_time"), vote("b", "another_time")]
+    assert not select_shadow_and_caster(target, pool, light_bank(), LabelConfig())["shadow_accepted"]
+
+
+def test_factorized_existence_does_not_require_other_track_light_votes():
+    mask, maps, tracks, directions = moving_case()
+    hypotheses, _ = rank_hypotheses(mask, maps, tracks, [0, 0, 1, 0], plane_basis([0, 0, 1, 0]),
+                                    projection(), directions, LabelConfig())
+    candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["f"],
+                 "hypotheses": hypotheses}
+    assert not select_shadow_and_caster(candidate, [], directions, LabelConfig())["shadow_accepted"]
+    decision = factorized_shadow_decision(candidate, [], directions, LabelConfig())
+    assert decision["shadow_accepted"] and decision["association"] is None
+    assert sum(row["weight"] for row in decision["light_weights"]) == pytest.approx(1)
+
+
+def test_factorized_policy_never_approves_static_darkness_without_observed_transitions():
+    candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["f"], "hypotheses": []}
+    assert not factorized_shadow_decision(candidate, [], light_bank(), LabelConfig())["shadow_accepted"]
+
+
 def test_polygon_cache_matches_uncached_roi_results():
     mask, maps, tracks, directions = moving_case()
     args = (mask, maps, tracks, [0, 0, 1, 0], plane_basis([0, 0, 1, 0]), projection(), directions, LabelConfig())
@@ -201,6 +259,21 @@ def test_audit_only_manifest_is_blocked_by_training_builder(tmp_path, monkeypatc
         builder.main()
 
 
+def test_default_context_does_not_reveal_gt_caster_location():
+    builder = script("build_shadow_annotation_dataset")
+    box, shape = [100, 100, 120, 120], (400, 600)
+    a = builder.context_bounds(box, shape, [200, 200, 240, 240])
+    b = builder.context_bounds(box, shape, [400, 300, 450, 350])
+    assert a == b == builder.context_bounds(box, shape)
+    assert a != builder.context_bounds(box, shape, [400, 300, 450, 350], "gt-assisted")
+
+
+@pytest.mark.parametrize("gain", [-0.1, 1.1, float("nan")])
+def test_track_contrast_rejects_invalid_threshold(gain):
+    with pytest.raises(ValueError, match="contrast"):
+        LabelConfig(minimum_temporal_gain=gain).validate()
+
+
 def test_stage3_integration_exports_no_unapproved_targets(tmp_path, monkeypatch):
     builder = script("build_physics_shadow_labels")
     pairs = pair_rows()
@@ -217,12 +290,14 @@ def test_stage3_integration_exports_no_unapproved_targets(tmp_path, monkeypatch)
     write_rows(manifest, pairs)
     analysis = tmp_path/"flow"
     analysis.mkdir()
-    (analysis/"analysis_protocol.json").write_text(json.dumps({"manifest_sha256": digest(manifest)}))
+    (analysis/"analysis_protocol.json").write_text(json.dumps({"manifest_sha256": digest(manifest),
+        "flow_evidence_version": "receiver-support-v2"}))
     metrics = []
     for index, pair in enumerate(pairs):
         path = analysis/f"e{index}.npz"
         # t0->t1 observes middle darkness, t1->t2 observes its recovery.
         np.savez_compressed(path, visible_ground=np.ones_like(mask), flow_reliable=np.ones_like(mask),
+                            receiver_flow_supported=np.ones_like(mask),
                             onset_candidate=maps["onset"] if index == 0 else np.zeros_like(mask),
                             recovery_candidate=maps["recovery"] if index == 1 else np.zeros_like(mask),
                             stable_dark_candidate=mask & ~(maps["onset"] if index == 0 else maps["recovery"]))
@@ -230,17 +305,19 @@ def test_stage3_integration_exports_no_unapproved_targets(tmp_path, monkeypatch)
                         "evidence": str(path), "evidence_sha256": digest(path), "exposure": {"valid": True}})
     write_rows(analysis/"pair_metrics.jsonl", metrics)
     monkeypatch.setattr(builder, "light_bank", lambda: np.array([[1, 0, -1]])/np.sqrt(2))
-    original_selector = builder.select_with_independent_light
+    original_selector = builder.select_shadow_and_caster
     for enabled, independent_support in ((False, False), (True, False), (True, True)):
         output = tmp_path/f"labels_{enabled}_{independent_support}"
         if independent_support:
             # Exercise the export/consumer contract separately from the real consensus test above.
             def accepted(candidate, *args, **kwargs):
                 best = next(item for item in candidate["hypotheses"] if item["passes"])
-                return {**best, "independent_light_tracks": ["other_a", "other_b"]}, "synthetic_test_gate"
-            monkeypatch.setattr(builder, "select_with_independent_light", accepted)
+                best = {**best, "independent_light_tracks": ["other_a", "other_b"]}
+                return {"shadow_accepted": True, "selected": best, "association": best,
+                        "reason": "synthetic_test_gate", "plausible_hypotheses": [best]}
+            monkeypatch.setattr(builder, "select_shadow_and_caster", accepted)
         else:
-            monkeypatch.setattr(builder, "select_with_independent_light", original_selector)
+            monkeypatch.setattr(builder, "select_shadow_and_caster", original_selector)
         argv = ["builder", "--pairs", str(manifest), "--analysis-root", str(analysis), "--output-root", str(output)]
         if enabled:
             argv.append("--export-weak-labels")

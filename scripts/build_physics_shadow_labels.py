@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import checked_write_image, digest, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.physics_labels import (
     LabelConfig, footprint_mask, light_bank, light_support_index, middle_evidence, rank_hypotheses, receiver_points,
-    select_with_independent_light, window_tracks,
+    select_shadow_and_caster, factorized_shadow_decision, window_tracks,
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.utils.io import write_json
@@ -34,6 +34,8 @@ def read_evidence(row, stats, base):
     if digest(path) != metric["evidence_sha256"]:
         raise ValueError("Pair evidence changed since analysis")
     with np.load(path, allow_pickle=False) as archive:
+        if "receiver_flow_supported" not in archive.files:
+            raise ValueError("Missing v2 receiver-flow support; rebuild motion analysis")
         return {key: archive[key].copy() for key in archive.files}, metric
 
 
@@ -65,10 +67,13 @@ def main():
     parser.add_argument("--max-components-per-window", type=int, default=50)
     parser.add_argument("--minimum-area", type=int, default=32)
     parser.add_argument("--review-limit", type=int, default=20)
+    parser.add_argument("--minimum-temporal-gain", type=float, default=0.1,
+                        help="Real trajectory minus hardest frozen/wrong-time score; zero is an ablation")
+    parser.add_argument("--decision-policy", choices=["strict-v2", "factorized-v3"], default="strict-v2")
     args = parser.parse_args()
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
-    config = LabelConfig(minimum_area=args.minimum_area)
+    config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain)
     config.validate()
     output = Path(args.output_root).resolve()
     if output.exists() and any(output.iterdir()):
@@ -79,6 +84,8 @@ def main():
     analysis = Path(args.analysis_root).resolve()
     protocol_path = analysis/"analysis_protocol.json"
     protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    if protocol.get("flow_evidence_version") != "receiver-support-v2":
+        raise ValueError("Re-run motion analysis with receiver-support-v2 before building v2 labels")
     if protocol["manifest_sha256"] != digest(args.pairs):
         raise ValueError("Flow analysis was not produced from this exact pair manifest")
     pairs = read_rows(args.pairs)
@@ -140,6 +147,12 @@ def main():
                    "middle_timestamp": frame["camera_timestamp"], "middle_image_sha256": frame["image_sha256"],
                    "alignment": "same_world_receiver_not_caster_translation", "views": []}
         window_stem = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
+        transition_path = output/"transitions"/f"{window_stem}.npz"
+        transition_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(transition_path, onset=(maps["onset"] & maps["flow_supported"]).astype(np.uint8),
+                            recovery=(maps["recovery"] & maps["flow_supported"]).astype(np.uint8))
+        context["transitions"] = {"path": str(transition_path), "sha256": digest(transition_path),
+            "semantics": "relative_brightness_evidence_not_absolute_nonshadow_labels"}
         for slot, adjacent in (("previous", left["frames"][0]), ("next", right["frames"][1])):
             adjacent_image = cv2.imread(str(resolve_path(adjacent["image"], base)))
             if adjacent_image is None:
@@ -171,6 +184,7 @@ def main():
             candidates.append({"id": stem, "scene_name": left["scene_name"], "official_split": left["official_split"],
                 "camera": left["camera"], "sample_token": right["sample_token"],
                 "frame_tokens": [left["frames"][0]["sample_data_token"], frame["sample_data_token"], right["frames"][1]["sample_data_token"]],
+                "sample_tokens": [left["sample_token"], right["sample_token"], right["next_sample_token"]],
                 "pair_ids": [left["id"], right["id"]], "image": str(resolve_path(frame["image"], base)),
                 "ground_support": str(resolve_path(frame["ground_support"], base)),
                 "timestamp": frame["camera_timestamp"], "mask": str(path), "mask_sha256": digest(path),
@@ -179,7 +193,7 @@ def main():
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
         counts["windows_processed"] += 1
         print(f"windows={counts['windows_processed']} components={len(components)} tracks={len(tracks)} scene={left['scene_name']}", flush=True)
-    # Build the scene index once; only distinct OTHER tracks with disjoint camera frames vote.
+    # Only other tracks outside the query's camera frames AND physical samples vote.
     pools = defaultdict(list)
     for item in candidates:
         pools[item["scene_name"], item["official_split"]].append(item)
@@ -187,23 +201,29 @@ def main():
     pair_lookup = {pair["id"]: pair for pair in pairs}
     canonical, decisions = [], []
     for index, item in enumerate(tqdm(candidates, desc="independent light support / trimaps", mininterval=5)):
-        selection, reason = select_with_independent_light(item, pools[item["scene_name"], item["official_split"]],
-                                                         directions, config, support_index=support_index)
+        selector = factorized_shadow_decision if args.decision_policy == "factorized-v3" else select_shadow_and_caster
+        decision = selector(item, pools[item["scene_name"], item["official_split"]],
+                            directions, config, support_index=support_index)
+        selection, association, reason = decision["selected"], decision["association"], decision["reason"]
         mask = cv2.imread(item["mask"], cv2.IMREAD_GRAYSCALE) > 0
         positive = np.zeros_like(mask)
-        if selection is not None:
+        if decision["shadow_accepted"]:
             left, right = (pair_lookup[key] for key in item["pair_ids"])
             tracks, _ = window_tracks(left, right)
-            track = next(track for track in tracks if track["instance_token"] == selection["instance_token"])
+            track_map = {track["instance_token"]: track for track in tracks}
             projection = np.asarray(right["frames"][0]["projection_world_to_image"])
-            plausible = footprint_mask(track["points"][1, 1:], left["plane_world"],
-                                       directions[selection["light_id"]], projection, mask.shape)
-            # Do not label the unsupported tail of an otherwise acceptable component.
-            positive = mask & plausible
+            positive = mask.copy()
+            # Keep only observed pixels supported by ALL near-best explanations.
+            for explanation in decision["plausible_hypotheses"]:
+                track = track_map[explanation["instance_token"]]
+                positive &= footprint_mask(track["points"][1, 1:], left["plane_world"],
+                    directions[explanation["light_id"]], projection, mask.shape)
             if positive.sum() < config.minimum_area:
-                selection, reason = None, "insufficient_supported_positive_area"
+                selection, association, reason = None, None, "insufficient_supported_positive_area"
+                decision = {**decision, "shadow_accepted": False, "selected": None,
+                            "association": None, "reason": reason}
                 positive[:] = False
-        accepted = selection is not None
+        accepted = decision["shadow_accepted"]
         label = "YES" if accepted and args.export_weak_labels else "IGNORE"
         counts["weak_gate_passed" if accepted else "uncertain"] += 1
         counts[f"reason:{reason}"] += 1
@@ -223,25 +243,29 @@ def main():
         np.savez_compressed(score_path, uncalibrated_rule_score=score_map)
         row = {key: item[key] for key in ("id", "scene_name", "official_split", "camera", "sample_token", "image", "ground_support", "timestamp")}
         row.update(label_source="temporal_weak", shadow_mask=str(target_path), mask_encoding="trimap",
-            physics_protocol="three-frame-physics-weak-v1", physics_export_enabled=args.export_weak_labels,
+            physics_protocol="factorized-receiver-shadow-v3" if args.decision_policy == "factorized-v3" else "three-frame-track-contrast-v2", physics_export_enabled=args.export_weak_labels,
             physics_target_sha256=digest(target_path),
             physics_pair_ids=item["pair_ids"], physics_frame_tokens=item["frame_tokens"],
+            physics_sample_tokens=item["sample_tokens"],
             physics_context=item["physics_context"],
-            physics_evidence={**item["evidence"], "gate_reason": reason, "selected": selection,
+            physics_evidence={**item["evidence"], "gate_reason": reason, "selected": association,
+                              "shadow_decision": decision, "minimum_temporal_gain": config.minimum_temporal_gain,
                               "probability_calibrated": False, "is_shadow_gt": False},
             regions=[{"id": "observed_region", "mask": str(region_path), "mask_sha256": digest(region_path), "shadow_label": label,
                       "label_source": "temporal_weak", "proposal_source": "ground_aligned_three_frame_dark_region"}])
-        if accepted:
-            caster = item["casters"][selection["instance_token"]]
-            row.update(instance_token=selection["instance_token"], annotation_token=caster["annotation_token"],
+        if accepted and association is None:
+            counts["shadow_supported_owner_unresolved"] += 1
+        if association is not None:
+            caster = item["casters"][association["instance_token"]]
+            row.update(instance_token=association["instance_token"], annotation_token=caster["annotation_token"],
                 associated_annotation_token=caster["annotation_token"], caster_category=caster["category"],
                 caster_source="annotation_gt", association_source="temporal_weak",
                 association_status="temporal_supported" if label == "YES" else "unapproved_physics_candidate",
-                association_evidence={"selection": selection, "gt_scope": "object_state_only_not_shadow_association"})
+                association_evidence={"selection": association, "gt_scope": "object_state_only_not_shadow_association"})
             if caster["bbox"] is not None:
                 row["caster_bbox_xyxy"] = caster["bbox"]
         canonical.append(row)
-        decisions.append({**item, "selection": selection, "gate_reason": reason,
+        decisions.append({**item, "selection": selection, "shadow_decision": decision, "gate_reason": reason,
                           "decision": "YES" if accepted else "UNCERTAIN", "exported_label": label,
                           "supported_positive_pixels": int(positive.sum()),
                           "probability_calibrated": False, "is_shadow_gt": False})
@@ -252,8 +276,8 @@ def main():
             marked = image.copy()
             contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(marked, contours, -1, (0, 200, 0) if accepted else (0, 180, 255), 1)
-            if accepted:
-                bbox = item["casters"][selection["instance_token"]]["bbox"]
+            if association is not None:
+                bbox = item["casters"][association["instance_token"]]["bbox"]
                 if bbox is not None:
                     x0, y0, x1, y1 = np.rint(bbox).astype(int)
                     cv2.rectangle(marked, (x0, y0), (x1, y1), (255, 200, 0), 1)
@@ -268,8 +292,20 @@ def main():
     write_rows(output/"window_audit.jsonl", audit)
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
+        "decision_policy": args.decision_policy,
+        "stage_counts": {"receiver_windows": counts["windows_processed"], "observed_components": len(candidates),
+            "absolute_projection_fits": sum(any(h.get("shadow_fit_passes") for parent in item["hypotheses"]
+                for h in [parent, *parent.get("alternatives", [])]) for item in candidates),
+            "contrast_fits": sum(any(h.get("shadow_passes") for h in item["hypotheses"]) for item in candidates),
+            "accepted_shadow": counts["weak_gate_passed"],
+            "unique_weak_association": sum(item["shadow_decision"]["association"] is not None for item in decisions)},
         "scenes": len({item["scene_name"] for item in candidates}),
         "weak_gate_pass_fraction": counts["weak_gate_passed"]/len(candidates) if candidates else None,
+        "temporal_contrast": {
+            "minimum_gain": config.minimum_temporal_gain,
+            "accepted_gain_mean": float(np.mean([row["selection"]["temporal_gain"] for row in decisions
+                                                   if row["selection"]])) if counts["weak_gate_passed"] else None,
+            "controls_are_shadow_negatives": False},
         "distinct_proposed_caster_tracks": len({row["selection"]["instance_token"] for row in decisions if row["selection"]}),
         "exported_negative_pixels": 0, "export_weak_labels": args.export_weak_labels,
         "shadow_precision": None, "shadow_recall": None, "shadow_iou": None, "caster_accuracy": None,
@@ -280,7 +316,9 @@ def main():
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),
         "coordinate_frame": "middle camera pixels; metric receiver points in world ground plane",
-        "consensus": "same scene/split; leave caster track and camera frames out; deduplicate other tracks",
+        "protocol": "factorized-receiver-shadow-v3" if args.decision_policy == "factorized-v3" else "three-frame-track-contrast-v2",
+        "consensus": "same scene/split; leave all plausible caster tracks, camera frames AND physical samples out",
+        "track_contrast": "same light; real time order versus hardest permutation and frozen-middle control",
         "limitations": ["bounding volumes are not object silhouettes", "single locally planar receiver",
                         "constant scene-light hypothesis may fail", "uncalibrated weak scores, not real shadow probabilities",
                         "no confident static-shadow acceptance or automatic negative labels",

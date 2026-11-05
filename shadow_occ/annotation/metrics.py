@@ -21,6 +21,27 @@ class BinaryMetrics:
         return {"tn": tn, "fp": fp, "fn": fn, "tp": tp, "iou": ratio(tp, tp+fp+fn), "precision": ratio(tp, tp+fp), "recall": ratio(tp, tp+fn), "f1": ratio(2*tp, 2*tp+fp+fn), "accuracy": ratio(tp+tn, tp+tn+fp+fn), "valid_count": tn+fp+fn+tp}
 
 
+def pixel_score_diagnostics(histogram):
+    """Fixed dev score diagnostics, not an automatically selected operating point."""
+    histogram = np.asarray(histogram)
+    if histogram.ndim != 2 or histogram.shape[0] != 2 or histogram.shape[1] < 2:
+        raise ValueError("Expected a 2 x bins pixel-score histogram")
+    bins = histogram.shape[1]
+    centers = (np.arange(bins)+0.5)/bins
+    means = [float(row @ centers/row.sum()) if row.sum() else None for row in histogram]
+    sweep = []
+    for desired in (0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9):
+        boundary = int(np.ceil(desired*bins))
+        fp, tp = (int(row[boundary:].sum()) for row in histogram)
+        tn, fn = (int(row[:boundary].sum()) for row in histogram)
+        sweep.append({"threshold": boundary/bins, "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+                      "recall": tp/(tp+fn) if tp+fn else None,
+                      "fpr": fp/(fp+tn) if fp+tn else None})
+    return {"bins": bins, "histogram_by_class": histogram.tolist(),
+            "approximate_mean_probability_nonshadow_shadow": means, "threshold_sweep": sweep,
+            "approved_for_relabeling": False, "scope": "fixed quantized dev diagnostics; no threshold selected"}
+
+
 def auc(labels, scores):
     labels, scores = np.asarray(labels, dtype=int), np.asarray(scores, dtype=float)
     if not len(labels) or len(np.unique(labels)) != 2:

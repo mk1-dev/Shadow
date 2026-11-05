@@ -12,9 +12,24 @@ export camera-time-aligned object motion and locally supported ground, then
 measure dense optical flow, geometry compensation and exposure-corrected light
 changes. This path does **not** read Occ3D or existing shadow pseudo masks.
 Stage 1/2 exports diagnostic candidates. Stage 3 now joins consecutive pairs on
-the same receiver plane, tests three-frame light/caster hypotheses, rejects
-competing casters, and requires other-track/disjoint-frame light support.
+the same receiver plane. The v2 gate compares real tracks against frozen and
+wrong-time explanations under the SAME light, requires other-track support
+outside both camera frames and physical samples, and separates shadow existence
+from caster ownership. Ambiguous ownership can remain unresolved without
+discarding supported observed shadow pixels.
 This is geometric BEV/ground registration, **not a BEV neural encoder**.
+
+Optical flow validates local textured receiver registration; it is NOT treated
+as shadow-boundary velocity. Default VLM context crops depend on proposals, not
+GT caster boxes (`--context-policy gt-assisted` is an explicit ablation).
+See [the v2 method, related work and validation gates](docs/shadow_track_contrast_v2.md).
+
+The 2026-11-06 recovery update adds balanced pixel risk, foreground-collapse
+checkpoint rejection, macro decision-NLL VLM checkpoint selection, corrected
+component reliability weights, and an explicit factorized-v3 physics audit.
+An optional receiver-transition ordering loss does not invent lit endpoint
+negatives. Read the recovery section in the same document before new HPC jobs;
+old collapsed checkpoints and unvalidated VLM adapters must not clean labels.
 
 The default remains audit-only. Explicit weak export produces positive/IGNORE
 trimaps for the existing segmenter and unified VLM data builders, including clean

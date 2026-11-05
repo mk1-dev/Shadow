@@ -29,4 +29,8 @@ torchrun --standalone --nproc_per_node=2 scripts/train_shadow_segmenter.py \
   --output-root "$OUTPUT_ROOT" \
   --epochs "${SHADOW_SEG_EPOCHS:-10}" --batch-size "${SHADOW_SEG_BATCH_SIZE:-2}" \
   --accumulation "${SHADOW_SEG_ACCUMULATION:-4}" --temporal-weight "${SHADOW_SEG_TEMPORAL_WEIGHT:-0.2}" \
+  --pixel-balance "${SHADOW_SEG_PIXEL_BALANCE:-loss}" --max-pixel-weight "${SHADOW_SEG_MAX_PIXEL_WEIGHT:-50}" \
+  --dice-weight "${SHADOW_SEG_DICE_WEIGHT:-0.5}" \
+  --receiver-pair-weight "${SHADOW_SEG_RECEIVER_PAIR_WEIGHT:-0}" \
+  --backbone-weights "${SHADOW_SEG_BACKBONE_WEIGHTS:-none}" \
   --seed 0 --allow-weak-labels "${INIT_ARGS[@]}"

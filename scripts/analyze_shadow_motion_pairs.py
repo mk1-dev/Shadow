@@ -79,10 +79,16 @@ def main():
     parser.add_argument("--min-background", type=int, default=128)
     parser.add_argument("--light-threshold", type=float, default=6.0, help="Lab L units in [0, 100]")
     parser.add_argument("--review-limit", type=int, default=20)
+    parser.add_argument("--receiver-support-radius", type=int, default=7)
+    parser.add_argument("--receiver-support-min-pixels", type=int, default=16)
+    parser.add_argument("--receiver-support-min-fraction", type=float, default=0.6)
     args = parser.parse_args()
     if args.review_limit < 0:
         raise ValueError("Review limit cannot be negative")
-    config = EvidenceConfig(min_background=args.min_background, light_threshold_L=args.light_threshold)
+    config = EvidenceConfig(min_background=args.min_background, light_threshold_L=args.light_threshold,
+        receiver_support_radius=args.receiver_support_radius,
+        receiver_support_min_pixels=args.receiver_support_min_pixels,
+        receiver_support_min_fraction=args.receiver_support_min_fraction)
     config.validate()
     output = Path(args.output_root).resolve()
     if output.exists() and any(output.iterdir()):
@@ -157,6 +163,8 @@ def main():
                "manifest_sha256": digest(args.pairs), "opencv_version": cv2.__version__,
                "flow_weights_sha256": digest(args.flow_weights) if args.flow_weights else None,
                "protocol": "physics-motion-evidence-v1", "coordinate_frame": "all evidence arrays use image t pixels",
+               "flow_evidence_version": "receiver-support-v2",
+               "flow_role": "local textured receiver registration; boundary flow is not shadow/material ground truth",
                "delta_definition": "exposure_compensated_L_next_at_same_ground_minus_L_t",
                "exposure_assumption": "majority stable lighting among flow-consistent sparse supported ground",
                "not_implemented": ["causal_three_frame_recovery", "light_direction_estimation", "caster_shadow_association",

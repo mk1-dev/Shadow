@@ -42,7 +42,10 @@ def main():
                 question += " Images 4 and 5 show earlier and later contexts registered to the same receiver ground as image 3, not to caster translation. Compare formation and recovery; black unsupported pixels are unknown. Future context is an offline annotation input, not a causal deployment claim."
             if row.get("temporal_context"):
                 question += " Image 4 follows the same caster with GT-assisted translation in this training/diagnostic view; changing shape and occlusion may interrupt continuity."
-            item = {**row, "task": "shadow_annotation", "prompt": question+schema, "answer": json.dumps(target, separators=(",", ":")) if target else None, "annotation_target": target, "shadow_label_source": row["label_source"], "association_source": row.get("association_source", "unresolved") if target and target["caster"]["state"] == "visible" else "unresolved", "candidates": [], "annotation_origin": "observed_region", "input_regime": "gt_assisted_context"}
+            regime = "gt_assisted_context"
+            if row.get("context_policy") == "proposal" and not row.get("temporal_context"):
+                regime = "proposal_context_gt_supervised_offline"
+            item = {**row, "task": "shadow_annotation", "prompt": question+schema, "answer": json.dumps(target, separators=(",", ":")) if target else None, "annotation_target": target, "shadow_label_source": row["label_source"], "association_source": row.get("association_source", "unresolved") if target and target["caster"]["state"] == "visible" else "unresolved", "candidates": [], "annotation_origin": "observed_region", "input_regime": regime}
             datasets[split].append(item)
         if args.offbev_data_root:
             for row in read_rows(Path(args.offbev_data_root)/f"offbev_{split}.jsonl"):

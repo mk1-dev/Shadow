@@ -29,6 +29,15 @@ def crop_bounds(box, shape, scale):
     return [max(0, int(cx-half_w)), max(0, int(cy-half_h)), min(width, int(np.ceil(cx+half_w))), min(height, int(np.ceil(cy+half_h)))]
 
 
+def context_bounds(box, shape, caster_box=None, policy="proposal"):
+    if policy not in {"proposal", "gt-assisted"}:
+        raise ValueError("Unknown context policy")
+    if policy == "gt-assisted" and caster_box is not None:
+        box = [min(box[0], caster_box[0]), min(box[1], caster_box[1]),
+               max(box[2], caster_box[2]), max(box[3], caster_box[3])]
+    return crop_bounds(box, shape, 2.5)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("Build shared segmentation and single-proposal VLM data.")
     parser.add_argument("--manifest", nargs="+", required=True, help="Canonical JSONLs; see docs/shadow_annotation_hpc.md")
@@ -41,6 +50,8 @@ def main() -> None:
     parser.add_argument("--min-known-fraction", type=float, default=0.8)
     parser.add_argument("--prompt", default=str(ROOT / "prompts/shadow_single_region_sft.txt"))
     parser.add_argument("--casters", help="Optional caster GT JSONL exported by export_nuscenes_caster_gt.py")
+    parser.add_argument("--context-policy", choices=["proposal", "gt-assisted"], default="proposal",
+                        help="Proposal-only context by default; GT-expanded crops are an explicit ablation")
     parser.add_argument("--no-temporal-context", action="store_true", help="Ablate only the VLM's additional previous-frame view")
     parser.add_argument("--min-temporal-region-overlap", type=float, default=0.1)
     args = parser.parse_args()
@@ -68,7 +79,8 @@ def main() -> None:
         row = dict(original)
         if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
             raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
-        if row.get("physics_protocol") and (row["physics_protocol"] != "three-frame-physics-weak-v1"
+        if row.get("physics_protocol") and (row["physics_protocol"] not in {
+                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3"}
                 or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
             raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
         if row.get("caster_id"):
@@ -119,7 +131,7 @@ def main() -> None:
         for key in ("sample_token", "camera", "group", "pair_id", "annotation_token", "instance_token", "caster_bbox_xyxy", "caster_category", "association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "ground_support", "ego_to_img", "ego_to_global", "timestamp", "temporal_status", "ground_z_ego"):
             if key in row:
                 common[key] = row[key]
-        for key in ("physics_protocol", "physics_export_enabled", "physics_pair_ids", "physics_frame_tokens", "physics_evidence", "physics_target_sha256"):
+        for key in ("physics_protocol", "physics_export_enabled", "physics_pair_ids", "physics_frame_tokens", "physics_sample_tokens", "physics_evidence", "physics_target_sha256"):
             if key in row:
                 common[key] = row[key]
         if common.get("ground_support"):
@@ -137,6 +149,14 @@ def main() -> None:
                 raise ValueError(f"Physics context mismatch: {identifier}")
             if row.get("temporal"):
                 raise ValueError("Do not mix ground and caster-aligned temporal views")
+            if context.get("transitions"):
+                transition = context["transitions"]
+                path = resolve_path(transition["path"], base)
+                if (digest(path) != transition["sha256"] or transition["semantics"] !=
+                        "relative_brightness_evidence_not_absolute_nonshadow_labels"):
+                    raise ValueError("Changed or invalid receiver transition evidence")
+                common["physics_transition"] = {**transition, "path": str(path),
+                    "views": [{**view, "image": str(resolve_path(view["image"], base))} for view in context["views"]]}
             if not args.no_temporal_context:
                 for view in context["views"]:
                     path = resolve_path(view["image"], base)
@@ -176,19 +196,32 @@ def main() -> None:
                 continue
             if row.get("physics_protocol"):
                 selected = row["physics_evidence"].get("selected")
+                if row["physics_protocol"] in {"three-frame-track-contrast-v2", "factorized-receiver-shadow-v3"}:
+                    decision = row["physics_evidence"].get("shadow_decision", {})
+                    selected = decision.get("selected")
+                    threshold = row["physics_evidence"].get("minimum_temporal_gain")
+                    if threshold is None or not np.isfinite(threshold) or not 0 <= threshold <= 1:
+                        raise ValueError("Missing or invalid frozen track-contrast threshold")
+                    fit_key = "shadow_fit_passes" if row["physics_protocol"] == "factorized-receiver-shadow-v3" else "shadow_passes"
+                    if region["shadow_label"] == "YES" and (not decision.get("shadow_accepted")
+                            or not selected or not selected.get(fit_key)
+                            or not np.isfinite(selected.get("temporal_gain", np.nan))
+                            or (row["physics_protocol"] == "three-frame-track-contrast-v2" and selected["temporal_gain"] < threshold)
+                            or not selected.get("control") or not decision.get("plausible_hypotheses")
+                            or len(set(row.get("physics_sample_tokens", []))) != 3):
+                        raise ValueError("Positive v2 region lacks a separate shadow/trajectory-contrast decision")
                 if region["shadow_label"] not in {"YES", "IGNORE"}:
                     raise ValueError("Physics regions must be positive or IGNORE, never invented negatives")
-                if region["shadow_label"] == "YES" and (not selected or not selected.get("passes")
-                        or len(set(selected.get("independent_light_tracks", []))) < 2 or not np.all(target[mask] == 1)):
+                key = {"three-frame-track-contrast-v2": "shadow_passes", "factorized-receiver-shadow-v3": "shadow_fit_passes"}.get(row["physics_protocol"], "passes")
+                passed = selected and selected.get(key)
+                if region["shadow_label"] == "YES" and (not passed
+                        or (row["physics_protocol"] != "factorized-receiver-shadow-v3" and len(set(selected.get("independent_light_tracks", []))) < 2)
+                        or not np.all(target[mask] == 1)):
                     raise ValueError("Positive physics region lacks the weak gate or matching observed trimap")
             yy, xx = np.where(mask)
             box = [xx.min(), yy.min(), xx.max()+1, yy.max()+1]
             tight = crop_bounds(box, shape, 1.6)
-            context_box = box
-            if row.get("caster_bbox_xyxy"):
-                caster_box = row["caster_bbox_xyxy"]
-                context_box = [min(box[0], caster_box[0]), min(box[1], caster_box[1]), max(box[2], caster_box[2]), max(box[3], caster_box[3])]
-            context = crop_bounds(context_box, shape, 2.5)
+            context = context_bounds(box, shape, row.get("caster_bbox_xyxy"), args.context_policy)
             x0, y0, x1, y1 = tight
             clean = image[y0:y1, x0:x1]
             outlined = clean.copy()
@@ -230,6 +263,7 @@ def main() -> None:
                 label = "IGNORE"
             item = {**common, "id": region_id, "parent_id": identifier, "task": "shadow", "region_id": region["id"], "region_mask": str(region_path), "context_crop_xyxy": context, "images": [str(path) for path in paths], "prompt": region_prompt, "temporal_context": has_context, "answer": label if label != "IGNORE" else None, "label_source": source, "known_fraction": known_fraction, "positive_fraction": positive_fraction}
             item["physics_temporal_context"] = bool(physics_views)
+            item["context_policy"] = args.context_policy
             for key in ("association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "shadow_evidence", "proposal_source"):
                 if key in region:
                     item[key] = region[key]
@@ -251,7 +285,7 @@ def main() -> None:
             row["sample_weight"] = 1.0/max(image_counts[row["image"]], 1)
         write_rows(output / f"seg_{split}.jsonl", segments[split])
         write_rows(output / f"vlm_{split}.jsonl", vlm[split])
-    write_json(output / "dataset_protocol.json", {"input_sha256": {path: digest(path) for path in args.manifest}, "casters_sha256": digest(args.casters) if args.casters else None, "prompt_sha256": digest(args.prompt), "seed": args.seed, "dev_fraction": args.dev_fraction, "positive_fraction": args.positive_fraction, "negative_fraction": args.negative_fraction, "min_known_fraction": args.min_known_fraction, "no_temporal_context": args.no_temporal_context, "min_temporal_region_overlap": args.min_temporal_region_overlap, "excluded_scenes": sorted(excluded), "scenes": scene_splits, "counts": dict(counts)})
+    write_json(output / "dataset_protocol.json", {"input_sha256": {path: digest(path) for path in args.manifest}, "casters_sha256": digest(args.casters) if args.casters else None, "prompt_sha256": digest(args.prompt), "seed": args.seed, "dev_fraction": args.dev_fraction, "positive_fraction": args.positive_fraction, "negative_fraction": args.negative_fraction, "min_known_fraction": args.min_known_fraction, "context_policy": args.context_policy, "no_temporal_context": args.no_temporal_context, "min_temporal_region_overlap": args.min_temporal_region_overlap, "excluded_scenes": sorted(excluded), "scenes": scene_splits, "counts": dict(counts)})
     print(f"Wrote shared segmentation/VLM datasets to {output}")
 
 

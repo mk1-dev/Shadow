@@ -61,6 +61,40 @@ def scaled_projection(camera, working_size):
     return resize @ camera.calibration.intrinsic @ camera.calibration.global_to_sensor[:3]
 
 
+def object_image_polygon(corners, projection, shape, *, near_depth=0.1, margin=3):
+    corners = np.asarray(corners, dtype=np.float64)
+    projection = np.asarray(projection, dtype=np.float64)
+    if (corners.shape != (8, 3) or projection.shape != (3, 4)
+            or not np.isfinite(corners).all() or not np.isfinite(projection).all()):
+        raise ValueError("invalid_object_projection")
+    projected = np.c_[corners, np.ones(8)] @ projection.T
+    front = projected[:, 2] >= near_depth
+    crossing = bool(front.any() and not front.all())
+    empty = np.empty((0, 1, 2), dtype=np.int32)
+    if not front.any():
+        return empty, crossing
+    vertices = [*projected[front]]
+    if crossing:
+        # All vertex chords include the box edges; extra intersections lie inside
+        # the clipped convex box. This does not depend on corner ordering.
+        for a in projected[front]:
+            for b in projected[~front]:
+                fraction = (near_depth-a[2])/(b[2]-a[2])
+                vertices.append(a+fraction*(b-a))
+    vertices = np.asarray(vertices)
+    uv = vertices[:, :2]/vertices[:, 2:3]
+    hull = cv2.convexHull(uv.astype(np.float32))
+    if len(hull) < 3 or cv2.contourArea(hull) <= 0:
+        return empty, crossing
+    height, width = shape
+    viewport = np.array([[-margin, -margin], [width-1+margin, -margin],
+                         [width-1+margin, height-1+margin], [-margin, height-1+margin]], np.float32)
+    area, clipped = cv2.intersectConvexConvex(hull, viewport)
+    if area <= 0 or clipped is None:
+        return empty, crossing
+    return np.rint(clipped).astype(np.int32), crossing
+
+
 def observed_ground(points_world, object_free, projection, plane_world, shape,
                     object_corners, *, basis_world=None, support_radius=3, plane_tolerance=0.15):
     height, width = shape
@@ -78,22 +112,19 @@ def observed_ground(points_world, object_free, projection, plane_world, shape,
     support[pixels[ground, 1], pixels[ground, 0]] = 1
     support = cv2.dilate(support, np.ones((2*support_radius+1, 2*support_radius+1), np.uint8)) > 0
     # All annotated objects, not just candidate vehicles, exclude visible support.
-    near_plane_ambiguous = False
+    objects_crossing_near_plane = 0
+    near_plane_objects_clipped = 0
+    object_exclusion = np.zeros(shape, bool)
     for corners in object_corners:
-        box_uv, box_depth, good = project_world(corners, projection)
-        if np.any(box_depth > 0.1) and not good.all():
-            near_plane_ambiguous = True
+        polygon, crossing = object_image_polygon(corners, projection, shape)
+        objects_crossing_near_plane += int(crossing)
+        if not len(polygon):
             continue
-        if not good.all():
-            continue
-        box_uv = np.clip(box_uv, -10000, 10000)
-        polygon = cv2.convexHull(np.rint(box_uv).astype(np.int32))
+        near_plane_objects_clipped += int(crossing)
         object_mask = np.zeros(shape, np.uint8)
         cv2.fillConvexPoly(object_mask, polygon, 1)
-        support &= cv2.dilate(object_mask, np.ones((7, 7), np.uint8)) == 0
-    if near_plane_ambiguous:
-        # Do not draw a spurious polygon across the camera near plane.
-        support[:] = False
+        object_exclusion |= cv2.dilate(object_mask, np.ones((7, 7), np.uint8)) > 0
+    support &= ~object_exclusion
     # A dilated sample is only local planar support, NOT dense visibility truth.
     basis = plane_basis(plane_world) if basis_world is None else np.asarray(basis_world)
     matrix = projection @ basis
@@ -106,7 +137,9 @@ def observed_ground(points_world, object_free, projection, plane_world, shape,
     support &= (inverse_depth > 0) & (plane_depth <= zbuffer+0.3)
     return support, {"projected_lidar_points": int(valid.sum()), "projected_ground_points": int(ground.sum()),
                      "supported_pixels": int(support.sum()), "support_radius_px": support_radius,
-                     "near_plane_object_ambiguous": near_plane_ambiguous,
+                     "objects_crossing_near_plane": objects_crossing_near_plane,
+                     "near_plane_objects_clipped": near_plane_objects_clipped,
+                     "object_exclusion_pixels": int(object_exclusion.sum()),
                      "visibility_scope": "sparse_lidar_local_planar_support_not_dense_ground_gt"}
 
 

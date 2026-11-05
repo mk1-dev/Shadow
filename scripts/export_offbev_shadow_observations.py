@@ -10,6 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import checked_write_image, read_rows, write_rows
+from shadow_occ.annotation.readiness import require_prediction_for_proposals
 from shadow_occ.annotation.offbev import boundary_hypotheses
 from shadow_occ.annotation.temporal import plane_matrix, warp
 from shadow_occ.config import load_config
@@ -60,6 +61,7 @@ def main():
     prediction_index = {}
     if args.seg_predictions:
         for row in read_rows(args.seg_predictions):
+            require_prediction_for_proposals(row)
             prediction_index.setdefault((row["sample_token"], row["camera"]), []).append(row)
     grid_to_ego = np.array([[grid.resolution, 0, grid.x_min+grid.resolution/2], [0, grid.resolution, grid.y_min+grid.resolution/2], [0, 0, args.ground_z], [0, 0, 1]])
     observations = []

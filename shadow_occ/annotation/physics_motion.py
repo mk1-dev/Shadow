@@ -18,6 +18,10 @@ class EvidenceConfig:
     light_threshold_L: float = 6.0
     chroma_scale: float = 12.0
     darkness_ratio: float = 0.88
+    receiver_support_radius: int = 7
+    receiver_support_min_pixels: int = 16
+    receiver_support_min_fraction: float = 0.6
+    receiver_texture_L: float = 1.0
 
     def validate(self):
         if self.min_background < 16 or not 0 < self.darkness_ratio < 1:
@@ -27,6 +31,11 @@ class EvidenceConfig:
                   self.light_threshold_L, self.chroma_scale]
         if not np.isfinite(values).all() or min(values) <= 0:
             raise ValueError("Evidence thresholds must be finite and positive")
+        if (not isinstance(self.receiver_support_radius, int) or self.receiver_support_radius < 1
+                or not isinstance(self.receiver_support_min_pixels, int) or self.receiver_support_min_pixels < 1
+                or not np.isfinite([self.receiver_support_min_fraction, self.receiver_texture_L]).all()
+                or not 0 < self.receiver_support_min_fraction <= 1 or self.receiver_texture_L <= 0):
+            raise ValueError("Invalid local receiver-flow support settings")
 
 
 def project_world(points, projection):
@@ -223,6 +232,42 @@ def exposure_fit(old_L, new_L, background, config):
     return result
 
 
+def receiver_flow_evidence(lightness, visible, forward, geometric_flow, flow_reliable, config):
+    """Validate receiver registration without requiring shadow boundaries to follow material flow.
+
+    Neighbour votes are restricted to the same connected supported-ground patch.
+    Textureless patches without observable neighbours remain unsupported.
+    """
+    residual = np.linalg.norm(forward-geometric_flow, axis=-1)
+    gx = cv2.Sobel(lightness, cv2.CV_32F, 1, 0, ksize=3)/8
+    gy = cv2.Sobel(lightness, cv2.CV_32F, 0, 1, ksize=3)/8
+    textured = np.hypot(gx, gy) >= config.receiver_texture_L
+    anchors = visible & textured & flow_reliable & np.isfinite(residual)
+    anchors &= residual <= config.ground_flow_tolerance_px
+    window = 2*config.receiver_support_radius+1
+    count = np.zeros(lightness.shape, np.float32)
+    fraction = np.zeros_like(count)
+    number, components, stats, _ = cv2.connectedComponentsWithStats(visible.astype(np.uint8), connectivity=8)
+    for index in range(1, number):
+        x, y, width, height, _ = stats[index]
+        section = np.s_[y:y+height, x:x+width]
+        patch = components[section] == index
+        if not np.any(anchors[section] & patch):
+            continue
+        def total(values):
+            return cv2.boxFilter(values.astype(np.float32), -1, (window, window),
+                                 normalize=False, borderType=cv2.BORDER_CONSTANT)
+        votes = total(anchors[section] & patch)
+        observable = total(visible[section] & textured[section] & patch)
+        count[section][patch] = votes[patch]
+        fraction[section][patch] = (votes/np.maximum(observable, 1))[patch]
+    neighbourhood = (count >= config.receiver_support_min_pixels) & (fraction >= config.receiver_support_min_fraction)
+    supported = visible & (anchors | neighbourhood)
+    return {"receiver_flow_supported": supported, "receiver_flow_anchor": anchors,
+            "receiver_flow_support_count": count, "receiver_flow_support_fraction": fraction,
+            "receiver_texture": textured & visible}
+
+
 def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
                   projection_next, basis_world, forward, backward, config=None):
     """All output maps use t coordinates; positive delta means recovery at that surface."""
@@ -243,6 +288,7 @@ def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
     lab_next = cv2.cvtColor(image_next, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_t[..., 0] *= 100/255
     lab_next[..., 0] *= 100/255
+    receiver = receiver_flow_evidence(lab_t[..., 0], visible, forward, geometric_flow, flow_reliable, config)
     aligned = sample_at(lab_next, endpoints)
     exposure = exposure_fit(aligned[..., 0], lab_t[..., 0], background, config)
     delta = exposure["scale"]*aligned[..., 0]+exposure["offset_L"]-lab_t[..., 0]
@@ -269,8 +315,12 @@ def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
                "flow_fb_error_median_px": median(fb_error, visible), "exposure": exposure,
                "onset_candidate_pixels": int(onset.sum()), "recovery_candidate_pixels": int(recovery.sum()),
                "stable_dark_candidate_pixels": int(stable.sum()), "shadow_accuracy_available": False,
+               "flow_evidence_version": "receiver-support-v2",
+               "receiver_flow_supported_pixels": int(receiver["receiver_flow_supported"].sum()),
+               "receiver_flow_anchor_pixels": int(receiver["receiver_flow_anchor"].sum()),
+               "transition_pixels_without_direct_reliable_flow": int(((onset | recovery) & ~flow_reliable).sum()),
                "status": "evidence_available" if exposure["valid"] else exposure["reason"]}
-    return {"ground_flow": geometric_flow, "flow_residual_px": flow_residual,
+    return {**receiver, "ground_flow": geometric_flow, "flow_residual_px": flow_residual,
             "flow_fb_error_px": fb_error, "flow_reliable": flow_reliable,
             "visible_ground": visible, "delta_L": np.where(visible, delta, 0),
             "chroma_difference": np.where(visible, chroma, 0),

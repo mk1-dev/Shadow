@@ -48,7 +48,8 @@ def test_prediction_proposal_and_refinement_can_recover_previously_unknown_pixel
     np.savez_compressed(probability_path, probability=probability)
     predictions = tmp_path/"predictions.jsonl"
     write_rows(predictions, [{"id": "a", "image": str(tmp_path/"image.png"), "target": str(target_path),
-                             "probability": str(probability_path), "ground_support": str(ground_path), "label_source": "geometry_weak"}])
+                             "probability": str(probability_path), "ground_support": str(ground_path), "label_source": "geometry_weak",
+                             "segmenter_readiness": {"noncollapsed": True, "approved_for_relabeling": False}}])
     proposals = tmp_path/"proposals"
     run_script("propose_shadow_annotation_regions.py", "--seg-predictions", predictions, "--output-root", proposals, "--min-area", 4)
     regions = read_rows(proposals/"manifest.jsonl")[0]["regions"]
@@ -57,7 +58,7 @@ def test_prediction_proposal_and_refinement_can_recover_previously_unknown_pixel
     votes = tmp_path/"votes.jsonl"
     write_rows(votes, [{"id": "a:proposal", "parent_id": "a", "region_mask": regions[0]["mask"], "prediction": {"shadow": "YES"}}])
     refined = tmp_path/"refined"
-    run_script("refine_shadow_annotations.py", "--seg-predictions", predictions, "--annotation-results", votes, "--output-root", refined)
+    run_script("refine_shadow_annotations.py", "--seg-predictions", predictions, "--annotation-results", votes, "--output-root", refined, "--allow-weak-pilot")
     row = read_rows(refined/"manifest.jsonl")[0]
     assert row["refinement"]["new_positive_pixels"] == 64
     assert np.count_nonzero(cv2.imread(row["target"], cv2.IMREAD_GRAYSCALE) == 1) == 64

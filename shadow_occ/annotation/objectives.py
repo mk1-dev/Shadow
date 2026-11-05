@@ -34,10 +34,13 @@ def assistant_token_groups(tokenizer, full_text, answer, supervised_ids):
     return torch.tensor(groups, dtype=torch.long)
 
 
-def component_loss(logits, labels, groups, decision_weight, weights):
+def component_loss(logits, labels, groups, decision_weight, weights, example_weight=1.0):
+    import math
     import torch
     from torch.nn import functional as F
 
+    if not all(math.isfinite(x) and x > 0 for x in (decision_weight, example_weight)):
+        raise ValueError("Invalid decision/base example weight")
     valid = labels[:, 1:] != -100
     if not bool(valid.any()):
         raise ValueError("No supervised response tokens")
@@ -55,4 +58,4 @@ def component_loss(logits, labels, groups, decision_weight, weights):
             normalizer += weights[name]
     if normalizer <= 0:
         raise ValueError("No active component loss")
-    return total/normalizer, components
+    return example_weight*total/normalizer, components
