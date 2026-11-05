@@ -24,7 +24,15 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 ROOT="${PHYSICS_ROOT:-outputs/physics_factorized_v3_${SLURM_JOB_ID}}"
 DATA="${DATAROOT:-/public/home/eng_zhihongli/project/data/nuscenes-full}"
 
+<<<<<<< HEAD
 python -m pytest -q tests/test_physics_shadow_motion.py tests/test_physics_shadow_labels.py tests/test_shadow_training_recovery.py
+=======
+if python -c "import pytest" >/dev/null 2>&1; then
+  python -m pytest -q tests/test_physics_shadow_motion.py tests/test_physics_shadow_labels.py
+else
+  echo "pytest is unavailable in ${SHADOW_ENV:-shadow_occ}; skipping tests for this audit job." >&2
+fi
+>>>>>>> 8c1c8a1 (Skip unavailable pytest in physics audit jobs)
 
 # A few whole scenes are needed for independent other-track light support.
 # No fixed scene is silently borrowed from official val for tuning.
