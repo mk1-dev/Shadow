@@ -7,6 +7,133 @@ No manual nuScenes shadow masks, no Occ3D, no OCC training, no new flow network.
 Keep both the pixel segmenter and the unified VLM annotator. Existing HPC jobs
 and outputs are not updated in place; rebuild into a fresh v2 output root.
 
+## BEV-Flow Redesign
+
+The learned encoder is the existing UniAD/OpenDriveVLA BEVFormer, not Shadow's
+older local BEVFormer-style model. The inspected local implementation is
+`E:/VLA_baseline/mulit_VLA/OpenDriveVLAre`:
+
+- `projects/mmdet3d_plugin/uniad/detectors/uniad_track.py:get_bevs` outputs
+  `[H*W, B, C]`; the base config is 200 x 200 with 256 channels.
+- `projects/mmdet3d_plugin/uniad/modules/encoder.py:get_reference_points`
+  confirms rows follow y and columns follow x. The configured metric range
+  belongs to LIDAR_TOP, not an interchangeable ego frame.
+- `scripts/export_uniad_pth.py` supplies the existing model construction,
+  preprocessing and inference helpers. Its compact VLM cache omits spatial
+  BEV; `--full-results` retains `result_track.bev_embed`.
+
+`scripts/export_mature_bev.py` calls those helpers in the mature environment,
+replays needed scenes in timestamp order with the existing test pipeline,
+and saves only the requested samples' spatial BEV. Earlier frames in each
+needed scene initialize temporal memory. `--ann-file` selects train/val infos
+without switching to the training/augmentation path. The two external projects
+are not modified. A MACR checkout can be added through its actual encoder
+interface once its local directory is identified; it is not a second
+dependency for this implementation.
+
+### Common Representation
+
+1. Export all-class box volumes, camera-time 3D vehicle tracks, ground support
+   and calibration. A fixed first-sample ego frame defines the metric grid.
+2. Sample the SAME world ground points in three images. Compose both affine
+   exposure corrections into the first frame's Lab-L reference.
+3. Store expected geometric flow and measured dense flow at each receiver;
+   their units remain source-image pixels per actual camera interval.
+4. Store box footprints/height envelopes, visibility, receiver support,
+   brightness onset/recovery, static dark regions and flow registration support.
+5. Transform each common world point into each cached BEV's LIDAR_TOP frame
+   before sampling features. Save three-frame receiver features and temporal
+   cosine similarity. Feature variation is recorded, not used as a replacement
+   for the measured lighting transitions.
+6. Extract components in metric BEV. Match all three caster-box shadow
+   footprints under the same light in that BEV. Keep the existing real-time
+   versus frozen/permuted trajectory comparisons and factorized decisions.
+7. Project the observed BEV component back to the supported middle camera.
+   Export image-space trimaps to the existing segmenter/VLM data builders.
+   Each candidate also stores BEV area, feature means, and its leading caster
+   footprint hypotheses for inspection and later feature fusion.
+
+The `explanation_state` map is 0=unknown, 1=stable receiver observation,
+2=physical box support, 3=receiver illumination change. Candidate formation
+uses illumination and receiver evidence, not a large-flow-residual threshold.
+Static dark components are retained for audit; the moving-caster acceptance
+stage still needs observed onset/recovery. The evidence includes all supported
+receivers before any shadow component is extracted.
+
+### HPC Sequence
+
+No local model execution is required. Run the tests and data/model jobs on HPC.
+Use an unused output directory for `ROOT`.
+
+```bash
+cd /public/home/eng_zhihongli/project/Shadow_update
+conda activate shadow_occ
+python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py \
+  tests/test_physics_shadow_motion.py tests/test_physics_shadow_labels.py
+
+ROOT="$PWD/outputs/bev_flow_v1"
+DATA=/public/home/eng_zhihongli/project/data/nuscenes-full
+python -u scripts/export_nuscenes_motion_pairs.py \
+  --dataroot "$DATA" --split train --cams CAM_FRONT \
+  --max-pairs 120 --max-attempts 600 --output-root "$ROOT/pairs"
+python -u scripts/analyze_shadow_motion_pairs.py \
+  --pairs "$ROOT/pairs/pairs.jsonl" --flow-backend dis --device cpu \
+  --output-root "$ROOT/flow"
+```
+
+Use the already working OpenDriveVLA environment and its actual cloud paths:
+
+```bash
+export UNIAD_ROOT=/path/to/OpenDriveVLAre
+export UNIAD_CHECKPOINT=/path/to/uniad_base_track_map.pth
+export UNIAD_ANN_FILE=/path/to/nuscenes_infos_temporal_train.pkl
+conda activate YOUR_EXISTING_UNIAD_ENV
+python -u scripts/export_mature_bev.py \
+  --external-root "$UNIAD_ROOT" --checkpoint "$UNIAD_CHECKPOINT" \
+  --ann-file "$UNIAD_ANN_FILE" --dataroot "$DATA" \
+  --pairs "$ROOT/pairs/pairs.jsonl" --output-root "$ROOT/mature_bev"
+
+conda activate shadow_occ
+python -u scripts/analyze_bev_flow_discrepancy.py \
+  --pairs "$ROOT/pairs/pairs.jsonl" --analysis-root "$ROOT/flow" \
+  --feature-root "$ROOT/mature_bev" --output-root "$ROOT/bev_flow"
+python -u scripts/build_physics_shadow_labels.py \
+  --pairs "$ROOT/pairs/pairs.jsonl" --analysis-root "$ROOT/flow" \
+  --bev-flow-root "$ROOT/bev_flow" --decision-policy factorized-v3 \
+  --output-root "$ROOT/labels_audit"
+```
+
+The export stage needs one GPU; optical-flow DIS, physical BEV construction,
+feature-cache sampling and label matching run on CPU. A Slurm version of the
+second block is `slurm/export_mature_shadow_bev.slurm`, configured through
+`PHYSICS_ROOT`, `UNIAD_ROOT`, `UNIAD_CHECKPOINT`, `UNIAD_ANN_FILE` and
+`UNIAD_CONDA_ENV`. `slurm/build_shadow_physics_labels.slurm` prepares a fresh
+CPU-only physical-BEV audit without requiring the feature cache first.
+
+Existing full-results caches can instead be converted using
+`scripts/import_uniad_bev_cache.py --external-root ... --cache-root ... --output-root ... --pairs ...
+--dataroot ... --model-config ... --checkpoint ...` in the mature environment.
+
+### Outputs And Comparisons
+
+- `mature_bev/<sample>.npz/json`: spatial features, range, LiDAR-to-world pose,
+  timestamp, model/config identity.
+- `bev_flow/windows.jsonl` and `windows/*.npz`: common receivers, 3D motion,
+  geometric/observed flow, reliability, three-frame brightness, illumination
+  transitions, learned receiver features and explanations.
+- `bev_flow/review/*.jpg`: aligned three-frame BEV brightness, changes, states.
+- `labels_audit/bev_regions/*.npz`: individual BEV components and feature means.
+- `labels_audit/decisions.jsonl`: light/caster matches, motion controls and links
+  to the corresponding BEV evidence; image masks remain in camera coordinates.
+
+For the image-space ablation, run the same label command without
+`--bev-flow-root` and choose another output directory. For the physical-BEV-only
+ablation, omit `--feature-root` from the BEV analyzer. These retain the same
+frames, tracks and flow. Review labels before using the existing explicit
+`--export-weak-labels` option and the segmentation/joint-annotator builders.
+OCC experiments and injecting shadow features into the mature model are the
+next stage; this update covers BEV-based observation and annotation.
+
 ## Recovery Update: 2026-11-06
 
 The reported fresh run completed execution but failed quality checks: segmenter

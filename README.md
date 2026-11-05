@@ -2,10 +2,29 @@
 
 ## Current Research Scope: Physics-Guided Shadow Annotation
 
-The active experiment is **3D-to-2D Physics-Guided Shadow Annotation**, without
-manual shadow labels. BEVFormer, OCC training and shadow-to-BEV fusion are
-deferred; their older code remains below for reference, not as the current run
-path. Existing 3D object GT supplies motion constraints, never shadow truth.
+The active experiment is **BEV-Flow-Guided Shadow Annotation**. Reuse the mature
+UniAD/OpenDriveVLA BEVFormer as a frozen encoder, align its spatial features with
+three-frame physical BEV and image flow, and generate receiver-grounded shadow
+regions for the existing segmenter and unified VLM. OCC training remains the
+next stage. Existing 3D object GT supplies the physical tracks.
+
+The executable BEV path is:
+
+```text
+existing UniAD/OpenDriveVLA BEVFormer -> frozen spatial BEV cache
+nuScenes 3D tracks / ground / poses -> physical BEV and geometric expected flow
+three camera frames / optical flow -> aligned brightness and observed flow
+                                    |
+                   common world receiver / fixed BEV grid
+                                    |
+            BEV components -> caster/light trajectory matching
+                                    |
+           observed image trimaps -> segmenter + unified VLM
+```
+
+Use `scripts/export_mature_bev.py` in the existing OpenDriveVLA environment;
+Shadow does not copy or retrain that encoder. The CPU join and label builder run
+in the annotation environment. See [BEV redesign and HPC commands](docs/shadow_track_contrast_v2.md#bev-flow-redesign).
 
 Start with [the physics annotation workflow on HPC](docs/physics_guided_shadow_annotation_hpc.md):
 export camera-time-aligned object motion and locally supported ground, then
@@ -17,7 +36,8 @@ wrong-time explanations under the SAME light, requires other-track support
 outside both camera frames and physical samples, and separates shadow existence
 from caster ownership. Ambiguous ownership can remain unresolved without
 discarding supported observed shadow pixels.
-This is geometric BEV/ground registration, **not a BEV neural encoder**.
+The physical grid and the cached learned BEV are kept in their own coordinates
+until aligned through world points; the learned model uses a LIDAR_TOP grid.
 
 Optical flow validates local textured receiver registration; it is NOT treated
 as shadow-boundary velocity. Default VLM context crops depend on proposals, not

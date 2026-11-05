@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -15,28 +15,15 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.data import checked_write_image, digest, read_rows, resolve_path, write_rows
+from shadow_occ.annotation.bev_flow import bev_mask_to_image
+from shadow_occ.annotation.physics_io import load_motion_analysis, check_pair_files, read_evidence
+from shadow_occ.geometry.bev import BEVGrid
 from shadow_occ.annotation.physics_labels import (
     LabelConfig, footprint_mask, light_bank, light_support_index, middle_evidence, rank_hypotheses, receiver_points,
     select_shadow_and_caster, factorized_shadow_decision, window_tracks,
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.utils.io import write_json
-
-
-def read_evidence(row, stats, base):
-    if row["id"] not in stats:
-        raise ValueError(f"Missing pair evidence: {row['id']}")
-    metric = stats[row["id"]]
-    for key in ("scene_name", "camera", "official_split"):
-        if row[key] != metric[key]:
-            raise ValueError(f"Pair evidence metadata mismatch: {key}")
-    path = resolve_path(metric["evidence"], base)
-    if digest(path) != metric["evidence_sha256"]:
-        raise ValueError("Pair evidence changed since analysis")
-    with np.load(path, allow_pickle=False) as archive:
-        if "receiver_flow_supported" not in archive.files:
-            raise ValueError("Missing v2 receiver-flow support; rebuild motion analysis")
-        return {key: archive[key].copy() for key in archive.files}, metric
 
 
 def visible_box(track, projection, shape):
@@ -51,17 +38,12 @@ def visible_box(track, projection, shape):
     return np.r_[lower, upper].tolist()
 
 
-def check_pair_files(pair, base):
-    for frame in pair["frames"]:
-        for key, sha in (("image", "image_sha256"), ("ground_support", "ground_sha256")):
-            if digest(resolve_path(frame[key], base)) != frame[sha]:
-                raise ValueError(f"Exported {key} changed: {pair['id']}")
-
-
 def main():
     parser = argparse.ArgumentParser("Joint 3D/2D weak-label gate; audit-only unless explicitly enabled.")
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--analysis-root", required=True)
+    parser.add_argument("--bev-flow-root", help="Use BEV components and metric caster matching instead of image components")
+    parser.add_argument("--minimum-bev-area-m2", type=float, default=0.5)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--export-weak-labels", action="store_true", help="Opt in to experimental positive-only training labels, NOT verified GT")
     parser.add_argument("--max-components-per-window", type=int, default=50)
@@ -82,19 +64,21 @@ def main():
     cv2.setNumThreads(1)
     base = Path(args.pairs).resolve().parent
     analysis = Path(args.analysis_root).resolve()
-    protocol_path = analysis/"analysis_protocol.json"
-    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
-    if protocol.get("flow_evidence_version") != "receiver-support-v2":
-        raise ValueError("Re-run motion analysis with receiver-support-v2 before building v2 labels")
-    if protocol["manifest_sha256"] != digest(args.pairs):
-        raise ValueError("Flow analysis was not produced from this exact pair manifest")
-    pairs = read_rows(args.pairs)
-    if not pairs or len({row["id"] for row in pairs}) != len(pairs):
-        raise ValueError("Pairs must be nonempty and uniquely identified")
-    metrics = read_rows(analysis/"pair_metrics.jsonl")
-    stats = {row["id"]: row for row in metrics}
-    if len(stats) != len(metrics) or set(stats) != {row["id"] for row in pairs}:
-        raise ValueError("Evidence must cover the exact pair manifest, without duplicates")
+    pairs, stats, protocol_path = load_motion_analysis(args.pairs, analysis)
+    bev_windows = {}
+    if args.bev_flow_root:
+        bev_root = Path(args.bev_flow_root).resolve()
+        bev_protocol = json.loads((bev_root/"bev_flow_protocol.json").read_text(encoding="utf-8"))
+        for key, path in (("pair_manifest_sha256", args.pairs), ("analysis_protocol_sha256", protocol_path),
+                          ("pair_metrics_sha256", analysis/"pair_metrics.jsonl")):
+            if bev_protocol[key] != digest(path):
+                raise ValueError(f"BEV-flow input mismatch: {key}")
+        rows = read_rows(bev_root/"windows.jsonl")
+        bev_windows = {tuple(row["pair_ids"]): row for row in rows}
+        if len(bev_windows) != len(rows) or not rows:
+            raise ValueError("BEV windows must be nonempty and unique")
+        if not np.isfinite(args.minimum_bev_area_m2) or args.minimum_bev_area_m2 <= 0:
+            raise ValueError("BEV component area must be positive square metres")
     successor = {}
     for pair in pairs:
         key = (pair["scene_name"], pair["official_split"], pair["camera"], pair["sample_token"])
@@ -134,9 +118,26 @@ def main():
         projection = np.asarray(frame["projection_world_to_image"])
         basis = np.asarray(left["plane_basis_world"])
         plane = np.asarray(left["plane_world"])
-        # Never bridge gaps across unsupported ground by dilation or closing.
-        number, labels, areas, _ = cv2.connectedComponentsWithStats(maps["dark"].astype(np.uint8), connectivity=8)
-        components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= config.minimum_area]
+        rank_maps, rank_projection, rank_config = maps, projection, config
+        bev_ref, bev_arrays, grid = None, None, None
+        if args.bev_flow_root:
+            bev_ref = bev_windows[left["id"], right["id"]]
+            evidence_path = resolve_path(bev_ref["evidence"], bev_root)
+            if digest(evidence_path) != bev_ref["evidence_sha256"]:
+                raise ValueError("BEV-flow evidence changed")
+            with np.load(evidence_path, allow_pickle=False) as archive:
+                bev_arrays = {key: archive[key].copy() for key in archive.files}
+            grid = BEVGrid(**bev_ref["grid"])
+            rank_projection = bev_arrays["bev_world_to_grid"]
+            rank_maps = {"visible": bev_arrays["receiver_valid"], "dark": bev_arrays["shadow_candidate"],
+                "onset": bev_arrays["shadow_boundary_onset"], "recovery": bev_arrays["shadow_boundary_recovery"],
+                "flow_supported": bev_arrays["shadow_flow_supported"],
+                "same_patch_cycle": bev_arrays["shadow_same_patch_cycle"]}
+            rank_config = replace(config, minimum_area=max(1, int(np.ceil(args.minimum_bev_area_m2/grid.resolution**2))),
+                                  minimum_change_pixels=1)
+        # Never bridge gaps across unsupported receivers by dilation or closing.
+        number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
+        components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
         counts["small_components"] += number-1-len(components)
         if len(components) > args.max_components_per_window:
             counts["component_limit_windows"] += 1
@@ -166,9 +167,15 @@ def main():
                                      "timestamp": adjacent["camera_timestamp"]})
         polygon_cache = {}
         for component in components:
-            mask = labels == component
-            hypotheses, report = rank_hypotheses(mask, maps, tracks, plane, basis, projection,
-                                                  directions, config, polygon_cache=polygon_cache)
+            rank_mask = labels == component
+            hypotheses, report = rank_hypotheses(rank_mask, rank_maps, tracks, plane, basis, rank_projection,
+                                                  directions, rank_config, polygon_cache=polygon_cache)
+            mask = rank_mask
+            if grid is not None:
+                mask = bev_mask_to_image(rank_mask, projection, basis, grid, maps["visible"].shape) & maps["visible"]
+                if mask.sum() < config.minimum_area:
+                    counts["bev_components_without_image_support"] += 1
+                    continue
             stem = hashlib.sha256(f"{left['id']}:{right['id']}:{component}".encode()).hexdigest()[:24]
             path = output/"regions"/f"{stem}.png"
             checked_write_image(path, mask.astype(np.uint8)*255)
@@ -176,11 +183,31 @@ def main():
             ground_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(ground_path, observed_receiver_points_world=receiver_points(mask, projection, basis))
             eligible = {item["instance_token"] for item in hypotheses}
+            eligible.update(alt["instance_token"] for item in hypotheses for alt in item.get("alternatives", []))
             caster_metadata = {}
             for token in eligible:
                 track = track_map[token]
                 caster_metadata[token] = {"annotation_token": track["annotation_token"], "category": track["category"],
                                           "bbox": visible_box(track, projection, mask.shape)}
+            bev_component = None
+            if grid is not None:
+                component_path = output/"bev_regions"/f"{stem}.npz"
+                component_path.parent.mkdir(parents=True, exist_ok=True)
+                pooled = {}
+                if "learned_bev_receiver_features" in bev_arrays:
+                    features = bev_arrays["learned_bev_receiver_features"].astype(np.float32)
+                    support = bev_arrays["learned_bev_valid"] & rank_mask[None]
+                    pooled["receiver_feature_mean"] = np.stack([
+                        features[t][support[t]].mean(axis=0) if support[t].any() else np.zeros(features.shape[-1])
+                        for t in range(3)]).astype(np.float32)
+                np.savez_compressed(component_path, component_mask=rank_mask, **pooled)
+                bev_component = {"window_id": bev_ref["id"], "evidence": str(evidence_path),
+                    "evidence_sha256": bev_ref["evidence_sha256"], "component": str(component_path),
+                    "component_sha256": digest(component_path), "area_m2": float(rank_mask.sum()*grid.resolution**2),
+                    "coordinate_frame": "fixed anchor ego x/y; rows=y, columns=x",
+                    "caster_footprints": [{"instance_token": h["instance_token"], "light_id": h["light_id"],
+                        "polygons": [p.tolist() for p in polygon_cache[h["instance_token"], h["light_id"]]]}
+                        for h in sorted(hypotheses, key=lambda h: -h["score"])[:5]]}
             candidates.append({"id": stem, "scene_name": left["scene_name"], "official_split": left["official_split"],
                 "camera": left["camera"], "sample_token": right["sample_token"],
                 "frame_tokens": [left["frames"][0]["sample_data_token"], frame["sample_data_token"], right["frames"][1]["sample_data_token"]],
@@ -189,7 +216,8 @@ def main():
                 "ground_support": str(resolve_path(frame["ground_support"], base)),
                 "timestamp": frame["camera_timestamp"], "mask": str(path), "mask_sha256": digest(path),
                 "ground_points": str(ground_path), "hypotheses": hypotheses,
-                "evidence": report, "casters": caster_metadata, "physics_context": context})
+                "evidence": report, "casters": caster_metadata, "physics_context": context,
+                "bev_flow": bev_component})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
         counts["windows_processed"] += 1
         print(f"windows={counts['windows_processed']} components={len(components)} tracks={len(tracks)} scene={left['scene_name']}", flush=True)
@@ -248,11 +276,12 @@ def main():
             physics_pair_ids=item["pair_ids"], physics_frame_tokens=item["frame_tokens"],
             physics_sample_tokens=item["sample_tokens"],
             physics_context=item["physics_context"],
+            bev_flow=item["bev_flow"],
             physics_evidence={**item["evidence"], "gate_reason": reason, "selected": association,
                               "shadow_decision": decision, "minimum_temporal_gain": config.minimum_temporal_gain,
                               "probability_calibrated": False, "is_shadow_gt": False},
             regions=[{"id": "observed_region", "mask": str(region_path), "mask_sha256": digest(region_path), "shadow_label": label,
-                      "label_source": "temporal_weak", "proposal_source": "ground_aligned_three_frame_dark_region"}])
+                      "label_source": "temporal_weak", "proposal_source": "bev_flow_receiver_component" if args.bev_flow_root else "ground_aligned_three_frame_dark_region"}])
         if accepted and association is None:
             counts["shadow_supported_owner_unresolved"] += 1
         if association is not None:
@@ -293,6 +322,7 @@ def main():
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
         "decision_policy": args.decision_policy,
+        "candidate_space": "physical_bev" if args.bev_flow_root else "middle_camera",
         "stage_counts": {"receiver_windows": counts["windows_processed"], "observed_components": len(candidates),
             "absolute_projection_fits": sum(any(h.get("shadow_fit_passes") for parent in item["hypotheses"]
                 for h in [parent, *parent.get("alternatives", [])]) for item in candidates),
@@ -315,7 +345,7 @@ def main():
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),
-        "coordinate_frame": "middle camera pixels; metric receiver points in world ground plane",
+        "coordinate_frame": "BEV caster matching; observed middle-camera trimaps" if args.bev_flow_root else "middle camera pixels; metric receiver points in world ground plane",
         "protocol": "factorized-receiver-shadow-v3" if args.decision_policy == "factorized-v3" else "three-frame-track-contrast-v2",
         "consensus": "same scene/split; leave all plausible caster tracks, camera frames AND physical samples out",
         "track_contrast": "same light; real time order versus hardest permutation and frozen-middle control",

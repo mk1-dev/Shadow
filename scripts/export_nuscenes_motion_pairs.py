@@ -243,17 +243,22 @@ def main():
                             width = max(64, int(round(width/8))*8)
                             image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
                             projection = scaled_projection(camera, (width, height))
-                            timed_states, object_corners, state_failures = {}, [], []
+                            timed_states, object_corners, state_failures, volumes = {}, [], [], []
                             for ann in anns:
                                 try:
                                     state = annotation_state(adapter, ann, camera.timestamp, args.max_gap_seconds)
                                     timed_states[ann["instance_token"]] = (ann, state)
                                     object_corners.append(state["corners"])
+                                    volumes.append({"instance_token": ann["instance_token"], "category": ann["category_name"],
+                                        "corners_world": state["corners"].tolist(), "source": "camera_time_interpolated_box"})
                                 except ValueError as exc:
                                     counts[str(exc)] += 1
                                     state_failures.append({"instance_token": ann["instance_token"], "reason": str(exc)})
                                     # Conservative fallback is for EXCLUSION only, never motion evidence.
-                                    object_corners.append(adapter.nusc.get_box(ann["token"]).corners().T)
+                                    fallback = adapter.nusc.get_box(ann["token"]).corners().T
+                                    object_corners.append(fallback)
+                                    volumes.append({"instance_token": ann["instance_token"], "category": ann["category_name"],
+                                        "corners_world": fallback.tolist(), "source": "annotation_time_exclusion_only"})
                             support, support_info = observed_ground(points, clean, projection, world_plane,
                                                                       image.shape[:2], object_corners,
                                                                       basis_world=basis_world,
@@ -267,6 +272,7 @@ def main():
                                            "source_image": str(camera.image_path.resolve()), "camera_timestamp": camera.timestamp,
                                            "sample_data_token": camera.token, "projection_world_to_image": projection.tolist(),
                                            "object_state_failures": state_failures,
+                                           "object_volumes_world": volumes,
                                            "image_size_wh": [width, height], "ground_evidence": support_info})
                             states.append(timed_states)
                         if frames[0]["image_size_wh"] != frames[1]["image_size_wh"]:
@@ -297,6 +303,7 @@ def main():
                                "sample_token": previous.token, "next_sample_token": following.token,
                                "dt_seconds": seconds, "frames": frames, "objects": motions,
                                "plane_basis_world": basis_world.tolist(), "plane_world": world_plane.tolist(),
+                               "anchor_ego_to_world": previous.ego_to_global.tolist(),
                                "ground_plane_fit": plane_info, "world_t_to_next": homography.tolist(),
                                "protocol": "physics-motion-evidence-v1", "shadow_label_source": "none",
                                "is_shadow_gt": False, "train_approved": False}
