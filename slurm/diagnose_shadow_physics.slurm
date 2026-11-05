@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J Shadow_physics_pilot
-#SBATCH -p debugpc
+# CPU-only physics audit: do not request a GPU.
+#SBATCH -p NV_RTX4090
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -12,7 +13,7 @@
 set -euo pipefail
 source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
 conda activate "${SHADOW_ENV:-shadow_occ}"
-cd "${SHADOW_ROOT:-/public/home/eng_zhihongli/project/Shadow}"
+cd "${SHADOW_ROOT:-/public/home/eng_zhihongli/project/Shadow_update}"
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1

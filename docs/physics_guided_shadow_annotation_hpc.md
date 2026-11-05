@@ -207,8 +207,8 @@ mkdir -p logs
 sbatch slurm/diagnose_shadow_physics.slurm
 ```
 
-The script defaults to `debugpc`, one process, four CPUs, 32G host memory and no
-GPU. Adjust the partition for the cluster; there is no GPU library override.
+The script defaults to `NV_RTX4090`, one process, four CPUs, 32G host memory and
+no GPU request. Adjust the partition for the cluster; there is no GPU library override.
 The run root contains the Slurm job ID and is not overwritten.
 
 Inspect Stage 1/2 images and failure rates before enabling Stage 3 weak export.
