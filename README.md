@@ -1,5 +1,30 @@
 # Shadow-OCC
 
+## Current Research Scope: Physics-Guided Shadow Annotation
+
+The active experiment is **3D-to-2D Physics-Guided Shadow Annotation**, without
+manual shadow labels. BEVFormer, OCC training and shadow-to-BEV fusion are
+deferred; their older code remains below for reference, not as the current run
+path. Existing 3D object GT supplies motion constraints, never shadow truth.
+
+Start with [the physics annotation workflow on HPC](docs/physics_guided_shadow_annotation_hpc.md):
+export camera-time-aligned object motion and locally supported ground, then
+measure dense optical flow, geometry compensation and exposure-corrected light
+changes. This path does **not** read Occ3D or existing shadow pseudo masks.
+Stage 1/2 exports diagnostic candidates. Stage 3 now joins consecutive pairs on
+the same receiver plane, tests three-frame light/caster hypotheses, rejects
+competing casters, and requires other-track/disjoint-frame light support.
+This is geometric BEV/ground registration, **not a BEV neural encoder**.
+
+The default remains audit-only. Explicit weak export produces positive/IGNORE
+trimaps for the existing segmenter and unified VLM data builders, including clean
+ground-aligned earlier/later VLM views. No GT-projected polygon becomes a target
+mask. Static dark regions remain unknown; no automatic negatives are fabricated.
+Independent negative supervision and scene-disjoint dev data are still required
+for training. No real shadow accuracy or OCC benefit is established by this code.
+
+## Existing Annotation And Legacy OCC Workflows
+
 The VLM is the **GT-constrained shadow annotator**. Its single annotation contains
 the shadow region decision and caster association, including a possible
 outside-BEV caster when supported. Segmentation and temporal light evidence

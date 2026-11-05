@@ -66,6 +66,11 @@ def main() -> None:
     inputs = [(row, Path(path).resolve().parent) for path in args.manifest for row in read_rows(path)]
     for original, base in inputs:
         row = dict(original)
+        if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
+            raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
+        if row.get("physics_protocol") and (row["physics_protocol"] != "three-frame-physics-weak-v1"
+                or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
+            raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
         if row.get("caster_id"):
             if row["caster_id"] not in casters:
                 raise ValueError(f"Unknown caster_id: {row['caster_id']}")
@@ -96,6 +101,11 @@ def main() -> None:
             raise FileNotFoundError(image_path)
         shape = image.shape[:2]
         target = make_target(row, shape, base)
+        if row.get("physics_protocol"):
+            if digest(resolve_path(row["shadow_mask"], base)) != row["physics_target_sha256"]:
+                raise ValueError("Physics trimap changed after weak-label export")
+            if np.any(target == 0):
+                raise ValueError("This physics protocol does not supply negative shadow labels")
         stem = hashlib.sha256(identifier.encode()).hexdigest()[:24]
         target_path = output / "targets" / f"{stem}.png"
         checked_write_image(target_path, target)
@@ -104,13 +114,38 @@ def main() -> None:
             "split": split, "image": str(image_path), "target": str(target_path),
             "label_source": row.get("label_source", "unlabeled"),
             "caster_source": row.get("caster_source", "none"),
+            "known_pixel_count": int(np.count_nonzero(target != 255)),
         }
         for key in ("sample_token", "camera", "group", "pair_id", "annotation_token", "instance_token", "caster_bbox_xyxy", "caster_category", "association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "ground_support", "ego_to_img", "ego_to_global", "timestamp", "temporal_status", "ground_z_ego"):
+            if key in row:
+                common[key] = row[key]
+        for key in ("physics_protocol", "physics_export_enabled", "physics_pair_ids", "physics_frame_tokens", "physics_evidence", "physics_target_sha256"):
             if key in row:
                 common[key] = row[key]
         if common.get("ground_support"):
             common["ground_support"] = str(resolve_path(common["ground_support"], base))
         temporal_image, temporal_overlap = None, None
+        physics_views = []
+        if row.get("physics_context"):
+            context = row["physics_context"]
+            if (context["scene_name"] != scene or context["camera"] != row.get("camera")
+                    or context["middle_timestamp"] != row.get("timestamp")
+                    or context["middle_image_sha256"] != digest(image_path)
+                    or context["alignment"] != "same_world_receiver_not_caster_translation"
+                    or [view["slot"] for view in context["views"]] != ["previous", "next"]
+                    or not context["views"][0]["timestamp"] < row["timestamp"] < context["views"][1]["timestamp"]):
+                raise ValueError(f"Physics context mismatch: {identifier}")
+            if row.get("temporal"):
+                raise ValueError("Do not mix ground and caster-aligned temporal views")
+            if not args.no_temporal_context:
+                for view in context["views"]:
+                    path = resolve_path(view["image"], base)
+                    if digest(path) != view["sha256"]:
+                        raise ValueError("Physics context image changed")
+                    aligned = cv2.imread(str(path))
+                    if aligned is None or aligned.shape[:2] != shape:
+                        raise ValueError("Physics context must use middle-frame coordinates")
+                    physics_views.append(aligned)
         if row.get("temporal"):
             temporal = dict(row["temporal"])
             for key, expected in (("previous_scene_name", scene), ("previous_instance_token", row.get("instance_token")), ("previous_camera", row.get("camera"))):
@@ -131,12 +166,21 @@ def main() -> None:
         segments[split].append(common)
         counts[f"{split}_known_pixels"] += int(np.count_nonzero(target != 255))
         for region in row.get("regions", []):
+            if row.get("physics_protocol") and digest(resolve_path(region["mask"], base)) != region["mask_sha256"]:
+                raise ValueError("Physics observed-region mask changed after export")
             mask = load_array(region["mask"], base) > 0
             if mask.shape != shape:
                 raise ValueError("Region masks must match the source image exactly")
             if not mask.any():
                 counts["empty_regions"] += 1
                 continue
+            if row.get("physics_protocol"):
+                selected = row["physics_evidence"].get("selected")
+                if region["shadow_label"] not in {"YES", "IGNORE"}:
+                    raise ValueError("Physics regions must be positive or IGNORE, never invented negatives")
+                if region["shadow_label"] == "YES" and (not selected or not selected.get("passes")
+                        or len(set(selected.get("independent_light_tracks", []))) < 2 or not np.all(target[mask] == 1)):
+                    raise ValueError("Positive physics region lacks the weak gate or matching observed trimap")
             yy, xx = np.where(mask)
             box = [xx.min(), yy.min(), xx.max()+1, yy.max()+1]
             tight = crop_bounds(box, shape, 1.6)
@@ -165,6 +209,12 @@ def main() -> None:
                 checked_write_image(previous_path, temporal_image[cy0:cy1, cx0:cx1])
                 paths.append(previous_path)
                 region_prompt += " Image 4 is the previous-frame context aligned using ego motion and the translation of the same tracked caster. Its coordinates match image 3. Compare only jointly visible ground; unmapped black pixels are not evidence. A stationary cast shadow can persist with almost no brightness difference. A moving caster can move its shadow. Continuity supports a decision but does not guarantee that a dark region is a shadow."
+            if physics_views:
+                for slot, aligned in zip(("previous_ground", "next_ground"), physics_views):
+                    path = output/"views"/f"{region_stem}_{slot}.png"
+                    checked_write_image(path, aligned[cy0:cy1, cx0:cx1])
+                    paths.append(path)
+                region_prompt += " Images 4 and 5 are the earlier and later contexts aligned to the same world ground as image 3, NOT to vehicle translation. Black unsupported pixels are unknown. Compare darkening and recovery of the receiver surface; never interpret a moving shadow boundary as material optical flow. These offline views may include a future frame."
             known = mask & (target != 255)
             known_fraction = float(known.sum() / mask.sum())
             positive_fraction = float(np.count_nonzero(target[known] == 1) / max(known.sum(), 1))
@@ -179,6 +229,7 @@ def main() -> None:
             else:
                 label = "IGNORE"
             item = {**common, "id": region_id, "parent_id": identifier, "task": "shadow", "region_id": region["id"], "region_mask": str(region_path), "context_crop_xyxy": context, "images": [str(path) for path in paths], "prompt": region_prompt, "temporal_context": has_context, "answer": label if label != "IGNORE" else None, "label_source": source, "known_fraction": known_fraction, "positive_fraction": positive_fraction}
+            item["physics_temporal_context"] = bool(physics_views)
             for key in ("association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "shadow_evidence", "proposal_source"):
                 if key in region:
                     item[key] = region[key]
@@ -194,9 +245,10 @@ def main() -> None:
             counts[f"{split}_caster"] += 1
     assert_disjoint(segments["train"], segments["dev"] + segments["eval"])
     for split in segments:
-        image_counts = Counter(row["image"] for row in segments[split])
+        # IGNORE-only proposals must not dilute the weight of supervised regions.
+        image_counts = Counter(row["image"] for row in segments[split] if row["known_pixel_count"] > 0)
         for row in segments[split]:
-            row["sample_weight"] = 1.0/image_counts[row["image"]]
+            row["sample_weight"] = 1.0/max(image_counts[row["image"]], 1)
         write_rows(output / f"seg_{split}.jsonl", segments[split])
         write_rows(output / f"vlm_{split}.jsonl", vlm[split])
     write_json(output / "dataset_protocol.json", {"input_sha256": {path: digest(path) for path in args.manifest}, "casters_sha256": digest(args.casters) if args.casters else None, "prompt_sha256": digest(args.prompt), "seed": args.seed, "dev_fraction": args.dev_fraction, "positive_fraction": args.positive_fraction, "negative_fraction": args.negative_fraction, "min_known_fraction": args.min_known_fraction, "no_temporal_context": args.no_temporal_context, "min_temporal_region_overlap": args.min_temporal_region_overlap, "excluded_scenes": sorted(excluded), "scenes": scene_splits, "counts": dict(counts)})
