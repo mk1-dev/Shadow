@@ -146,3 +146,9 @@ def test_default_preparation_has_no_legacy_shadow_label_dependency():
         assert required in preparation
     assert "export_caster_shadow_weak_data.py" not in preparation
     assert "SHADOW_LABEL_ROOT" not in preparation and "outputs_temporal" not in preparation
+
+
+def test_mature_bev_export_unwraps_last_frame_transforms():
+    module = script("export_mature_bev")
+    marker = object()
+    assert module._pick_last_tensor_like([[[marker]]]) is marker

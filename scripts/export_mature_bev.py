@@ -19,6 +19,19 @@ from shadow_occ.data.nuscenes_adapter import NuScenesAdapter
 from shadow_occ.utils.io import write_json
 
 
+def _pick_last_tensor_like(value):
+    """Pick the current frame from nested list wrappers used by the mature exporter."""
+    while isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return value
+        if isinstance(value[0], (list, tuple)):
+            return _pick_last_tensor_like(value[-1])
+        return _pick_last_tensor_like(value[-1])
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser("Frozen spatial BEV export using the mature OpenDriveVLA UniAD environment")
     parser.add_argument("--external-root", required=True)
@@ -93,6 +106,8 @@ def main():
         data["img"] = data["img"][0]
         exporter._normalize_sequence_inputs_for_export(data)
         exporter._normalize_seg_gt_shapes_for_export(data)
+        for key in ("l2g_t", "l2g_r_mat"):
+            data[key] = _pick_last_tensor_like(data.get(key))
         data = exporter.move_data_to_device(data, "cuda:0")
         with torch.no_grad():
             _, result = model(return_loss=False, rescale=True, **data)
