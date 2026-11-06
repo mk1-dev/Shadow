@@ -156,6 +156,7 @@ def main():
     parser.add_argument("--scene", action="append")
     parser.add_argument("--cams", nargs="+", default=["CAM_FRONT"])
     parser.add_argument("--max-pairs", type=int, default=20)
+    parser.add_argument("--max-pairs-per-scene", type=int, default=24)
     parser.add_argument("--max-attempts", type=int, default=200)
     parser.add_argument("--max-gap-seconds", type=float, default=0.75)
     parser.add_argument("--max-camera-lidar-offset", type=float, default=0.1)
@@ -164,7 +165,7 @@ def main():
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--output-root", required=True)
     args = parser.parse_args()
-    if (args.max_pairs < 1 or args.max_attempts < args.max_pairs or args.working_width < 64 or args.support_radius < 0
+    if (args.max_pairs < 1 or args.max_pairs_per_scene < 2 or args.max_attempts < args.max_pairs or args.working_width < 64 or args.support_radius < 0
             or not 0 < args.max_gap_seconds <= 0.75 or args.max_camera_lidar_offset <= 0):
         raise ValueError("Invalid pair, image, support or time limits")
     output = Path(args.output_root).resolve()
@@ -177,7 +178,7 @@ def main():
     scenes = set(args.scene) if args.scene else official
     if not scenes or not scenes <= official:
         raise ValueError("Select nonempty scenes from the requested official split")
-    counts, audit = Counter(), []
+    counts, audit, scene_counts = Counter(), [], Counter()
 
     @lru_cache(maxsize=3)
     def geometry(sample_token):
@@ -201,6 +202,8 @@ def main():
                 if next_sample["scene_token"] != record.scene_token:
                     raise ValueError("Sample link crosses scenes")
                 for name in args.cams:
+                    if scene_counts[record.scene_name] >= args.max_pairs_per_scene:
+                        break
                     if counts["pairs_attempted"] >= args.max_attempts:
                         return
                     pair_id = f"{record.token}_{next_sample['token']}_{name}"
@@ -309,6 +312,7 @@ def main():
                                "is_shadow_gt": False, "train_approved": False}
                         yield row
                         counts["pairs_written"] += 1
+                        scene_counts[record.scene_name] += 1
                         counts["object_tracks_with_motion"] += len(motions)
                         written += 1
                         progress.update(1)

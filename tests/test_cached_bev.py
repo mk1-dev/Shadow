@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, ground_grid
-from shadow_occ.annotation.cached_bev import attach_cached_bev, sample_cached_bev, spatial_bev, write_cached_bev
+from shadow_occ.annotation.cached_bev import attach_cached_bev, sample_cached_bev, select_bev_flow_receivers, spatial_bev, write_cached_bev
 from shadow_occ.annotation.physics_motion import plane_basis
 
 
@@ -42,3 +42,19 @@ def test_three_frame_features_are_aligned_at_world_receivers(tmp_path):
     assert arrays["learned_bev_receiver_features"].shape == (3, 4, 4, 2)
     np.testing.assert_allclose(arrays["learned_bev_temporal_cosine"], 1, atol=1e-6)
     assert meta["learned_bev"]["layout"] == "T,H,W,C"
+
+
+def test_learned_bev_changes_actual_candidate_selection():
+    full = np.ones((2, 2), bool)
+    arrays = {"learned_bev_temporal_cosine": np.ones((2, 2, 2), np.float32),
+        "learned_bev_valid": np.ones((3, 2, 2), bool), "shadow_candidate": full.copy(),
+        "shadow_flow_supported": full.copy(), "shadow_boundary_onset": full.copy(),
+        "shadow_boundary_recovery": full.copy(), "shadow_same_patch_cycle": full.copy()}
+    arrays["learned_bev_temporal_cosine"][0, 0, 0] = -0.2
+    arrays["shadow_flow_supported"][1, 1] = False
+    arrays, metadata = select_bev_flow_receivers(arrays, {"counts": {}}, 0.3)
+    assert arrays["shadow_candidate"].sum() == 2
+    assert not arrays["shadow_candidate"][0, 0]
+    assert not arrays["shadow_boundary_onset"][0, 0]
+    assert metadata["learned_bev_selection"]["feature_rejected_cells"] == 1
+    assert metadata["learned_bev_selection"]["flow_rejected_cells"] == 1

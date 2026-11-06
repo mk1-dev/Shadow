@@ -19,6 +19,7 @@ from shadow_occ.annotation.data import (
 )
 from shadow_occ.utils.io import write_json
 from shadow_occ.annotation.temporal import warp
+from shadow_occ.annotation.bev_teacher import PROTOCOL as BEV_TEACHER_PROTOCOL
 
 
 def crop_bounds(box, shape, scale):
@@ -80,7 +81,7 @@ def main() -> None:
         if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
             raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
         if row.get("physics_protocol") and (row["physics_protocol"] not in {
-                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3"}
+                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3", BEV_TEACHER_PROTOCOL}
                 or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
             raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
         if row.get("caster_id"):
@@ -116,7 +117,7 @@ def main() -> None:
         if row.get("physics_protocol"):
             if digest(resolve_path(row["shadow_mask"], base)) != row["physics_target_sha256"]:
                 raise ValueError("Physics trimap changed after weak-label export")
-            if np.any(target == 0):
+            if np.any(target == 0) and row["physics_protocol"] != BEV_TEACHER_PROTOCOL:
                 raise ValueError("This physics protocol does not supply negative shadow labels")
         stem = hashlib.sha256(identifier.encode()).hexdigest()[:24]
         target_path = output / "targets" / f"{stem}.png"
@@ -131,7 +132,7 @@ def main() -> None:
         for key in ("sample_token", "camera", "group", "pair_id", "annotation_token", "instance_token", "caster_bbox_xyxy", "caster_category", "association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "ground_support", "ego_to_img", "ego_to_global", "timestamp", "temporal_status", "ground_z_ego"):
             if key in row:
                 common[key] = row[key]
-        for key in ("physics_protocol", "physics_export_enabled", "physics_pair_ids", "physics_frame_tokens", "physics_sample_tokens", "physics_evidence", "physics_target_sha256"):
+        for key in ("physics_protocol", "physics_export_enabled", "physics_pair_ids", "physics_frame_tokens", "physics_sample_tokens", "physics_evidence", "physics_target_sha256", "bev_flow", "teacher_observation_ids"):
             if key in row:
                 common[key] = row[key]
         if common.get("ground_support"):
@@ -186,6 +187,9 @@ def main() -> None:
         segments[split].append(common)
         counts[f"{split}_known_pixels"] += int(np.count_nonzero(target != 255))
         for region in row.get("regions", []):
+            if row.get("require_three_frame_vlm") and not physics_views:
+                counts["vlm_boundary_regions_without_three_frames"] += 1
+                continue
             if row.get("physics_protocol") and digest(resolve_path(region["mask"], base)) != region["mask_sha256"]:
                 raise ValueError("Physics observed-region mask changed after export")
             mask = load_array(region["mask"], base) > 0
@@ -194,7 +198,14 @@ def main() -> None:
             if not mask.any():
                 counts["empty_regions"] += 1
                 continue
-            if row.get("physics_protocol"):
+            if row.get("physics_protocol") == BEV_TEACHER_PROTOCOL:
+                expected = 1 if region["shadow_label"] == "YES" else 0
+                kind = region.get("teacher_evidence", {}).get("kind")
+                if kind != ("selected_shadow" if expected else "observed_lit_endpoint") or not np.all(target[mask] == expected):
+                    raise ValueError("BEV teacher region and observed trimap disagree")
+                if not region.get("bev_flow", {}).get("selection"):
+                    raise ValueError("BEV teacher region lacks learned receiver selection")
+            elif row.get("physics_protocol"):
                 selected = row["physics_evidence"].get("selected")
                 if row["physics_protocol"] in {"three-frame-track-contrast-v2", "factorized-receiver-shadow-v3"}:
                     decision = row["physics_evidence"].get("shadow_decision", {})
@@ -264,7 +275,7 @@ def main() -> None:
             item = {**common, "id": region_id, "parent_id": identifier, "task": "shadow", "region_id": region["id"], "region_mask": str(region_path), "context_crop_xyxy": context, "images": [str(path) for path in paths], "prompt": region_prompt, "temporal_context": has_context, "answer": label if label != "IGNORE" else None, "label_source": source, "known_fraction": known_fraction, "positive_fraction": positive_fraction}
             item["physics_temporal_context"] = bool(physics_views)
             item["context_policy"] = args.context_policy
-            for key in ("association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "shadow_evidence", "proposal_source"):
+            for key in ("association_source", "association_status", "associated_annotation_token", "association_candidates", "association_evidence", "shadow_evidence", "proposal_source", "bev_flow", "teacher_evidence", "instance_token", "annotation_token", "caster_category", "caster_bbox_xyxy", "caster_source"):
                 if key in region:
                     item[key] = region[key]
             vlm[split].append(item)

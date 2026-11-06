@@ -94,3 +94,27 @@ def attach_cached_bev(arrays, metadata, root):
     metadata["learned_bev"] = {"sources": sources, "layout": "T,H,W,C",
         "alignment": "world receiver -> each sample LIDAR_TOP; no resize-only alignment"}
     return arrays, metadata
+
+
+def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3):
+    """Require a persistent learned receiver representation, not just dark appearance."""
+    cosine = np.asarray(arrays["learned_bev_temporal_cosine"])
+    feature_valid = arrays["learned_bev_valid"].all(axis=0) & np.isfinite(cosine).all(axis=0)
+    consistency = np.min(np.nan_to_num(cosine, nan=-1.0), axis=0)
+    learned = feature_valid & (consistency >= minimum_cosine)
+    original = arrays["shadow_candidate"].copy()
+    selected = original & learned & arrays["shadow_flow_supported"]
+    arrays["shadow_candidate_photometric"] = original
+    arrays["learned_bev_receiver_support"] = learned
+    arrays["learned_bev_receiver_consistency"] = consistency
+    arrays["shadow_candidate"] = selected
+    for key in ("shadow_boundary_onset", "shadow_boundary_recovery", "shadow_same_patch_cycle"):
+        arrays[key] &= selected
+    metadata["learned_bev_selection"] = {"minimum_cosine": minimum_cosine,
+        "rule": "photometric AND registered_flow AND three_frame_learned_receiver",
+        "photometric_candidate_cells": int(original.sum()), "selected_cells": int(selected.sum()),
+        "feature_rejected_cells": int((original & ~learned).sum()),
+        "flow_rejected_cells": int((original & ~arrays["shadow_flow_supported"]).sum())}
+    metadata["counts"]["photometric_candidates"] = int(original.sum())
+    metadata["counts"]["shadow_candidates"] = int(selected.sum())
+    return arrays, metadata

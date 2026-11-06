@@ -17,9 +17,10 @@ cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
-DATA="${SHADOW_ANNOTATION_DATA_ROOT:-outputs/shadow_annotation/joint}"
-ADAPTER="${SHADOW_VLM_ADAPTER:-${SHADOW_VLM_ROOT:-outputs/shadow_annotation/vlm_lora}/adapter}"
-OUT="${SHADOW_DIAG_ROOT:-outputs/shadow_annotation/diagnostics}"
+ROOT="${SHADOW_ANNOTATION_ROOT:-outputs/shadow_bev_flow}"
+DATA="${SHADOW_ANNOTATION_DATA_ROOT:-$ROOT/joint}"
+ADAPTER="${SHADOW_VLM_ADAPTER:-${SHADOW_VLM_ROOT:-$ROOT/vlm_lora}/adapter}"
+OUT="${SHADOW_DIAG_ROOT:-$ROOT/diagnostics}"
 SPLIT="${SHADOW_DIAG_SPLIT:-dev}"
 if [[ "$SPLIT" != "dev" && "$SPLIT" != "eval" ]]; then
   echo "SHADOW_DIAG_SPLIT must be dev or eval" >&2
@@ -31,7 +32,7 @@ python scripts/score_shadow_annotation_decisions.py \
   --output-root "$OUT/$SPLIT/scores"
 if [[ "$SPLIT" == "dev" ]]; then
   python scripts/analyze_shadow_decision_scores.py fit-dev \
-    --scores "$OUT/dev/scores/scores.jsonl" --max-fpr "${SHADOW_MAX_DEV_FPR:-0.1}" \
+    --scores "$OUT/dev/scores/scores.jsonl" --max-fpr "${SHADOW_MAX_DEV_FPR:-0}" \
     --output-root "$OUT/dev/analysis"
 else
   python scripts/analyze_shadow_decision_scores.py evaluate \

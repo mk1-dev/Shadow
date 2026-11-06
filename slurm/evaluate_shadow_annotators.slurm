@@ -18,15 +18,24 @@ export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-DATA_ROOT="${SHADOW_DATA_ROOT:-outputs/shadow_annotation/data}"
-ANNOTATION_DATA="${SHADOW_ANNOTATION_DATA_ROOT:-outputs/shadow_annotation/joint}"
-SEG_ROOT="${SHADOW_SEG_ROOT:-outputs/shadow_annotation/segmenter}"
-VLM_ROOT="${SHADOW_VLM_ROOT:-outputs/shadow_annotation/vlm_lora}"
-EVAL_ROOT="${SHADOW_EVAL_ROOT:-outputs/shadow_annotation/evaluation}"
+ROOT="${SHADOW_ANNOTATION_ROOT:-outputs/shadow_bev_flow}"
+DATA_ROOT="${SHADOW_DATA_ROOT:-$ROOT/data}"
+ANNOTATION_DATA="${SHADOW_ANNOTATION_DATA_ROOT:-$ROOT/joint}"
+SEG_ROOT="${SHADOW_SEG_ROOT:-$ROOT/segmenter}"
+VLM_ROOT="${SHADOW_VLM_ROOT:-$ROOT/vlm_lora}"
+EVAL_ROOT="${SHADOW_EVAL_ROOT:-$ROOT/evaluation}"
+TASK="${SHADOW_EVAL_TASK:-both}"
+if [[ "$TASK" != both && "$TASK" != segmenter && "$TASK" != vlm ]]; then
+  echo "SHADOW_EVAL_TASK must be segmenter, vlm or both" >&2
+  exit 1
+fi
 
+if [[ "$TASK" != vlm ]]; then
 python scripts/evaluate_shadow_segmenter.py \
   --manifest "$DATA_ROOT/seg_eval.jsonl" --checkpoint "$SEG_ROOT/best.pth" \
   --output-root "$EVAL_ROOT/segmentation"
+fi
+if [[ "$TASK" != segmenter ]]; then
 python scripts/evaluate_shadow_annotator.py \
   --model "${SHADOW_VLM_MODEL:?Set SHADOW_VLM_MODEL}" --load-in-4bit \
   --manifest "$ANNOTATION_DATA/annotation_eval.jsonl" --output-root "$EVAL_ROOT/base"
@@ -37,3 +46,4 @@ python scripts/compare_shadow_annotations.py \
   --base "$EVAL_ROOT/base/annotations.jsonl" \
   --tuned "$EVAL_ROOT/tuned/annotations.jsonl" \
   --output "$EVAL_ROOT/comparison.json"
+fi

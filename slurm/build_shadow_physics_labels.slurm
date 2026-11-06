@@ -36,13 +36,11 @@ python -u scripts/analyze_shadow_motion_pairs.py \
   --pairs "$ROOT/pairs/pairs.jsonl" --flow-backend dis --device cpu \
   --output-root "$ROOT/flow"
 
-BEV_ARGS=()
-if [[ -n "${BEV_FEATURE_ROOT:-}" ]]; then
-  BEV_ARGS+=(--feature-root "$BEV_FEATURE_ROOT")
-fi
+echo "Dense flow is ready. BEV_FEATURE_ROOT must contain mature spatial features for these samples."
+: "${BEV_FEATURE_ROOT:?Export mature BEV features before this BEV selection stage}"
 python -u scripts/analyze_bev_flow_discrepancy.py \
   --pairs "$ROOT/pairs/pairs.jsonl" --analysis-root "$ROOT/flow" \
-  --output-root "$ROOT/bev_flow" "${BEV_ARGS[@]}"
+  --feature-root "$BEV_FEATURE_ROOT" --output-root "$ROOT/bev_flow"
 
 # Audit-only on purpose. Explicit weak export is a separate post-review command.
 python -u scripts/build_physics_shadow_labels.py \

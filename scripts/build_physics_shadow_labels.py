@@ -42,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser("Joint 3D/2D weak-label gate; audit-only unless explicitly enabled.")
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--analysis-root", required=True)
-    parser.add_argument("--bev-flow-root", help="Use BEV components and metric caster matching instead of image components")
+    parser.add_argument("--bev-flow-root", help="BEV components after learned receiver and flow selection")
     parser.add_argument("--minimum-bev-area-m2", type=float, default=0.5)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--export-weak-labels", action="store_true", help="Opt in to experimental positive-only training labels, NOT verified GT")
@@ -202,6 +202,8 @@ def main():
                         for t in range(3)]).astype(np.float32)
                 np.savez_compressed(component_path, component_mask=rank_mask, **pooled)
                 bev_component = {"window_id": bev_ref["id"], "evidence": str(evidence_path),
+                    "grid": bev_ref["grid"],
+                    "selection": bev_ref.get("learned_bev_selection"),
                     "evidence_sha256": bev_ref["evidence_sha256"], "component": str(component_path),
                     "component_sha256": digest(component_path), "area_m2": float(rank_mask.sum()*grid.resolution**2),
                     "coordinate_frame": "fixed anchor ego x/y; rows=y, columns=x",

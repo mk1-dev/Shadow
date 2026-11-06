@@ -5,7 +5,42 @@
 This is a proposed weak-supervision method, not a demonstrated improvement.
 No manual nuScenes shadow masks, no Occ3D, no OCC training, no new flow network.
 Keep both the pixel segmenter and the unified VLM annotator. Existing HPC jobs
-and outputs are not updated in place; rebuild into a fresh v2 output root.
+and outputs are not updated in place; rebuild into a fresh BEV-flow output root.
+
+## Current Default Route
+
+Use `bash scripts/submit_bev_flow_pipeline.sh` with the variables listed in the
+README's Default HPC Pipeline. `prepare_shadow_annotation.slurm` now performs
+raw pair export, DIS flow, mature BEV export, learned receiver selection,
+caster/light matching, teacher-label export and both training-data builders.
+It does not invoke the old caster-plus-shadow-label exporter.
+
+The learned BEV features now affect selection: each receiver must be valid in
+three cached features and its minimum adjacent-frame cosine must reach 0.3.
+Registration support must also pass. All intermediate rejection counts are
+recorded. This is a configurable receiver-consistency test, not a newly trained
+BEV shadow head.
+
+`build_bev_flow_annotation_manifest.py` converts accepted regions to the new
+`bev-flow-annotation-v1` training protocol. An observed onset can supply a weak
+lit label at the previous receiver; recovery can supply one at the following
+receiver. The endpoint must be locally lit (L/background >= 0.97), pass BEV/flow
+support, and be outside the union of tracked box shadows under all plausible
+light hypotheses. Endpoints use their original camera images and their own
+projections, not warped images assigned as a different class. Other pixels are
+unlabeled. Same-frame observations are merged with conflicts set to IGNORE.
+
+Both VLM classes use clean/reference/context plus two ground-registered temporal
+views. Endpoint boundary frames lacking a complete three-frame neighbourhood
+are used by segmentation only, avoiding a YES/NO cue from input image count.
+The segmenter retains BCE/Dice and receiver ordering; the VLM retains component
+decision/association/format loss. Neither is used as the other's teacher.
+
+The complete prepare job requires one GPU for the frozen encoder and switches
+between the mature UniAD environment and the annotation environment. Separate
+training jobs depend on that data job. Segmentation failure does not prevent
+independent VLM evaluation. Dev score calibration defaults to a zero-observed-FP
+budget, and its frozen policy is applied to official-val evaluation data.
 
 ## BEV-Flow Redesign
 
@@ -43,8 +78,8 @@ dependency for this implementation.
    brightness onset/recovery, static dark regions and flow registration support.
 5. Transform each common world point into each cached BEV's LIDAR_TOP frame
    before sampling features. Save three-frame receiver features and temporal
-   cosine similarity. Feature variation is recorded, not used as a replacement
-   for the measured lighting transitions.
+   cosine similarity. Validity and temporal similarity now participate in
+   candidate selection alongside flow and measured lighting transitions.
 6. Extract components in metric BEV. Match all three caster-box shadow
    footprints under the same light in that BEV. Keep the existing real-time
    versus frozen/permuted trajectory comparisons and factorized decisions.
@@ -107,8 +142,8 @@ The export stage needs one GPU; optical-flow DIS, physical BEV construction,
 feature-cache sampling and label matching run on CPU. A Slurm version of the
 second block is `slurm/export_mature_shadow_bev.slurm`, configured through
 `PHYSICS_ROOT`, `UNIAD_ROOT`, `UNIAD_CHECKPOINT`, `UNIAD_ANN_FILE` and
-`UNIAD_CONDA_ENV`. `slurm/build_shadow_physics_labels.slurm` prepares a fresh
-CPU-only physical-BEV audit without requiring the feature cache first.
+`UNIAD_CONDA_ENV`. The CPU diagnostic wrapper requires `BEV_FEATURE_ROOT`;
+the complete default preparation job exports its own cache first.
 
 Existing full-results caches can instead be converted using
 `scripts/import_uniad_bev_cache.py --external-root ... --cache-root ... --output-root ... --pairs ...
@@ -126,15 +161,18 @@ Existing full-results caches can instead be converted using
 - `labels_audit/decisions.jsonl`: light/caster matches, motion controls and links
   to the corresponding BEV evidence; image masks remain in camera coordinates.
 
-For the image-space ablation, run the same label command without
-`--bev-flow-root` and choose another output directory. For the physical-BEV-only
-ablation, omit `--feature-root` from the BEV analyzer. These retain the same
-frames, tracks and flow. Review labels before using the existing explicit
-`--export-weak-labels` option and the segmentation/joint-annotator builders.
+For a receiver-similarity ablation, run the analyzer with
+`--minimum-bev-cosine -1` in another output directory, keeping identical cached
+features, tracks and flow. The default preparation route always supplies the
+BEV cache and exports training labels; the single-split commands above remain
+useful for inspecting a stage in isolation.
 OCC experiments and injecting shadow features into the mature model are the
 next stage; this update covers BEV-based observation and annotation.
 
 ## Recovery Update: 2026-11-06
+
+The sections below document earlier protocols and experiment history; they are
+not the current default data-preparation route.
 
 The reported fresh run completed execution but failed quality checks: segmenter
 TP=FP=0 in all ten epochs, VLM positives 116/5741, and zero accepted physical

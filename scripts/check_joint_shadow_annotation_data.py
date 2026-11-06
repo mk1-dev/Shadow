@@ -15,6 +15,7 @@ from shadow_occ.utils.io import write_json
 def main():
     parser = argparse.ArgumentParser("Check the single GT-constrained VLM annotation task on HPC.")
     parser.add_argument("--data-root", required=True)
+    parser.add_argument("--require-both-classes", action="store_true", help="Require YES and NO in every training/evaluation split")
     args = parser.parse_args()
     root = Path(args.data_root)
     datasets, report = {}, {}
@@ -47,6 +48,9 @@ def main():
             counts["association_status:"+row.get("association_status", "unspecified")] += 1
             counts["input_regime:"+row.get("input_regime", "unspecified")] += 1
         report[split] = {"rows": len(rows), "scenes": len({row['scene_name'] for row in rows}), "counts": dict(counts)}
+        if args.require_both_classes and (not counts["shadow:YES"] or not counts["shadow:NO"]):
+            write_json(root/"data_check.json", report)
+            raise ValueError(f"New BEV-flow data needs YES and NO in {split}; inspect teacher/protocol.json")
     assert_disjoint(datasets["train"], datasets["dev"]+datasets["eval"])
     if {row["scene_name"] for row in datasets["dev"]} & {row["scene_name"] for row in datasets["eval"]}:
         raise ValueError("Dev and eval scenes overlap")

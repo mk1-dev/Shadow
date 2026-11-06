@@ -14,7 +14,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, build_bev_flow
-from shadow_occ.annotation.cached_bev import attach_cached_bev
+from shadow_occ.annotation.cached_bev import attach_cached_bev, select_bev_flow_receivers
 from shadow_occ.annotation.data import checked_write_image, digest, load_array, resolve_path, write_rows
 from shadow_occ.annotation.physics_io import check_pair_files, load_motion_analysis, read_evidence
 from shadow_occ.annotation.physics_labels import validate_window
@@ -48,12 +48,15 @@ def main():
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--analysis-root", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--feature-root", help="Spatial cache from import_uniad_bev_cache.py")
+    parser.add_argument("--feature-root", required=True, help="Frozen spatial UniAD/OpenDriveVLA BEV cache")
+    parser.add_argument("--minimum-bev-cosine", type=float, default=0.3)
     parser.add_argument("--extent-m", type=float, default=40)
     parser.add_argument("--resolution-m", type=float, default=0.5)
     parser.add_argument("--light-threshold", type=float, default=6)
     parser.add_argument("--review-limit", type=int, default=20)
     args = parser.parse_args()
+    if not -1 <= args.minimum_bev_cosine <= 1:
+        raise ValueError("BEV cosine threshold must be in [-1,1]")
     config = BEVFlowConfig(extent_m=args.extent_m, resolution_m=args.resolution_m, light_threshold_L=args.light_threshold)
     config.grid()
     output = Path(args.output_root).resolve()
@@ -89,8 +92,8 @@ def main():
         grounds = [load_array(frame["ground_support"], base) > 0 for frame in frames]
         arrays, metadata = build_bev_flow(left, right, images, grounds, first, second,
                                          [ma["exposure"], mb["exposure"]], config)
-        if args.feature_root:
-            arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
+        arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
+        arrays, metadata = select_bev_flow_receivers(arrays, metadata, args.minimum_bev_cosine)
         stem = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
         path = output/"windows"/f"{stem}.npz"
         path.parent.mkdir(parents=True, exist_ok=True)

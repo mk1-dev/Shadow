@@ -146,8 +146,10 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
     sigma = config.background_sigma_m/grid.resolution
     support = receiver.astype(np.float32)
     density = cv2.GaussianBlur(support, (0, 0), sigma)
-    mean = cv2.GaussianBlur(appearance[1]*support, (0, 0), sigma)/np.maximum(density, 1e-6)
-    dark = receiver & (density > 1e-6) & (appearance[1] < config.darkness_ratio*np.maximum(mean, 1))
+    means = np.stack([cv2.GaussianBlur(value*support, (0, 0), sigma)/np.maximum(density, 1e-6)
+                      for value in appearance])
+    local_ratio = appearance/np.maximum(means, 1)
+    dark = receiver & (density > 1e-6) & (local_ratio[1] < config.darkness_ratio)
     chroma = np.stack([np.linalg.norm(labs[i+1][..., 1:]-labs[i][..., 1:], axis=-1) for i in range(2)])
     color = (np.exp(-chroma/config.chroma_scale) >= 0.5).all(axis=0)
     usable = receiver & color & comparable
@@ -179,6 +181,7 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "physical_box_bottom_z_anchor": np.stack(low), "physical_box_top_z_anchor": np.stack(high),
         "receiver_valid": receiver, "appearance_L_raw": raw_L,
         "appearance_L_compensated": appearance, "temporal_illumination_change_L": delta,
+        "appearance_local_ratio": np.where(receiver[None], local_ratio, np.nan),
         "expected_geometric_flow_px": np.stack(expected), "observed_optical_flow_px": np.stack(observed),
         "flow_residual_px": np.stack(residual), "flow_reliability": np.stack(reliability),
         "explanation_state": state, "illumination_event": changed,
@@ -215,6 +218,14 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         arrays[key] = np.where(receiver[None, ..., None], arrays[key], np.nan)
     arrays["flow_residual_px"] = np.where(receiver[None], arrays["flow_residual_px"], np.nan)
     return arrays, metadata
+
+
+def image_mask_to_bev(mask, projection, world):
+    uv, _, valid = project_world(world.reshape(-1, 3), projection)
+    height, width = mask.shape
+    valid &= (uv[:, 0] >= 0) & (uv[:, 0] < width) & (uv[:, 1] >= 0) & (uv[:, 1] < height)
+    coordinates = np.where(valid[:, None], uv, -1).reshape(*world.shape[:2], 2).astype(np.float32)
+    return (sample_at(mask.astype(np.uint8), coordinates, nearest=True) > 0) & valid.reshape(world.shape[:2])
 
 
 def bev_mask_to_image(mask, projection, basis_world, grid, image_shape):

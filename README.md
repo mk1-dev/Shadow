@@ -26,39 +26,60 @@ Use `scripts/export_mature_bev.py` in the existing OpenDriveVLA environment;
 Shadow does not copy or retrain that encoder. The CPU join and label builder run
 in the annotation environment. See [BEV redesign and HPC commands](docs/shadow_track_contrast_v2.md#bev-flow-redesign).
 
-Start with [the physics annotation workflow on HPC](docs/physics_guided_shadow_annotation_hpc.md):
-export camera-time-aligned object motion and locally supported ground, then
-measure dense optical flow, geometry compensation and exposure-corrected light
-changes. This path does **not** read Occ3D or existing shadow pseudo masks.
-Stage 1/2 exports diagnostic candidates. Stage 3 now joins consecutive pairs on
-the same receiver plane. The v2 gate compares real tracks against frozen and
-wrong-time explanations under the SAME light, requires other-track support
-outside both camera frames and physical samples, and separates shadow existence
-from caster ownership. Ambiguous ownership can remain unresolved without
-discarding supported observed shadow pixels.
-The physical grid and the cached learned BEV are kept in their own coordinates
-until aligned through world points; the learned model uses a LIDAR_TOP grid.
+## Default HPC Pipeline
 
-Optical flow validates local textured receiver registration; it is NOT treated
-as shadow-boundary velocity. Default VLM context crops depend on proposals, not
-GT caster boxes (`--context-policy gt-assisted` is an explicit ablation).
-See [the v2 method, related work and validation gates](docs/shadow_track_contrast_v2.md).
+`slurm/prepare_shadow_annotation.slurm` now builds everything from raw nuScenes;
+it does not read `outputs_temporal`, `shadow_labels`, old segmenters or adapters.
+Frozen BEV temporal cosine (default >= 0.3) AND registered receiver flow actually
+filter the photometric candidates before caster/light matching.
 
-The 2026-11-06 recovery update adds balanced pixel risk, foreground-collapse
-checkpoint rejection, macro decision-NLL VLM checkpoint selection, corrected
-component reliability weights, and an explicit factorized-v3 physics audit.
-An optional receiver-transition ordering loss does not invent lit endpoint
-negatives. Read the recovery section in the same document before new HPC jobs;
-old collapsed checkpoints and unvalidated VLM adapters must not clean labels.
+The new `bev-flow-annotation-v1` teacher exports positive observed shadows and
+weak negative endpoints only where that receiver visibly brightens/darkens,
+looks locally lit at the endpoint, and lies outside competing tracked shadow
+footprints. Other pixels remain IGNORE. Labels from the same physical frame are
+merged; contradictory pixels are ignored. Both classes use original camera
+images. VLM examples have the same five-view layout for both classes; boundary
+frames without two adjacent observations contribute only to segmentation.
 
-The default remains audit-only. Explicit weak export produces positive/IGNORE
-trimaps for the existing segmenter and unified VLM data builders, including clean
-ground-aligned earlier/later VLM views. No GT-projected polygon becomes a target
-mask. Static dark regions remain unknown; no automatic negatives are fabricated.
-Independent negative supervision and scene-disjoint dev data are still required
-for training. No real shadow accuracy or OCC benefit is established by this code.
+Set actual HPC paths and use the existing working mature-model environment:
 
-## Existing Annotation And Legacy OCC Workflows
+```bash
+cd /public/home/eng_zhihongli/project/Shadow_update
+export SHADOW_PROJECT_ROOT="$PWD"
+export SHADOW_CONDA_ENV=shadow_annotator
+export UNIAD_ROOT=/path/to/OpenDriveVLAre
+export UNIAD_CONDA_ENV=your_existing_uniad_env
+export UNIAD_CHECKPOINT=/path/to/uniad_base_track_map.pth
+export UNIAD_TRAIN_ANN_FILE=/path/to/nuscenes_infos_temporal_train.pkl
+export UNIAD_VAL_ANN_FILE=/path/to/nuscenes_infos_temporal_val.pkl
+export SHADOW_VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct
+bash scripts/submit_bev_flow_pipeline.sh
+```
+
+Submission order:
+
+```text
+prepare raw geometry / flow / mature BEV / teacher / datasets [1 GPU]
+  -> segmenter training [2 GPUs] -> segmenter eval [1 GPU]
+  -> unified VLM training [1 GPU] -> dev calibration -> frozen eval [1 GPU each]
+                                 -> full annotation generation eval [1 GPU]
+```
+
+Training branches share data but neither model supplies the other's training
+targets. Each run gets a new `outputs/shadow_bev_flow_<timestamp>` root. The
+prepare job runs the new regression tests on HPC, then processes train and val
+separately; train scenes are further divided into train/dev by the data builder.
+Defaults are a pilot of 1200 pairs per official split, at most 24 per scene,
+using front/front-left/front-right cameras. Set `SHADOW_PAIRS_PER_SPLIT`,
+`SHADOW_PAIRS_PER_SCENE`, `SHADOW_PAIR_ATTEMPTS` and `SHADOW_CAMERAS` to expand it.
+
+Inspect `<root>/<train|val>/bev_flow/summary.json`, `labels/summary.json` and
+`teacher/protocol.json` first. These report actual candidate survival, accepted
+shadows, lit endpoints and conflict counts. `data/data_check.json` and
+`joint/data_check.json` report the data that training will actually consume.
+OCC is not part of this run.
+
+## Archived Annotation And OCC Workflows
 
 The VLM is the **GT-constrained shadow annotator**. Its single annotation contains
 the shadow region decision and caster association, including a possible

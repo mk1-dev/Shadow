@@ -52,9 +52,12 @@ def main():
     pairs = read_rows(pairs_path)
     needed = {p[key] for p in pairs for key in ("sample_token", "next_sample_token")}
     scenes = {adapter.nusc.get("sample", token)["scene_token"] for token in needed}
+    latest_needed = {scene: max(adapter.nusc.get("sample", token)["timestamp"] for token in needed
+        if adapter.nusc.get("sample", token)["scene_token"] == scene) for scene in scenes}
     exporter.import_plugin_modules(cfg)
     dataset = exporter.custom_build_dataset(cfg.data.test)
-    indices = sorted((i for i, info in enumerate(dataset.data_infos) if info["scene_token"] in scenes),
+    indices = sorted((i for i, info in enumerate(dataset.data_infos) if info["scene_token"] in scenes
+                      and info["timestamp"] <= latest_needed[info["scene_token"]]),
                      key=lambda i: (dataset.data_infos[i]["scene_token"], dataset.data_infos[i]["timestamp"]))
     # Keep the original dataset indices for its map/trajectory lookups and replay whole scenes.
     for index in indices:

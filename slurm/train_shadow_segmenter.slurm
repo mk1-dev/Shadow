@@ -16,8 +16,9 @@ conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
-DATA_ROOT="${SHADOW_DATA_ROOT:-outputs/shadow_annotation/data}"
-OUTPUT_ROOT="${SHADOW_SEG_ROOT:-outputs/shadow_annotation/segmenter}"
+ROOT="${SHADOW_ANNOTATION_ROOT:-outputs/shadow_bev_flow}"
+DATA_ROOT="${SHADOW_DATA_ROOT:-$ROOT/data}"
+OUTPUT_ROOT="${SHADOW_SEG_ROOT:-$ROOT/segmenter}"
 INIT_ARGS=()
 if [[ -n "${SHADOW_SEG_INIT_CHECKPOINT:-}" ]]; then
   INIT_ARGS+=(--init-checkpoint "$SHADOW_SEG_INIT_CHECKPOINT")
@@ -31,6 +32,6 @@ torchrun --standalone --nproc_per_node=2 scripts/train_shadow_segmenter.py \
   --accumulation "${SHADOW_SEG_ACCUMULATION:-4}" --temporal-weight "${SHADOW_SEG_TEMPORAL_WEIGHT:-0.2}" \
   --pixel-balance "${SHADOW_SEG_PIXEL_BALANCE:-loss}" --max-pixel-weight "${SHADOW_SEG_MAX_PIXEL_WEIGHT:-50}" \
   --dice-weight "${SHADOW_SEG_DICE_WEIGHT:-0.5}" \
-  --receiver-pair-weight "${SHADOW_SEG_RECEIVER_PAIR_WEIGHT:-0}" \
+  --receiver-pair-weight "${SHADOW_SEG_RECEIVER_PAIR_WEIGHT:-0.1}" \
   --backbone-weights "${SHADOW_SEG_BACKBONE_WEIGHTS:-none}" \
   --seed 0 --allow-weak-labels "${INIT_ARGS[@]}"

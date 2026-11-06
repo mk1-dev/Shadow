@@ -46,7 +46,7 @@ def main():
                             raise FileNotFoundError(image_path)
                     if row["task"] == "shadow":
                         counts[str(row.get("answer"))] += 1
-                        expected = 4 if row.get("temporal_context") else 3
+                        expected = 5 if row.get("physics_temporal_context") else 4 if row.get("temporal_context") else 3
                         if len(row["images"]) != expected:
                             raise ValueError("Incorrect clean/reference/context/temporal image count")
                         counts["with_temporal_view" if row.get("temporal_context") else "without_temporal_view"] += 1
