@@ -276,7 +276,7 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             shadow_passes = (fit["cover"] >= config.minimum_cover
                 and min(fit["onset_fit"], fit["recovery_fit"]) >= config.minimum_edge_fit
                 and fit["score"] >= config.minimum_score
-                and fit["temporal_gain"] >= config.minimum_temporal_gain)
+                and fit["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain)
             ranked.append({"instance_token": track["instance_token"], "light_id": light_id,
                            **fit, "shadow_passes": bool(shadow_passes)})
             ranked[-1]["shadow_fit_passes"] = bool(shadow_fit_passes)
