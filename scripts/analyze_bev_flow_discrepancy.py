@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 from dataclasses import asdict
 import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -48,13 +49,20 @@ def main():
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--analysis-root", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--feature-root", required=True, help="Frozen spatial UniAD/OpenDriveVLA BEV cache")
+    parser.add_argument("--feature-root", help="Frozen spatial UniAD/OpenDriveVLA BEV cache")
+    parser.add_argument("--feature-gate", choices=["aligned", "none", "shuffled", "matched-random"], default="aligned")
+    parser.add_argument("--flow-gate", choices=["registered", "none"], default="registered",
+                        help="Remove final registration gate only; cached exposure estimation still uses DIS")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--minimum-bev-cosine", type=float, default=0.3)
     parser.add_argument("--extent-m", type=float, default=40)
     parser.add_argument("--resolution-m", type=float, default=0.5)
     parser.add_argument("--light-threshold", type=float, default=6)
     parser.add_argument("--review-limit", type=int, default=20)
+    parser.add_argument("--omit-receiver-features", action="store_true", help="Retain cosine/gates but do not duplicate sampled feature tensors")
     args = parser.parse_args()
+    if args.feature_gate != "none" and not args.feature_root:
+        parser.error("--feature-root is required unless --feature-gate none")
     if not -1 <= args.minimum_bev_cosine <= 1:
         raise ValueError("BEV cosine threshold must be in [-1,1]")
     config = BEVFlowConfig(extent_m=args.extent_m, resolution_m=args.resolution_m, light_threshold_L=args.light_threshold)
@@ -66,6 +74,7 @@ def main():
     cv2.setNumThreads(1)
     base, analysis = Path(args.pairs).resolve().parent, Path(args.analysis_root).resolve()
     pairs, stats, analysis_protocol = load_motion_analysis(args.pairs, analysis)
+    motion_protocol = json.loads(analysis_protocol.read_text(encoding="utf-8"))
     lookup = {(p["scene_name"], p["official_split"], p["camera"], p["sample_token"]): p for p in pairs}
     if len(lookup) != len(pairs):
         raise ValueError("Duplicate camera/sample pair")
@@ -92,9 +101,14 @@ def main():
         grounds = [load_array(frame["ground_support"], base) > 0 for frame in frames]
         arrays, metadata = build_bev_flow(left, right, images, grounds, first, second,
                                          [ma["exposure"], mb["exposure"]], config)
-        arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
-        arrays, metadata = select_bev_flow_receivers(arrays, metadata, args.minimum_bev_cosine)
         stem = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
+        if args.feature_gate != "none":
+            arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
+        window_seed = int(hashlib.sha256(f"{args.seed}:{stem}".encode()).hexdigest()[:16], 16)
+        arrays, metadata = select_bev_flow_receivers(arrays, metadata, args.minimum_bev_cosine,
+            feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=window_seed)
+        if args.omit_receiver_features:
+            arrays.pop("learned_bev_receiver_features", None)
         path = output/"windows"/f"{stem}.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **arrays)
@@ -113,6 +127,8 @@ def main():
         "feature_cache_protocol_sha256": digest(Path(args.feature_root)/"cache_protocol.json") if args.feature_root else None,
         "coordinates": "fixed first-sample ego x/y; common world receiver for all three frames",
         "learned_encoder": "cached UniAD/OpenDriveVLA BEVFormer" if args.feature_root else None,
+        "registration_mode": motion_protocol.get("registration_mode", "geometry-dis"),
+        "flow_ablation_scope": "final receiver gate; upstream registration/exposure source recorded separately",
         "flow_units": "source camera pixels per actual interval; never BEV metres or caster velocity"})
     summary = {"windows": len(windows), "invalid_windows": len(audit), "counts": dict(counts),
                "learned_bev_attached": bool(args.feature_root)}

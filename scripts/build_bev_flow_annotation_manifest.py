@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--minimum-pixels", type=int, default=32)
     parser.add_argument("--minimum-lit-ratio", type=float, default=0.97)
+    parser.add_argument("--negative-exclusion-root", help="Optional camera-image risk masks named <frame sample_data_token>.png")
     args = parser.parse_args()
     if args.minimum_pixels < 1 or not 0.8 <= args.minimum_lit_ratio <= 1.5:
         raise ValueError("Invalid region size or lit-endpoint ratio")
@@ -109,8 +110,21 @@ def main():
         middle = right["frames"][0]
         positive_bev = image_mask_to_bev(target == 1, middle["projection_world_to_image"], arrays["receiver_world_xyz"])
         tracks, _ = window_tracks(left, right)
+        endpoint_frames = {0: left["frames"][0], 2: right["frames"][1]}
+        exclusions = {}
+        if args.negative_exclusion_root:
+            for slot, frame in endpoint_frames.items():
+                path = Path(args.negative_exclusion_root)/f"{frame['sample_data_token']}.png"
+                if path.exists():
+                    exclusion = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                    if exclusion is None or exclusion.shape[::-1] != tuple(frame["image_size_wh"]):
+                        raise ValueError(f"Expected exported camera-image exclusion mask: {path}")
+                    exclusions[slot] = image_mask_to_bev(exclusion > 0, frame["projection_world_to_image"],
+                        arrays["receiver_world_xyz"])
         masks, details = endpoint_negative_masks(arrays, positive_bev, tracks, left["plane_world"], light_bank(),
-            decision["shadow_decision"]["plausible_hypotheses"], minimum_lit_ratio=args.minimum_lit_ratio)
+            decision["shadow_decision"]["plausible_hypotheses"], minimum_lit_ratio=args.minimum_lit_ratio,
+            frame_volumes={slot: frame.get("object_volumes_world", []) for slot, frame in endpoint_frames.items()},
+            exclusion_masks=exclusions)
         row = {**row, "physics_protocol": PROTOCOL}
         row["regions"] = [{**region, "id": f"{row['id']}:{region['id']}", "bev_flow": evidence, "teacher_evidence": {"kind": "selected_shadow",
             "parent_id": row["id"]}, **{key: row[key] for key in CASTER_FIELDS if key in row}} for region in row["regions"]]
@@ -187,6 +201,7 @@ def main():
     write_json(output/"protocol.json", {**vars(args), "protocol": PROTOCOL, "counts": dict(counts),
         "pair_manifest_sha256": digest(args.pairs), "decisions_sha256": digest(labels_root/"decisions.jsonl"),
         "negative_source": "same receiver observed brighter at an endpoint and outside competing projected shadows",
+        "negative_exclusion_scope": "all annotated endpoint volumes plus optional static-risk masks; not exhaustive unannotated casters",
         "unknown_policy": "all other pixels ignored", "image_policy": "original camera images for BOTH classes"})
     print(dict(counts), flush=True)
     if not canonical or not counts["known_shadow_pixels"] or not counts["known_lit_pixels"]:

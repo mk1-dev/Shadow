@@ -27,7 +27,7 @@ def diagnostic_panel(image_t, image_next, row, evidence):
     delta = np.clip((evidence["delta_L"]+20)*255/40, 0, 255).astype(np.uint8)
     delta = cv2.applyColorMap(delta, cv2.COLORMAP_JET)
     delta[~evidence["visible_ground"]] = 0
-    residual = cv2.applyColorMap(np.clip(evidence["flow_residual_px"]*255/10, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    residual = cv2.applyColorMap(np.clip(np.nan_to_num(evidence["flow_residual_px"])*255/10, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
     residual[~evidence["visible_ground"]] = 0
     candidates = np.zeros_like(image_t)
     candidates[evidence["onset_candidate"]] = (255, 100, 0)
@@ -73,7 +73,7 @@ def main():
     parser = argparse.ArgumentParser("Measure Stage 1/2 evidence; never export accepted shadow labels.")
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--flow-backend", choices=["dis", "raft-small"], default="dis")
+    parser.add_argument("--flow-backend", choices=["dis", "raft-small", "none"], default="dis")
     parser.add_argument("--flow-weights")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--min-background", type=int, default=128)
@@ -96,7 +96,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     cv2.setNumThreads(1)
     cv2.setRNGSeed(0)
-    engine = DenseFlow(args.flow_backend, weights=args.flow_weights, device=args.device)
+    engine = DenseFlow(args.flow_backend, weights=args.flow_weights, device=args.device) if args.flow_backend != "none" else None
     base = Path(args.pairs).resolve().parent
     rows = read_rows(args.pairs)
     if not rows or len({row["id"] for row in rows}) != len(rows):
@@ -115,10 +115,14 @@ def main():
                 raise FileNotFoundError(image_path)
             images.append(image)
             grounds.append(load_array(str(ground_path), base) > 0)
-        forward, backward = engine(images[0], images[1]), engine(images[1], images[0])
+        if engine is None:
+            forward = np.full((*images[0].shape[:2], 2), np.nan, np.float32)
+            backward = forward.copy()
+        else:
+            forward, backward = engine(images[0], images[1]), engine(images[1], images[0])
         evidence = pair_evidence(*images, *grounds,
             row["frames"][0]["projection_world_to_image"], row["frames"][1]["projection_world_to_image"],
-            np.asarray(row["plane_basis_world"], np.float64), forward, backward, config)
+            np.asarray(row["plane_basis_world"], np.float64), forward, backward, config, use_observed_flow=engine is not None)
         stem = row["id"]
         arrays = {key: value.astype(np.uint8) if value.dtype == bool else value.astype(np.float32)
                   for key, value in evidence.items() if isinstance(value, np.ndarray)}
@@ -164,7 +168,9 @@ def main():
                "flow_weights_sha256": digest(args.flow_weights) if args.flow_weights else None,
                "protocol": "physics-motion-evidence-v1", "coordinate_frame": "all evidence arrays use image t pixels",
                "flow_evidence_version": "receiver-support-v2",
-               "flow_role": "local textured receiver registration; boundary flow is not shadow/material ground truth",
+               "registration_mode": "geometry-only" if engine is None else "geometry-dis",
+               "flow_role": "absent; geometry-only alignment and exposure" if engine is None else
+                   "local textured receiver registration; boundary flow is not shadow/material ground truth",
                "delta_definition": "exposure_compensated_L_next_at_same_ground_minus_L_t",
                "exposure_assumption": "majority stable lighting among flow-consistent sparse supported ground",
                "not_implemented": ["causal_three_frame_recovery", "light_direction_estimation", "caster_shadow_association",

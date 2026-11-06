@@ -20,7 +20,7 @@ from shadow_occ.annotation.physics_io import load_motion_analysis, check_pair_fi
 from shadow_occ.geometry.bev import BEVGrid
 from shadow_occ.annotation.physics_labels import (
     LabelConfig, footprint_mask, light_bank, light_support_index, middle_evidence, rank_hypotheses, receiver_points,
-    select_shadow_and_caster, factorized_shadow_decision, window_tracks,
+    select_shadow_and_caster, factorized_shadow_decision, window_tracks, fuse_shadow_support,
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.utils.io import write_json
@@ -52,10 +52,21 @@ def main():
     parser.add_argument("--minimum-temporal-gain", type=float, default=0.1,
                         help="Real trajectory minus hardest frozen/wrong-time score; zero is an ablation")
     parser.add_argument("--decision-policy", choices=["strict-v2", "factorized-v3"], default="strict-v2")
+    parser.add_argument("--light-search", choices=["bank", "fixed"], default="bank")
+    parser.add_argument("--fixed-light-id", type=int, default=0, help="Predeclared light ID, never chosen on eval")
+    parser.add_argument("--trajectory-contrast", choices=["on", "off"], default="on")
+    parser.add_argument("--independent-light", choices=["on", "off"], default="on")
+    parser.add_argument("--positive-fusion", choices=["best", "intersection", "consensus"], default="intersection")
+    parser.add_argument("--consensus-fraction", type=float, default=2/3)
     args = parser.parse_args()
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
-    config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain)
+    if not 0 <= args.fixed_light_id < len(light_bank()) or not 0 < args.consensus_fraction <= 1:
+        parser.error("Invalid fixed light ID or consensus fraction")
+    config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain,
+        require_temporal_contrast=args.trajectory_contrast == "on",
+        require_independent_light=args.independent_light == "on",
+        light_ids=(args.fixed_light_id,) if args.light_search == "fixed" else None)
     config.validate()
     output = Path(args.output_root).resolve()
     if output.exists() and any(output.iterdir()):
@@ -133,6 +144,8 @@ def main():
                 "onset": bev_arrays["shadow_boundary_onset"], "recovery": bev_arrays["shadow_boundary_recovery"],
                 "flow_supported": bev_arrays["shadow_flow_supported"],
                 "same_patch_cycle": bev_arrays["shadow_same_patch_cycle"]}
+            if bev_ref.get("learned_bev_selection", {}).get("flow_gate") is False:
+                maps["flow_supported"] = maps["visible"].copy()
             rank_config = replace(config, minimum_area=max(1, int(np.ceil(args.minimum_bev_area_m2/grid.resolution**2))),
                                   minimum_change_pixels=1)
         # Never bridge gaps across unsupported receivers by dilation or closing.
@@ -242,12 +255,11 @@ def main():
             tracks, _ = window_tracks(left, right)
             track_map = {track["instance_token"]: track for track in tracks}
             projection = np.asarray(right["frames"][0]["projection_world_to_image"])
-            positive = mask.copy()
-            # Keep only observed pixels supported by ALL near-best explanations.
-            for explanation in decision["plausible_hypotheses"]:
-                track = track_map[explanation["instance_token"]]
-                positive &= footprint_mask(track["points"][1, 1:], left["plane_world"],
-                    directions[explanation["light_id"]], projection, mask.shape)
+            explanations = ([selection] if args.positive_fusion == "best" else decision["plausible_hypotheses"])
+            footprints = (footprint_mask(track_map[explanation["instance_token"]]["points"][1, 1:],
+                left["plane_world"], directions[explanation["light_id"]], projection, mask.shape)
+                for explanation in explanations)
+            positive = fuse_shadow_support(mask, footprints, args.positive_fusion, args.consensus_fraction)
             if positive.sum() < config.minimum_area:
                 selection, association, reason = None, None, "insufficient_supported_positive_area"
                 decision = {**decision, "shadow_accepted": False, "selected": None,
@@ -281,6 +293,9 @@ def main():
             bev_flow=item["bev_flow"],
             physics_evidence={**item["evidence"], "gate_reason": reason, "selected": association,
                               "shadow_decision": decision, "minimum_temporal_gain": config.minimum_temporal_gain,
+                              "trajectory_contrast_enabled": config.require_temporal_contrast,
+                              "independent_light_enabled": config.require_independent_light,
+                              "positive_fusion": args.positive_fusion,
                               "probability_calibrated": False, "is_shadow_gt": False},
             regions=[{"id": "observed_region", "mask": str(region_path), "mask_sha256": digest(region_path), "shadow_label": label,
                       "label_source": "temporal_weak", "proposal_source": "bev_flow_receiver_component" if args.bev_flow_root else "ground_aligned_three_frame_dark_region"}])
@@ -324,12 +339,17 @@ def main():
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
         "decision_policy": args.decision_policy,
+        "ablation": {key: getattr(args, key) for key in ("light_search", "fixed_light_id", "trajectory_contrast",
+            "independent_light", "positive_fusion", "consensus_fraction")},
         "candidate_space": "physical_bev" if args.bev_flow_root else "middle_camera",
         "stage_counts": {"receiver_windows": counts["windows_processed"], "observed_components": len(candidates),
             "absolute_projection_fits": sum(any(h.get("shadow_fit_passes") for parent in item["hypotheses"]
                 for h in [parent, *parent.get("alternatives", [])]) for item in candidates),
-            "contrast_fits": sum(any(h.get("shadow_passes") for h in item["hypotheses"]) for item in candidates),
+            "contrast_fits": sum(any(h.get("shadow_passes") and h["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain
+                for h in item["hypotheses"]) for item in candidates),
+            "configured_trajectory_gate_fits": sum(any(h.get("shadow_passes") for h in item["hypotheses"]) for item in candidates),
             "accepted_shadow": counts["weak_gate_passed"],
+            "accepted_fraction_of_observed_components": counts["weak_gate_passed"]/max(len(candidates), 1),
             "unique_weak_association": sum(item["shadow_decision"]["association"] is not None for item in decisions)},
         "scenes": len({item["scene_name"] for item in candidates}),
         "weak_gate_pass_fraction": counts["weak_gate_passed"]/len(candidates) if candidates else None,

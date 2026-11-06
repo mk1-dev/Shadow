@@ -269,7 +269,7 @@ def receiver_flow_evidence(lightness, visible, forward, geometric_flow, flow_rel
 
 
 def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
-                  projection_next, basis_world, forward, backward, config=None):
+                  projection_next, basis_world, forward, backward, config=None, *, use_observed_flow=True):
     """All output maps use t coordinates; positive delta means recovery at that surface."""
     config = config or EvidenceConfig()
     config.validate()
@@ -280,9 +280,14 @@ def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
         raise ValueError("Flow must share the working image pixel frame")
     endpoints, geometric_flow, geometric_valid = ground_correspondence(projection_t, projection_next, basis_world, shape)
     visible = geometric_valid & (ground_t > 0) & (sample_at((ground_next > 0).astype(np.uint8), endpoints, True) > 0)
-    fb_error, flow_reliable = forward_backward_evidence(forward, backward, config)
+    if use_observed_flow:
+        fb_error, flow_reliable = forward_backward_evidence(forward, backward, config)
+    else:
+        fb_error, flow_reliable = np.full(shape, np.nan, np.float32), np.zeros(shape, bool)
     flow_residual = np.linalg.norm(forward-geometric_flow, axis=-1)
     background = visible & flow_reliable & np.isfinite(flow_residual) & (flow_residual <= config.ground_flow_tolerance_px)
+    if not use_observed_flow:
+        background = visible.copy()
     # Convert before interpolation: Lab remapping and BGR remapping are not equivalent.
     lab_t = cv2.cvtColor(image_t, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_next = cv2.cvtColor(image_next, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -308,8 +313,12 @@ def pair_evidence(image_t, image_next, ground_t, ground_next, projection_t,
         values = array[mask & np.isfinite(array)]
         return float(np.median(values)) if values.size else None
 
-    details = {"visible_ground_pixels": int(visible.sum()), "flow_consistent_background_pixels": int(background.sum()),
-               "flow_fb_reliable_ground_ratio": float(flow_reliable[visible].mean()) if visible.any() else None,
+    details = {"visible_ground_pixels": int(visible.sum()),
+               "flow_consistent_background_pixels": int(background.sum()) if use_observed_flow else 0,
+               "exposure_background_pixels": int(background.sum()),
+               "registration_mode": "geometry-dis" if use_observed_flow else "geometry-only",
+               "exposure_background": "flow_consistent_ground" if use_observed_flow else "geometrically_visible_ground",
+               "flow_fb_reliable_ground_ratio": float(flow_reliable[visible].mean()) if use_observed_flow and visible.any() else None,
                "ground_flow_residual_median_px": median(flow_residual, visible & flow_reliable),
                "fit_background_flow_residual_median_px": median(flow_residual, background),
                "flow_fb_error_median_px": median(fb_error, visible), "exposure": exposure,

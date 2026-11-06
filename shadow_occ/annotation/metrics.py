@@ -22,7 +22,7 @@ class BinaryMetrics:
 
 
 def pixel_score_diagnostics(histogram):
-    """Fixed dev score diagnostics, not an automatically selected operating point."""
+    """Fixed score diagnostics, not an automatically selected operating point."""
     histogram = np.asarray(histogram)
     if histogram.ndim != 2 or histogram.shape[0] != 2 or histogram.shape[1] < 2:
         raise ValueError("Expected a 2 x bins pixel-score histogram")
@@ -35,11 +35,22 @@ def pixel_score_diagnostics(histogram):
         fp, tp = (int(row[boundary:].sum()) for row in histogram)
         tn, fn = (int(row[:boundary].sum()) for row in histogram)
         sweep.append({"threshold": boundary/bins, "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+                      "precision": tp/(tp+fp) if tp+fp else None,
                       "recall": tp/(tp+fn) if tp+fn else None,
+                      "iou": tp/(tp+fp+fn) if tp+fp+fn else None,
                       "fpr": fp/(fp+tn) if fp+tn else None})
+    descending = np.cumsum(histogram[:, ::-1], axis=1)
+    positives = int(histogram[1].sum())
+    predicted = descending.sum(axis=0)
+    precision = np.divide(descending[1], predicted, out=np.ones(bins, np.float64), where=predicted > 0)
+    recall = descending[1]/positives if positives else np.zeros(bins)
+    average_precision = float(np.sum(np.diff(np.r_[0, recall])*precision)) if positives else None
+    curve = [{"threshold": (bins-1-index)/bins, "precision": float(precision[index]),
+              "recall": float(recall[index]) if positives else None} for index in range(bins)]
     return {"bins": bins, "histogram_by_class": histogram.tolist(),
             "approximate_mean_probability_nonshadow_shadow": means, "threshold_sweep": sweep,
-            "approved_for_relabeling": False, "scope": "fixed quantized dev diagnostics; no threshold selected"}
+            "approximate_average_precision": average_precision, "pr_curve": curve,
+            "approved_for_relabeling": False, "scope": "fixed quantized pixel-score diagnostics; no threshold selected"}
 
 
 def auc(labels, scores):

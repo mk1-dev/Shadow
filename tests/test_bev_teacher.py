@@ -51,6 +51,15 @@ def test_static_bright_receiver_alone_is_not_a_negative():
     assert not masks[0].any() and not masks[2].any()
 
 
+def test_endpoint_negatives_exclude_nonvehicle_volumes_and_static_risk():
+    _, arrays, mask, tracks = fixture()
+    static = {"category": "movable_object.barrier", "corners_world": tracks[0]["points"][1, 1:].tolist()}
+    masks, details = endpoint_negative_masks(arrays, mask, tracks, [0, 0, 1, 0], light_bank(), [{"light_id": 0}],
+        frame_volumes={0: [static]}, exclusion_masks={2: mask.copy()})
+    assert not masks[0].any() and not masks[2].any()
+    assert details["0"]["all_class_volumes"] == 1 and details["2"]["extra_exclusion_cells"] > 0
+
+
 def test_merge_contradictory_frame_observations_as_ignore():
     a, b = np.full((3, 3), 255, np.uint8), np.full((3, 3), 255, np.uint8)
     a[0, 0], b[0, 0], a[1, 1], b[2, 2] = 1, 0, 1, 0

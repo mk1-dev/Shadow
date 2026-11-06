@@ -1,0 +1,21 @@
+{
+  "protocol": "bev-flow-ablation-v1",
+  "variants": {
+    "full": {},
+    "geometry_only": {"feature_gate": "none"},
+    "current_only": {"feature_cache": "current-only"},
+    "shuffled": {"feature_gate": "shuffled"},
+    "matched_random": {"feature_gate": "matched-random"},
+    "cosine_01": {"minimum_bev_cosine": 0.1},
+    "cosine_05": {"minimum_bev_cosine": 0.5},
+    "without_final_flow_gate": {"feature_gate": "none", "flow_gate": "none"},
+    "geometry_no_dis": {"feature_gate": "none", "flow_gate": "none", "registration": "geometry-only"},
+    "geometry_no_dis_bev": {"flow_gate": "none", "registration": "geometry-only"},
+    "physics_fixed": {"decision_policy": "strict-v2", "light_search": "fixed", "trajectory_contrast": "off", "independent_light": "off"},
+    "physics_bank": {"decision_policy": "strict-v2", "trajectory_contrast": "off", "independent_light": "off"},
+    "physics_contrast": {"decision_policy": "strict-v2", "independent_light": "off"},
+    "physics_shared": {"decision_policy": "strict-v2"},
+    "best_projection": {"positive_fusion": "best"},
+    "consensus_projection": {"positive_fusion": "consensus"}
+  }
+}

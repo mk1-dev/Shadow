@@ -25,6 +25,9 @@ class LabelConfig:
     minimum_other_tracks: int = 2
     light_tolerance_degrees: float = 16.0
     minimum_temporal_gain: float = 0.1
+    require_temporal_contrast: bool = True
+    require_independent_light: bool = True
+    light_ids: tuple[int, ...] | None = None
 
     def validate(self):
         for name in ("minimum_change_fraction", "minimum_flow_fraction", "minimum_cover",
@@ -253,6 +256,8 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
     cache = {} if polygon_cache is None else polygon_cache
     rankings = []
     for light_id, direction in enumerate(directions):
+        if config.light_ids is not None and light_id not in config.light_ids:
+            continue
         ranked = []
         for track in eligible:
             points = track["points"]
@@ -276,7 +281,7 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             shadow_passes = (fit["cover"] >= config.minimum_cover
                 and min(fit["onset_fit"], fit["recovery_fit"]) >= config.minimum_edge_fit
                 and fit["score"] >= config.minimum_score
-                and fit["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain)
+                and (not config.require_temporal_contrast or fit["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain))
             ranked.append({"instance_token": track["instance_token"], "light_id": light_id,
                            **fit, "shadow_passes": bool(shadow_passes)})
             ranked[-1]["shadow_fit_passes"] = bool(shadow_fit_passes)
@@ -324,6 +329,9 @@ def select_shadow_and_caster(candidate, pool, directions, config, *, support_ind
                   if item["score"]-alt["score"] < config.caster_margin)
     supported = []
     for item in possible:
+        if not config.require_independent_light:
+            supported.append({**item, "independent_light_tracks": [], "independent_light_gate": False})
+            continue
         others = set()
         compatible = np.flatnonzero(directions @ directions[item["light_id"]] >= np.cos(np.deg2rad(config.light_tolerance_degrees)))
         for light_id in compatible:
@@ -385,6 +393,8 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
             or best["score"]-association["score"] >= config.caster_margin):
         association = None
     association_reason = "unique_contrast_and_shared_light_support"
+    if not config.require_temporal_contrast or not config.require_independent_light:
+        association_reason = "unique_owner_under_configured_ablation_gates"
     if association is None:
         if len(owners) != 1:
             association_reason = "ambiguous_physical_owners"
@@ -406,3 +416,24 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
             "light_weights": [{"light_id": index, "weight": float(weight)}
                               for index, weight in zip(light_ids, weights)],
             "probability_calibrated": False}
+
+
+def fuse_shadow_support(observed, footprints, policy="intersection", consensus_fraction=2/3):
+    """Apply physical support to observed pixels, never create a rendered target."""
+    if policy not in {"best", "intersection", "consensus"}:
+        raise ValueError(f"Unknown support fusion: {policy}")
+    if not 0 < consensus_fraction <= 1:
+        raise ValueError("Consensus fraction must be in (0,1]")
+    iterator = iter(footprints)
+    first = next(iterator, None)
+    if first is None:
+        return np.zeros_like(observed, dtype=bool)
+    if policy == "best":
+        return observed & first
+    votes = first.astype(np.uint32)
+    count = 1
+    for footprint in iterator:
+        votes += footprint
+        count += 1
+    required = count if policy == "intersection" else int(np.ceil(count*consensus_fraction))
+    return observed & (votes >= required)

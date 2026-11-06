@@ -127,6 +127,19 @@ def test_flow_fb_check_rejects_out_of_bounds_and_inconsistent_flow():
     assert not wrong.any()
 
 
+def test_geometry_only_evidence_does_not_fabricate_observed_flow():
+    first, second = image_pair()
+    ground = np.ones(first.shape[:2], bool)
+    absent = np.full((*first.shape[:2], 2), np.nan, np.float32)
+    result = pair_evidence(first, second, ground, ground, projection(), projection(),
+        plane_basis([0, 0, 1, 0]), absent, absent, use_observed_flow=False)
+    assert result["details"]["registration_mode"] == "geometry-only"
+    assert result["details"]["exposure"]["valid"]
+    assert not result["flow_reliable"].any() and not result["receiver_flow_supported"].any()
+    assert np.isnan(result["flow_residual_px"]).all()
+    assert result["onset_candidate"].any() and result["recovery_candidate"].any()
+
+
 def test_flow_disagreement_alone_does_not_create_shadow_evidence():
     image = np.full((64, 96, 3), 160, np.uint8)
     flow = np.zeros((64, 96, 2), np.float32)

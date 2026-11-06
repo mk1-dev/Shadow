@@ -20,6 +20,9 @@ ROOT="${SHADOW_ANNOTATION_ROOT:-outputs/shadow_bev_flow}"
 DATA_ROOT="${SHADOW_DATA_ROOT:-$ROOT/data}"
 OUTPUT_ROOT="${SHADOW_SEG_ROOT:-$ROOT/segmenter}"
 INIT_ARGS=()
+if [[ "${SHADOW_SEG_POSITIVE_ONLY_ABLATION:-0}" == 1 ]]; then
+  INIT_ARGS+=(--positive-only-ablation)
+fi
 if [[ -n "${SHADOW_SEG_INIT_CHECKPOINT:-}" ]]; then
   INIT_ARGS+=(--init-checkpoint "$SHADOW_SEG_INIT_CHECKPOINT")
 fi

@@ -96,25 +96,62 @@ def attach_cached_bev(arrays, metadata, root):
     return arrays, metadata
 
 
-def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3):
+def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
+                              feature_gate="aligned", flow_gate=True, seed=0):
     """Require a persistent learned receiver representation, not just dark appearance."""
-    cosine = np.asarray(arrays["learned_bev_temporal_cosine"])
-    feature_valid = arrays["learned_bev_valid"].all(axis=0) & np.isfinite(cosine).all(axis=0)
-    consistency = np.min(np.nan_to_num(cosine, nan=-1.0), axis=0)
-    learned = feature_valid & (consistency >= minimum_cosine)
-    original = arrays["shadow_candidate"].copy()
-    selected = original & learned & arrays["shadow_flow_supported"]
+    if feature_gate not in {"aligned", "none", "shuffled", "matched-random"}:
+        raise ValueError(f"Unknown feature gate: {feature_gate}")
+    if not np.isfinite(minimum_cosine) or not -1 <= minimum_cosine <= 1:
+        raise ValueError("BEV cosine threshold must be in [-1,1]")
+    original = arrays.get("shadow_candidate_photometric", arrays["shadow_candidate"]).copy()
+    observed_flow = arrays.get("shadow_flow_supported_observed", arrays["shadow_flow_supported"]).copy()
+    flow = observed_flow if flow_gate else np.ones_like(original)
+    rng = np.random.default_rng(seed)
+    consistency = np.full(original.shape, np.nan, np.float32)
+    feature_valid = np.ones_like(original)
+    if feature_gate == "none":
+        learned = np.ones_like(original)
+    else:
+        cosine = np.asarray(arrays["learned_bev_temporal_cosine"])
+        feature_valid = arrays["learned_bev_valid"].all(axis=0) & np.isfinite(cosine).all(axis=0)
+        if feature_gate == "shuffled":
+            features = arrays["learned_bev_receiver_features"].astype(np.float32).copy()
+            for slot in range(3):
+                support = arrays["learned_bev_valid"][slot]
+                values = features[slot][support]
+                features[slot][support] = values[rng.permutation(len(values))]
+            norms = np.linalg.norm(features, axis=-1)
+            cosine = np.stack([(features[i]*features[i+1]).sum(axis=-1)
+                / np.maximum(norms[i]*norms[i+1], 1e-6) for i in range(2)])
+            feature_valid &= (norms > 1e-6).all(axis=0)
+        consistency = np.min(np.nan_to_num(cosine, nan=-1.0), axis=0)
+        learned = feature_valid & (consistency >= minimum_cosine)
+        if feature_gate == "matched-random":
+            # Match the aligned arm's final candidate budget within the same valid domain.
+            count = int((original & flow & learned).sum())
+            eligible = np.flatnonzero(original & flow & feature_valid)
+            learned = np.zeros_like(original)
+            learned.flat[rng.choice(eligible, size=count, replace=False)] = True
+    selected = original & learned & flow
     arrays["shadow_candidate_photometric"] = original
+    arrays["shadow_flow_supported_observed"] = observed_flow
+    arrays["shadow_flow_supported"] = flow
     arrays["learned_bev_receiver_support"] = learned
     arrays["learned_bev_receiver_consistency"] = consistency
     arrays["shadow_candidate"] = selected
     for key in ("shadow_boundary_onset", "shadow_boundary_recovery", "shadow_same_patch_cycle"):
-        arrays[key] &= selected
+        source = f"{key}_photometric"
+        if source not in arrays:
+            arrays[source] = arrays[key].copy()
+        arrays[key] = arrays[source] & selected
     metadata["learned_bev_selection"] = {"minimum_cosine": minimum_cosine,
-        "rule": "photometric AND registered_flow AND three_frame_learned_receiver",
+        "feature_gate": feature_gate, "flow_gate": flow_gate, "seed": int(seed),
+        "rule": "photometric AND configured_registration AND configured_feature_gate",
         "photometric_candidate_cells": int(original.sum()), "selected_cells": int(selected.sum()),
+        "feature_valid_candidate_cells": int((original & feature_valid).sum()),
+        "selection_fraction": float(selected.sum()/max(original.sum(), 1)),
         "feature_rejected_cells": int((original & ~learned).sum()),
-        "flow_rejected_cells": int((original & ~arrays["shadow_flow_supported"]).sum())}
+        "flow_rejected_cells": int((original & ~flow).sum())}
     metadata["counts"]["photometric_candidates"] = int(original.sum())
     metadata["counts"]["shadow_candidates"] = int(selected.sum())
     return arrays, metadata

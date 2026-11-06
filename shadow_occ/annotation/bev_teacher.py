@@ -9,7 +9,8 @@ from shadow_occ.annotation.physics_labels import footprint_mask
 PROTOCOL = "bev-flow-annotation-v1"
 
 
-def endpoint_negative_masks(arrays, positive_core, tracks, plane, directions, explanations, *, minimum_lit_ratio=0.97):
+def endpoint_negative_masks(arrays, positive_core, tracks, plane, directions, explanations, *,
+                            minimum_lit_ratio=0.97, frame_volumes=None, exclusion_masks=None):
     """Weak lit endpoints: observed recovery/onset AND outside all plausible tracked shadows."""
     shape = positive_core.shape
     light_ids = sorted({item["light_id"] for item in explanations})
@@ -24,14 +25,26 @@ def endpoint_negative_masks(arrays, positive_core, tracks, plane, directions, ex
                         directions[light_id], arrays["bev_world_to_grid"], shape)
                 except ValueError:
                     invalid = True
+            for volume in (frame_volumes or {}).get(slot, []):
+                try:
+                    possible_shadow |= footprint_mask(np.asarray(volume["corners_world"]), plane,
+                        directions[light_id], arrays["bev_world_to_grid"], shape)
+                except ValueError:
+                    invalid = True
         mask = positive_core & arrays[event] & arrays["receiver_valid"]
         mask &= arrays["learned_bev_receiver_support"] & arrays["shadow_flow_supported"]
         mask &= arrays["appearance_local_ratio"][slot] >= minimum_lit_ratio
         mask &= ~possible_shadow
+        exclusion = (exclusion_masks or {}).get(slot)
+        if exclusion is not None:
+            mask &= ~exclusion
         if invalid or not light_ids:
             mask[:] = False
         result[slot] = mask
         details[str(slot)] = {"cells": int(mask.sum()), "invalid_competing_volume": invalid,
+                             "excluded_projected_shadow_cells": int(possible_shadow.sum()),
+                             "extra_exclusion_cells": int(exclusion.sum()) if exclusion is not None else 0,
+                             "all_class_volumes": len((frame_volumes or {}).get(slot, [])),
                              "light_ids": light_ids, "minimum_lit_ratio": minimum_lit_ratio}
     return result, details
 

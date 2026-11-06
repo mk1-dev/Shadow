@@ -32,6 +32,14 @@ def _pick_last_tensor_like(value):
     return value
 
 
+def reset_mature_history(model):
+    """UniAD tracking stores BEV history separately from prev_frame_info."""
+    model.test_track_instances = None
+    model.prev_bev = None
+    if hasattr(model, "prev_frame_info"):
+        model.prev_frame_info.update(prev_bev=None, scene_token=None, prev_pos=0, prev_angle=0)
+
+
 def main():
     parser = argparse.ArgumentParser("Frozen spatial BEV export using the mature OpenDriveVLA UniAD environment")
     parser.add_argument("--external-root", required=True)
@@ -43,6 +51,7 @@ def main():
     parser.add_argument("--version", default="v1.0-trainval")
     parser.add_argument("--ann-file", help="Use train or val nuScenes infos with the existing TEST pipeline")
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--history-mode", choices=["temporal", "current-only"], default="temporal")
     args = parser.parse_args()
     external = Path(args.external_root).resolve()
     config_path = Path(args.model_config)
@@ -70,7 +79,8 @@ def main():
     exporter.import_plugin_modules(cfg)
     dataset = exporter.custom_build_dataset(cfg.data.test)
     indices = sorted((i for i, info in enumerate(dataset.data_infos) if info["scene_token"] in scenes
-                      and info["timestamp"] <= latest_needed[info["scene_token"]]),
+                      and info["timestamp"] <= latest_needed[info["scene_token"]]
+                      and (args.history_mode == "temporal" or info["token"] in needed)),
                      key=lambda i: (dataset.data_infos[i]["scene_token"], dataset.data_infos[i]["timestamp"]))
     # Keep the original dataset indices for its map/trajectory lookups and replay whole scenes.
     for index in indices:
@@ -88,6 +98,7 @@ def main():
     model = exporter.build_model_from_cfg(cfg, str(checkpoint), torch.device("cuda:0"), False)
     model.requires_grad_(False)
     source = {"encoder": "UniAD/OpenDriveVLA BEVFormer", "mode": "frozen ordered inference",
+        "history_mode": args.history_mode,
         "checkpoint_sha256": digest(checkpoint), "model_config_sha256": digest(config_path),
         "external_exporter_sha256": digest(external/"scripts/export_uniad_pth.py")}
     saved, seen, previous_time = set(), set(), {}
@@ -109,6 +120,8 @@ def main():
         for key in ("l2g_t", "l2g_r_mat"):
             data[key] = _pick_last_tensor_like(data.get(key))
         data = exporter.move_data_to_device(data, "cuda:0")
+        if args.history_mode == "current-only":
+            reset_mature_history(model)
         with torch.no_grad():
             _, result = model(return_loss=False, rescale=True, **data)
         if token in needed:

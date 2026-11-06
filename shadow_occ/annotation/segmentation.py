@@ -213,6 +213,8 @@ def train_main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--pixel-balance", choices=["loss", "none"], default="loss")
+    parser.add_argument("--positive-only-ablation", action="store_true",
+                        help="Run the positive-only training control against unchanged two-class dev labels")
     parser.add_argument("--max-pixel-weight", type=float, default=50.0)
     parser.add_argument("--temporal-weight", type=float, default=0.2)
     parser.add_argument("--receiver-pair-weight", type=float, default=0.0,
@@ -264,9 +266,10 @@ def train_main():
             receiver_pair_rows += int(bool(row.get("physics_transition")) and resized[1] > 0)
             usable.append(row)
     train = usable
-    if (resized_counts == 0).any():
+    positive_only = args.positive_only_ablation and resized_counts[0] == 0 and resized_counts[1] > 0
+    if (resized_counts == 0).any() and not positive_only:
         raise ValueError("Both known classes must survive the actual training resize; increase resolution or fix labels")
-    pixel_weights = binary_risk_weights(effective_mass.tolist(), args.max_pixel_weight) if args.pixel_balance == "loss" else [1.0, 1.0]
+    pixel_weights = binary_risk_weights(effective_mass.tolist(), args.max_pixel_weight) if args.pixel_balance == "loss" and not positive_only else [1.0, 1.0]
     if args.receiver_pair_weight > 0 and not receiver_pair_rows:
         raise ValueError("Receiver-pair loss requested but no positive transition rows exist; rebuild physics data first")
     dev_counts = np.zeros(2, dtype=np.int64)
@@ -427,6 +430,7 @@ def predict_main():
         raise FileExistsError(output)
     output.mkdir(parents=True, exist_ok=True)
     states, predictions = defaultdict(BinaryMetrics), []
+    histograms = defaultdict(lambda: np.zeros((2, 256), np.int64))
     temporal_error, temporal_count = 0.0, 0.0
     with torch.inference_mode():
         for index, row in enumerate(tqdm(rows, desc="shadow segmentation")):
@@ -443,6 +447,10 @@ def predict_main():
             probability = F.interpolate(logits, size=original.shape[:2], mode="bilinear", align_corners=False)[0, 0].sigmoid().cpu().numpy()
             target = cv2.imread(row["target"], cv2.IMREAD_GRAYSCALE)
             states[row["label_source"]].update(probability >= args.threshold, target)
+            known = (target == 0) | (target == 1)
+            bucket = np.minimum((probability[known]*256).astype(np.int64), 255)
+            histograms[row["label_source"]] += np.bincount(target[known].astype(np.int64)*256+bucket,
+                minlength=512).reshape(2, 256)
             path = output/"probabilities"/f"{index:07d}.npz"
             path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(path, probability=probability.astype(np.float16))
@@ -459,5 +467,6 @@ def predict_main():
         "checkpoint_train_scenes": checkpoint.get("train_scenes"), "checkpoint_dev_scenes": checkpoint.get("dev_scenes"),
         "diagnostics_only": args.diagnostics_only, "segmenter_readiness": readiness,
         "in_sample_annotation": bool(overlap), "overlapping_train_scenes": overlap,
-        "by_label_source": {source: state.summary() for source, state in states.items()},
+        "by_label_source": {source: {**state.summary(), "score_diagnostics": pixel_score_diagnostics(histograms[source])}
+                            for source, state in states.items()},
         "temporal_consistency": {"weighted_probability_MAE": temporal_error/temporal_count if temporal_count else None, "weight_sum": temporal_count}})

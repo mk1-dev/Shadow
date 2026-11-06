@@ -28,6 +28,11 @@ in the annotation environment. See [BEV redesign and HPC commands](docs/shadow_t
 
 ## Default HPC Pipeline
 
+Internal experiments are available in [BEV-flow ablations](docs/bev_flow_ablations.md):
+shared-input feature/flow gates, genuine no-DIS geometry registration, current-only
+encoder export, physical-explanation controls, and training-label controls. Reuse
+the completed preparation caches; do not regenerate raw nuScenes for each arm.
+
 `slurm/prepare_shadow_annotation.slurm` now builds everything from raw nuScenes;
 it does not read `outputs_temporal`, `shadow_labels`, old segmenters or adapters.
 Frozen BEV temporal cosine (default >= 0.3) AND registered receiver flow actually
