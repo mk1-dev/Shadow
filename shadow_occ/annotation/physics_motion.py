@@ -181,9 +181,29 @@ def ground_correspondence(projection_t, projection_next, basis_world, shape):
 
 
 def sample_at(array, endpoints, nearest=False):
-    return cv2.remap(np.asarray(array), endpoints[..., 0], endpoints[..., 1],
-                     cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    array, endpoints = np.asarray(array), np.asarray(endpoints)
+    if endpoints.ndim < 2 or endpoints.shape[-1] != 2:
+        raise ValueError("Sampling endpoints must have a final dimension of two")
+    interpolation = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
+    output_shape = endpoints.shape[:-1]
+    # A dense projected box face can contain more than CV_16S coordinate-map rows/columns.
+    if all(size < 32767 for size in output_shape):
+        map_x = np.ascontiguousarray(endpoints[..., 0], dtype=np.float32)
+        map_y = np.ascontiguousarray(endpoints[..., 1], dtype=np.float32)
+        return cv2.remap(array, map_x, map_y, interpolation,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    flat = endpoints.reshape(-1, 2)
+    if not len(flat):
+        return np.empty(output_shape+array.shape[2:], dtype=array.dtype)
+    chunks = []
+    for start in range(0, len(flat), 30000):
+        values = flat[start:start+30000]
+        map_x = np.ascontiguousarray(values[:, 0].reshape(1, -1), dtype=np.float32)
+        map_y = np.ascontiguousarray(values[:, 1].reshape(1, -1), dtype=np.float32)
+        chunks.append(cv2.remap(array, map_x, map_y, interpolation,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0))
+    sampled = np.concatenate(chunks, axis=1)
+    return sampled.reshape(output_shape+sampled.shape[2:])
 
 
 def forward_backward_evidence(forward, backward, config):

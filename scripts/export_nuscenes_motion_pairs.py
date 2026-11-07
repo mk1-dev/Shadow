@@ -115,15 +115,19 @@ def observed_ground(points_world, object_free, projection, plane_world, shape,
     objects_crossing_near_plane = 0
     near_plane_objects_clipped = 0
     object_exclusion = np.zeros(shape, bool)
+    raster_pad = 4
     for corners in object_corners:
         polygon, crossing = object_image_polygon(corners, projection, shape)
         objects_crossing_near_plane += int(crossing)
         if not len(polygon):
             continue
         near_plane_objects_clipped += int(crossing)
-        object_mask = np.zeros(shape, np.uint8)
-        cv2.fillConvexPoly(object_mask, polygon, 1)
-        object_exclusion |= cv2.dilate(object_mask, np.ones((7, 7), np.uint8)) > 0
+        # Retain the exclusion margin for polygons just outside the image boundary.
+        object_mask = np.zeros((height+2*raster_pad, width+2*raster_pad), np.uint8)
+        cv2.fillConvexPoly(object_mask, polygon+raster_pad, 1)
+        object_mask = cv2.dilate(object_mask, np.ones((7, 7), np.uint8))
+        object_exclusion |= object_mask[raster_pad:raster_pad+height,
+                                        raster_pad:raster_pad+width] > 0
     support &= ~object_exclusion
     # A dilated sample is only local planar support, NOT dense visibility truth.
     basis = plane_basis(plane_world) if basis_world is None else np.asarray(basis_world)

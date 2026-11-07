@@ -9,6 +9,7 @@ from shadow_occ.annotation.physics_motion import (
     EvidenceConfig, decompose_object_motion, exposure_fit, fit_ground_plane,
     forward_backward_evidence, ground_correspondence, ground_homography,
     interpolate_box_state, pair_evidence, plane_basis, project_world, receiver_flow_evidence,
+    sample_at,
 )
 
 
@@ -88,6 +89,14 @@ def test_ground_correspondence_matches_direct_plane_projection():
 def test_ground_behind_camera_is_unknown_even_for_identity_homography():
     _, _, valid = ground_correspondence(projection(), projection(), plane_basis([0, 0, 1, -11]), (64, 96))
     assert not valid.any()
+
+
+def test_sampling_supports_more_than_opencv_short_coordinate_dimension():
+    source = np.arange(25, dtype=np.float32).reshape(5, 5)
+    endpoints = np.tile([[3., 2.]], (40000, 1))[None]
+    sampled = sample_at(source, endpoints, nearest=True)
+    assert sampled.shape == (1, 40000)
+    np.testing.assert_array_equal(sampled, source[2, 3])
 
 
 def test_singular_ground_projection_rejected():
