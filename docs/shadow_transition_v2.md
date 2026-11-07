@@ -174,3 +174,44 @@ sbatch --export=ALL slurm/rebuild_bev_flow_labels.slurm
 
 The existing Slurm entry runs the diagnostic regression tests on HPC. This is
 not a new model-training job and does not repeat BEV export or DIS estimation.
+
+## Receiver Sampling Audit
+
+If visibility and flow support disappear before exposure fitting, use the
+sampling-only entry. It does not run light search, caster ranking, exposure
+fitting, label export, or model training. All existing sampling rules stay fixed.
+
+```bash
+cd /public/home/eng_zhihongli/project/Shadow
+export SHADOW_PROJECT_ROOT="$PWD"
+export SHADOW_CONDA_ENV=shadow_annotator
+export SHADOW_REBUILD_SOURCE="$PWD/outputs/shadow_transition_stages_20261107_211522"
+export SHADOW_ANNOTATION_ROOT="$PWD/outputs/shadow_sampling_$(date +%Y%m%d_%H%M%S)"
+export SHADOW_TEMPORAL_RADIUS=3
+mkdir -p logs
+sbatch --export=ALL slurm/audit_receiver_sampling.slurm
+```
+
+Each split writes `windows.jsonl` and `summary.json`. The former records:
+
+- Geometric stages: camera-front projection, image bounds, source ground-mask
+  population, projected ground support, and overlap with the cached anchor
+  receiver. An empty anchor receiver is distinct from an invalid projection.
+- Sampling stages: nearest-neighbor and strict bilinear ground/flow counts,
+  including counts inside the anchor receiver. Nearest-neighbor is diagnostic
+  only, not an alternative acceptance rule.
+- Flow provenance: source-frame token and pair ID, source-image populations of
+  flow support, visible ground, forward/backward reliability, receiver texture
+  and anchors. Each sampled field must share the source camera pixel frame.
+- Chain support: overlap and surviving support after each pair, including nearby
+  and remote observations separately via `relative_frame`.
+- Cached central visibility mismatch: recompute the original three views from
+  cached world coordinates and compare on the cached anchor receiver. Nonzero
+  mismatch warrants checking coordinate precision/projection/support consistency;
+  it is not by itself proof of a calibration error.
+
+The summary aggregates visibility/flow failure reasons, empty reference receiver
+counts, central mismatch counts and flow-chain clearing. These are sampling
+diagnostics, not shadow-quality metrics. Source masks that already have zero
+support require tracing the original ground/flow export; changing the ranking
+score cannot restore those observations.

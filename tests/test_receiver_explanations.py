@@ -383,6 +383,37 @@ def test_active_bev_label_and_baseline_audit_pipeline(tmp_path, monkeypatch):
     stages = json.loads((audit/"transition_stages.json").read_text())
     assert stages["components_with_diagnostics"] == len(decisions)
     assert stages["windows_with_diagnostics"] > 0
+    # The sampling-only entry must run with frozen inputs and without label ranking.
+    import shutil
+
+    source, sampling = tmp_path/"frozen", tmp_path/"sampling"
+    (source/"train/pairs").mkdir(parents=True)
+    shutil.copy2(manifest, source/"train/pairs/pairs.jsonl")
+    shutil.copytree(flow, source/"train/flow")
+    shutil.copytree(bev, source/"train/bev_flow")
+    monkeypatch.setattr(sys, "argv", ["sampling", "--source-root", str(source), "--output-root", str(sampling),
+        "--splits", "train", "--max-windows", "1"])
+    script("audit_receiver_sampling").main()
+    sampled = json.loads((sampling/"train/summary.json").read_text())
+    assert sampled["windows"] == 1 and sampled["cached_central_comparisons"] == 3
+    assert (sampling/"train/windows.jsonl").exists()
+    review = script("audit_shadow_geometry")
+    by_id = {pair["id"]: pair for pair in pairs}
+    forward = {(*(pair[key] for key in ("scene_name", "official_split", "camera")), pair["sample_token"]): pair for pair in pairs}
+    backward = {(*(pair[key] for key in ("scene_name", "official_split", "camera")), pair["next_sample_token"]): pair for pair in pairs}
+    windows = {window["id"]: window for window in read_rows(bev/"windows.jsonl")}
+    item = decisions[0]
+    case = {"id": item["id"], "window_id": item["bev_flow"]["window_id"], "scene_name": item["scene_name"],
+        "category": "fixture", "component": item, "frame_index": None}
+    destination = tmp_path/"visual"
+    review.render_case(case, windows[case["window_id"]], by_id, forward, backward, source/"train", destination, 3,
+        {metric["id"]: metric for metric in metrics})
+    for name in ("panel.jpg", "light_bank_96.jpg", "receiver_visibility.jpg", "flow_stages.jpg", "exposure.jpg"):
+        rendered = cv2.imread(str(destination/name))
+        assert rendered is not None and rendered.max() > rendered.min()
+    assert (destination/"flow_stages.npz").exists()
+    assert (destination/"observations.npz").exists()
+    assert json.loads((destination/"audit.json").read_text())["case_id"] == item["id"]
 
 
 def test_transition_diagnostics_do_not_require_accepted_best_projection():

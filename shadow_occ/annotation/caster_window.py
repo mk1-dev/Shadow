@@ -1,6 +1,8 @@
 """GT-caster proposals and longer observations on the same world receiver grid."""
 from __future__ import annotations
 
+from collections import Counter
+
 import cv2
 import numpy as np
 
@@ -107,6 +109,16 @@ def trajectory_track_state(context, token):
         "status": "unseen", "observed_samples": 0, "missing_samples": len(context["sample_tokens"])})
 
 
+def receiver_chain_support(visible, flow, middle, index):
+    overlap = visible[index] & visible[middle]
+    support, steps = overlap.copy(), []
+    for step in range(min(index, middle), max(index, middle)):
+        before = int(support.sum())
+        support &= flow[step]
+        steps.append({"pair_index": step, "before_pixels": before, "after_pixels": int(support.sum())})
+    return overlap, support, steps
+
+
 def long_transition_evidence(observations, visible, flow, middle, roi):
     """Keep the event rule unchanged; expose every upstream support loss separately."""
     onset, recovery = np.zeros_like(visible), np.zeros_like(visible)
@@ -114,14 +126,7 @@ def long_transition_evidence(observations, visible, flow, middle, roi):
     exposures, diagnostics = [], []
     config = EvidenceConfig()
     for index in range(len(observations)):
-        overlap = visible[index] & visible[middle]
-        support = overlap.copy()
-        step_support = []
-        for step in range(min(index, middle), max(index, middle)):
-            before = int(support.sum())
-            support &= flow[step]
-            step_support.append({"pair_index": step, "before_pixels": before,
-                                 "after_pixels": int(support.sum())})
+        overlap, support, step_support = receiver_chain_support(visible, flow, middle, index)
         supports[index] = support
         background = support & ~roi
         fit = exposure_fit(observations[index], observations[middle], background, config)
@@ -181,12 +186,110 @@ def component_transition_diagnostics(context, mask):
         "scope": "observed component events before caster/light selection; raw darkness is not a shadow label"}
 
 
-def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
+def sample_receiver_frame(world, frame, ground, receiver):
+    """Trace geometric projection and sparse-ground sampling without relaxing support."""
+    height, width = ground.shape
+    if (width, height) != tuple(frame["image_size_wh"]):
+        raise ValueError("Receiver ground mask and camera pixel frame differ")
+    uv, depth, front = project_world(world.reshape(-1, 3), frame["projection_world_to_image"])
+    inside = front & (uv >= 0).all(axis=1) & (uv[:, 0] <= width-1) & (uv[:, 1] <= height-1)
+    coordinates = np.where(inside[:, None], uv, -1).reshape(*world.shape[:2], 2).astype(np.float32)
+    geometric = inside.reshape(receiver.shape)
+    fraction = sample_at(ground.astype(np.float32), coordinates)
+    nearest = sample_at(ground.astype(np.float32), coordinates, nearest=True) > 0
+    supported = geometric & (fraction >= .999)
+    valid = supported & receiver
+
+    def pixel_range(values):
+        return [float(values.min()), float(values.max())] if len(values) else None
+
+    reason = ("supported" if valid.any() else "empty_anchor_receiver" if not receiver.any()
+        else "no_front_projection" if not front.any() else "outside_image" if not inside.any()
+        else "empty_source_ground" if not ground.any() else "ground_bilinear_rejection" if (geometric & nearest).any() and not supported.any()
+        else "no_ground_grid_intersection" if not supported.any() else "anchor_receiver_disjoint")
+    diagnostics = {"sample_data_token": frame["sample_data_token"],
+        "grid_pixels": int(receiver.size), "anchor_receiver_pixels": int(receiver.sum()),
+        "source_ground_pixels": int(ground.sum()), "front_projection_pixels": int(front.sum()),
+        "in_image_pixels": int(inside.sum()),
+        "ground_nearest_pixels": int((geometric & nearest).sum()),
+        "ground_bilinear_pixels": int(supported.sum()), "receiver_visible_pixels": int(valid.sum()),
+        "anchor_ground_nearest_pixels": int((geometric & nearest & receiver).sum()),
+        "projection_depth_range_m": pixel_range(depth[front]),
+        "front_u_range_px": pixel_range(uv[front, 0]), "front_v_range_px": pixel_range(uv[front, 1]),
+        "zero_support_reason": reason,
+        "sampling_rule": "bilinear >= 0.999; nearest counts are diagnostic only"}
+    return coordinates, valid, diagnostics
+
+
+def sample_receiver_flow(evidence, coordinates, image_shape, receiver):
+    """Sample cached source-frame evidence on the fixed world receiver grid."""
+    source = np.asarray(evidence["receiver_flow_supported"], np.float32)
+    if source.shape != image_shape:
+        raise ValueError("Receiver flow support and source camera pixel frame differ")
+    sampled = sample_at(source, coordinates)
+    support = sampled >= .999
+    nearest = sample_at(source, coordinates, nearest=True) > 0
+    diagnostics = {"source_supported_pixels": int((source > 0).sum()),
+        "sampled_nearest_pixels": int(nearest.sum()), "sampled_bilinear_pixels": int(support.sum()),
+        "anchor_sampled_nearest_pixels": int((nearest & receiver).sum()),
+        "anchor_sampled_bilinear_pixels": int((support & receiver).sum())}
+    for key in ("visible_ground", "flow_reliable", "receiver_flow_anchor", "receiver_texture"):
+        if key in evidence:
+            values = np.asarray(evidence[key], np.float32)
+            if values.shape != image_shape:
+                raise ValueError(f"{key} and source camera pixel frame differ")
+            diagnostics[key] = {"source_pixels": int((values > 0).sum()),
+                "anchor_sampled_pixels": int(((sample_at(values, coordinates) >= .999) & receiver).sum())}
+    diagnostics["zero_support_reason"] = ("supported" if (support & receiver).any()
+        else "empty_anchor_receiver" if not receiver.any() else "empty_source_flow_support" if not source.any()
+        else "flow_bilinear_rejection" if (nearest & receiver).any() else "no_flow_grid_intersection")
+    return support, diagnostics
+
+
+def receiver_sampling_summary(frames):
+    flows = [frame["flow"] for frame in frames if "flow" in frame]
+    central = [frame for frame in frames if "cached_central_visibility_mismatch_pixels" in frame]
+    comparisons = [frame for frame in frames if not frame["is_reference"] and "chain_supported_pixels" in frame]
+    return {"frame_comparisons": len(frames),
+        "reference_frames": sum(frame["is_reference"] for frame in frames),
+        "empty_reference_receiver_frames": sum(frame["is_reference"] and frame["anchor_receiver_pixels"] == 0 for frame in frames),
+        "visibility_reasons": dict(Counter(frame["zero_support_reason"] for frame in frames)),
+        "visibility_reasons_by_relative_frame": {str(offset): dict(Counter(frame["zero_support_reason"]
+            for frame in frames if frame["relative_frame"] == offset))
+            for offset in sorted({frame["relative_frame"] for frame in frames})},
+        "flow_comparisons": len(flows),
+        "flow_reasons": dict(Counter(flow["zero_support_reason"] for flow in flows)),
+        "chain_comparisons": len(comparisons),
+        "chain_no_visible_overlap": sum(frame["chain_visible_overlap_pixels"] == 0 for frame in comparisons),
+        "chain_removed_all_support": sum(frame["chain_visible_overlap_pixels"] > 0 and frame["chain_supported_pixels"] == 0
+                                         for frame in comparisons),
+        "empty_source_ground_frames": sum(frame["source_ground_pixels"] == 0 for frame in frames),
+        "empty_source_flow_frames": sum(flow["source_supported_pixels"] == 0 for flow in flows),
+        "cached_central_comparisons": len(central),
+        "cached_central_mismatch_frames": sum(frame["cached_central_visibility_mismatch_pixels"] > 0 for frame in central),
+        "cached_central_mismatch_pixels": sum(frame["cached_central_visibility_mismatch_pixels"] for frame in central),
+        "scope": "fixed cached receiver grid; no labels, thresholds, scores or support masks changed"}
+
+
+def transition_stage_accounting(frames):
+    stages = Counter(frame.get("stage", "other") for frame in frames if not frame["is_reference"])
+    known = ("no_visible_overlap", "flow_chain_removed_support", "insufficient_background",
+             "roi_excluded_background", "unstable_exposure_or_background", "no_normalized_darkening",
+             "flow_removed_darkening", "observed_event")
+    counts = {name: stages[name] for name in known}
+    counts["other"] = sum(count for name, count in stages.items() if name not in known)
+    return {"total": sum(stages.values()), "counts": counts,
+        "other_details": {name: count for name, count in stages.items() if name not in known},
+        "closed": sum(counts.values()) == sum(stages.values())}
+
+
+def long_observations(chain, middle_token, arrays, roi, base, stats, analysis, *, sampling_only=False,
+                      include_observations=False):
     frames = [pair["frames"][0] for pair in chain]+[chain[-1]["frames"][1]]
     samples = [pair["sample_token"] for pair in chain]+[chain[-1]["next_sample_token"]]
     middle = next(index for index, frame in enumerate(frames) if frame["sample_data_token"] == middle_token)
     world = arrays["receiver_world_xyz"]
-    observations, visible, flow = [], [], []
+    observations, visible, flow, sampling = [], [], [], []
     states, inconsistent = {}, set()
     for pair in chain:
         for item in pair["objects"]:
@@ -196,33 +299,56 @@ def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
                 if sample in track and not np.allclose(track[sample], points, atol=1e-5, rtol=0):
                     inconsistent.add(item["instance_token"])
                 track[sample] = points
-    for frame in frames:
+    for frame_index, frame in enumerate(frames):
         image_path = resolve_path(frame["image"], base)
         if digest(image_path) != frame["image_sha256"]:
             raise ValueError("Long-window image changed")
         image = cv2.imread(str(image_path))
         if image is None:
             raise FileNotFoundError(image_path)
-        lab = cv2.cvtColor(image.astype(np.float32)/255, cv2.COLOR_BGR2LAB)
-        uv, _, good = project_world(world.reshape(-1, 3), frame["projection_world_to_image"])
-        width, height = frame["image_size_wh"]
-        good &= (uv >= 0).all(axis=1) & (uv[:, 0] <= width-1) & (uv[:, 1] <= height-1)
-        coordinates = np.where(good[:, None], uv, -1).reshape(*world.shape[:2], 2).astype(np.float32)
+        if image.shape[1::-1] != tuple(frame["image_size_wh"]):
+            raise ValueError("Long-window image and camera pixel frame differ")
         if digest(resolve_path(frame["ground_support"], base)) != frame["ground_sha256"]:
             raise ValueError("Long-window ground support changed")
         ground = load_array(frame["ground_support"], base) > 0
-        valid = good.reshape(world.shape[:2]) & (sample_at(ground.astype(np.float32), coordinates) >= .999)
-        observations.append(sample_at(lab[..., 0], coordinates))
-        visible.append(valid & arrays["receiver_valid"])
-        if len(flow) < len(chain):
-            evidence, _ = read_evidence(chain[len(flow)], stats, analysis)
-            flow.append(sample_at(evidence["receiver_flow_supported"].astype(np.float32), coordinates) >= .999)
-    observations, visible = np.stack(observations), np.stack(visible)
-    evidence = long_transition_evidence(observations, visible, flow, middle, roi)
+        coordinates, valid, diagnostic = sample_receiver_frame(world, frame, ground, arrays["receiver_valid"])
+        diagnostic.update(frame_index=frame_index, is_reference=frame_index == middle,
+                          relative_frame=frame_index-middle)
+        central_index = frame_index-middle+1
+        if 0 <= central_index <= 2 and "visible_by_frame" in arrays:
+            resampled = valid & arrays["receiver_valid"]
+            cached = arrays["visible_by_frame"][central_index] & arrays["receiver_valid"]
+            diagnostic["cached_central_visibility_mismatch_pixels"] = int((resampled != cached).sum())
+        if not sampling_only:
+            lab = cv2.cvtColor(image.astype(np.float32)/255, cv2.COLOR_BGR2LAB)
+            observations.append(sample_at(lab[..., 0], coordinates))
+        visible.append(valid)
+        if frame_index < len(chain):
+            pair = chain[frame_index]
+            if pair["frames"][0]["sample_data_token"] != frame["sample_data_token"]:
+                raise ValueError("Flow evidence must be sampled in its source frame")
+            evidence, _ = read_evidence(pair, stats, analysis)
+            supported, trace = sample_receiver_flow(evidence, coordinates, image.shape[:2], arrays["receiver_valid"])
+            trace.update(pair_id=pair["id"], source_frame_token=frame["sample_data_token"])
+            diagnostic["flow"] = trace
+            flow.append(supported)
+        sampling.append(diagnostic)
+    visible = np.stack(visible)
+    for index, trace in enumerate(sampling):
+        overlap, support, steps = receiver_chain_support(visible, flow, middle, index)
+        trace.update(chain_visible_overlap_pixels=int(overlap.sum()), chain_supported_pixels=int(support.sum()),
+                     chain_steps=steps)
+    if sampling_only:
+        return {"frames": frames, "middle": middle, "visible": visible, "flow": flow,
+                "sampling_diagnostics": sampling}
+    evidence = long_transition_evidence(np.stack(observations), visible, flow, middle, roi)
+    for diagnostic, trace in zip(evidence["frame_diagnostics"], sampling):
+        diagnostic["sampling"] = trace
     tracks, diagnostics, state_counts = summarize_track_states(states, inconsistent, samples)
     return {"frames": frames, "sample_tokens": samples, "middle": middle, **evidence,
-        "visible": visible, "tracks": tracks, "polygon_cache": {},
-        "timestamps": [frame["camera_timestamp"] for frame in frames],
+        **({"lightness": np.stack(observations)} if include_observations else {}),
+        "visible": visible, "tracks": tracks,
+        "polygon_cache": {}, "timestamps": [frame["camera_timestamp"] for frame in frames],
         "track_state_diagnostics": diagnostics, "track_state_counts": state_counts}
 
 
