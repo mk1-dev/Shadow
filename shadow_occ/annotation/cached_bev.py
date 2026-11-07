@@ -154,4 +154,6 @@ def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
         "flow_rejected_cells": int((original & ~flow).sum())}
     metadata["counts"]["photometric_candidates"] = int(original.sum())
     metadata["counts"]["shadow_candidates"] = int(selected.sum())
+    if "shadow_persistent_dark" in arrays:
+        metadata["counts"]["selected_persistent_dark"] = int((selected & arrays["shadow_persistent_dark"]).sum())
     return arrays, metadata

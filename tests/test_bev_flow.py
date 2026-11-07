@@ -59,6 +59,18 @@ def test_static_darkness_is_retained_but_not_accepted_as_motion_shadow():
     assert any("static_dark" in reason for reason in report["reasons"])
 
 
+def test_exposure_failure_keeps_persistent_appearance_without_false_transitions():
+    data = example()
+    data[1][0][:] = data[1][1]
+    data[1][2][:] = data[1][1]
+    data[4][0].update(valid=False, scale=float("nan"), offset_L=float("nan"))
+    arrays, metadata = build(data)
+    assert arrays["shadow_candidate"].any() and arrays["shadow_persistent_dark"].any()
+    assert not metadata["exposure_comparable"]
+    assert not arrays["shadow_boundary_onset"].any() and not arrays["shadow_boundary_recovery"].any()
+    assert not arrays["temporal_exposure_valid"].any()
+
+
 def test_expected_flow_uses_camera_projection_not_bev_pixel_displacement():
     data = example()
     pairs, images, _, flow, _ = data

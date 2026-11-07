@@ -11,14 +11,20 @@ export SHADOW_VLM_ADAPTER="$SHADOW_VLM_ROOT/adapter"
 export SHADOW_DIAG_ROOT="$SHADOW_ANNOTATION_ROOT/diagnostics"
 export SHADOW_EVAL_ROOT="$SHADOW_ANNOTATION_ROOT/evaluation"
 unset SHADOW_INIT_ADAPTER SHADOW_SEG_INIT_CHECKPOINT
-: "${UNIAD_ROOT:?Set the mature OpenDriveVLA repository}"
-: "${UNIAD_CONDA_ENV:?Set the working mature encoder environment}"
-: "${UNIAD_CHECKPOINT:?Set the mature encoder checkpoint}"
-: "${UNIAD_TRAIN_ANN_FILE:?Set train temporal infos}"
-: "${UNIAD_VAL_ANN_FILE:?Set val temporal infos}"
+if [[ -z "${SHADOW_REBUILD_SOURCE:-}" ]]; then
+  : "${UNIAD_ROOT:?Set the mature OpenDriveVLA repository}"
+  : "${UNIAD_CONDA_ENV:?Set the working mature encoder environment}"
+  : "${UNIAD_CHECKPOINT:?Set the mature encoder checkpoint}"
+  : "${UNIAD_TRAIN_ANN_FILE:?Set train temporal infos}"
+  : "${UNIAD_VAL_ANN_FILE:?Set val temporal infos}"
+fi
 : "${SHADOW_VLM_MODEL:?Set the local Qwen3-VL model}"
 mkdir -p logs
-DATA_JOB=$(sbatch --parsable slurm/prepare_shadow_annotation.slurm)
+if [[ -n "${SHADOW_REBUILD_SOURCE:-}" ]]; then
+  DATA_JOB=$(sbatch --parsable slurm/rebuild_bev_flow_labels.slurm)
+else
+  DATA_JOB=$(sbatch --parsable slurm/prepare_shadow_annotation.slurm)
+fi
 SEG_JOB=$(sbatch --parsable --dependency="afterok:$DATA_JOB" slurm/train_shadow_segmenter.slurm)
 VLM_JOB=$(sbatch --parsable --dependency="afterok:$DATA_JOB" slurm/train_shadow_vlm.slurm)
 SEG_EVAL=$(sbatch --parsable --dependency="afterok:$SEG_JOB" --export=ALL,SHADOW_EVAL_TASK=segmenter slurm/evaluate_shadow_annotators.slurm)

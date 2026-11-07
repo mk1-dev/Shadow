@@ -48,7 +48,8 @@ def main():
         recipe = {"feature_gate": "aligned", "flow_gate": "registered", "minimum_bev_cosine": 0.3,
             "registration": "geometry-dis",
             "decision_policy": "factorized-v3", "light_search": "bank", "fixed_light_id": 0,
-            "trajectory_contrast": "on", "independent_light": "on", "positive_fusion": "intersection",
+            "trajectory_contrast": "on", "independent_light": "on", "positive_fusion": "consensus",
+            "negative_policy": "endpoints+lit-receivers",
             "consensus_fraction": 2/3, **config["variants"][name]}
         root = output/name
         root.mkdir()
@@ -88,6 +89,8 @@ def main():
             options = [value for key in ("decision_policy", "light_search", "fixed_light_id", "trajectory_contrast",
                 "independent_light", "positive_fusion", "consensus_fraction")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
+            if "existence_mode" in recipe:
+                options += ["--existence-mode", recipe["existence_mode"]]
             run("build_physics_shadow_labels.py", "--pairs", origin/"pairs/pairs.jsonl", "--analysis-root", analysis_root,
                 "--bev-flow-root", target/"bev_flow", "--output-root", target/"labels", "--export-weak-labels", *options)
             summary = json.loads((target/"labels/summary.json").read_text(encoding="utf-8"))
@@ -96,7 +99,8 @@ def main():
                 results.append({"variant": name, "split": split, "status": "zero_accepted_shadow"})
                 continue
             teacher_run = run("build_bev_flow_annotation_manifest.py", "--pairs", origin/"pairs/pairs.jsonl",
-                "--labels-root", target/"labels", "--output-root", target/"teacher", check=False)
+                "--labels-root", target/"labels", "--output-root", target/"teacher",
+                "--negative-policy", recipe["negative_policy"], check=False)
             if teacher_run.returncode:
                 teacher_protocol = target/"teacher/protocol.json"
                 counts = json.loads(teacher_protocol.read_text(encoding="utf-8"))["counts"] if teacher_protocol.exists() else {}

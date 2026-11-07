@@ -52,13 +52,17 @@ def main():
     parser.add_argument("--minimum-temporal-gain", type=float, default=0.1,
                         help="Real trajectory minus hardest frozen/wrong-time score; zero is an ablation")
     parser.add_argument("--decision-policy", choices=["strict-v2", "factorized-v3"], default="strict-v2")
+    parser.add_argument("--existence-mode", choices=["motion", "static-dynamic"],
+                        help="Default: static-dynamic for factorized-v3, motion for strict-v2")
     parser.add_argument("--light-search", choices=["bank", "fixed"], default="bank")
     parser.add_argument("--fixed-light-id", type=int, default=0, help="Predeclared light ID, never chosen on eval")
     parser.add_argument("--trajectory-contrast", choices=["on", "off"], default="on")
     parser.add_argument("--independent-light", choices=["on", "off"], default="on")
-    parser.add_argument("--positive-fusion", choices=["best", "intersection", "consensus"], default="intersection")
+    parser.add_argument("--positive-fusion", choices=["best", "intersection", "consensus"],
+                        help="Default: consensus for factorized-v3, intersection for strict-v2")
     parser.add_argument("--consensus-fraction", type=float, default=2/3)
     args = parser.parse_args()
+    args.positive_fusion = args.positive_fusion or ("consensus" if args.decision_policy == "factorized-v3" else "intersection")
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
     if not 0 <= args.fixed_light_id < len(light_bank()) or not 0 < args.consensus_fraction <= 1:
@@ -66,6 +70,7 @@ def main():
     config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain,
         require_temporal_contrast=args.trajectory_contrast == "on",
         require_independent_light=args.independent_light == "on",
+        allow_static_existence=(args.existence_mode or ("static-dynamic" if args.decision_policy == "factorized-v3" else "motion")) == "static-dynamic",
         light_ids=(args.fixed_light_id,) if args.light_search == "fixed" else None)
     config.validate()
     output = Path(args.output_root).resolve()
@@ -120,7 +125,9 @@ def main():
         if not first_metric["exposure"]["valid"] or not second_metric["exposure"]["valid"]:
             counts["unstable_exposure_windows"] += 1
             audit.append({"left_pair": left["id"], "right_pair": right["id"], "status": "unstable_exposure"})
-            continue
+            if not config.allow_static_existence:
+                continue
+            counts["unstable_exposure_windows_retained_for_static"] += 1
         tracks, rejected = window_tracks(left, right)
         if rejected:
             audit.append({"left_pair": left["id"], "right_pair": right["id"], "status": "track_state_rejections", "tracks": rejected})
@@ -234,6 +241,7 @@ def main():
                 "evidence": report, "casters": caster_metadata, "physics_context": context,
                 "bev_flow": bev_component})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
+            counts.update(f"temporal_evidence_reason:{reason}" for reason in report.get("temporal_reasons", []))
         counts["windows_processed"] += 1
         print(f"windows={counts['windows_processed']} components={len(components)} tracks={len(tracks)} scene={left['scene_name']}", flush=True)
     # Only other tracks outside the query's camera frames AND physical samples vote.
@@ -268,12 +276,14 @@ def main():
         accepted = decision["shadow_accepted"]
         label = "YES" if accepted and args.export_weak_labels else "IGNORE"
         counts["weak_gate_passed" if accepted else "uncertain"] += 1
+        if accepted:
+            counts[f"accepted:{decision.get('existence_evidence', 'motion_contrast')}"] += 1
         counts[f"reason:{reason}"] += 1
         target = np.full(mask.shape, 255, np.uint8)
         score_map = np.full(mask.shape, -1, np.float32)
         if label == "YES":
             target[positive] = 1
-            score_map[positive] = selection["score"]
+            score_map[positive] = decision.get("existence_score", selection["score"])
         region_path = Path(item["mask"])
         if label == "YES":
             region_path = output/"training_regions"/f"{item['id']}.png"
@@ -296,6 +306,7 @@ def main():
                               "trajectory_contrast_enabled": config.require_temporal_contrast,
                               "independent_light_enabled": config.require_independent_light,
                               "positive_fusion": args.positive_fusion,
+                              "static_existence_enabled": config.allow_static_existence,
                               "probability_calibrated": False, "is_shadow_gt": False},
             regions=[{"id": "observed_region", "mask": str(region_path), "mask_sha256": digest(region_path), "shadow_label": label,
                       "label_source": "temporal_weak", "proposal_source": "bev_flow_receiver_component" if args.bev_flow_root else "ground_aligned_three_frame_dark_region"}])
@@ -339,6 +350,7 @@ def main():
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
         "decision_policy": args.decision_policy,
+        "existence_mode": "static-dynamic" if config.allow_static_existence else "motion",
         "ablation": {key: getattr(args, key) for key in ("light_search", "fixed_light_id", "trajectory_contrast",
             "independent_light", "positive_fusion", "consensus_fraction")},
         "candidate_space": "physical_bev" if args.bev_flow_root else "middle_camera",
@@ -349,6 +361,8 @@ def main():
                 for h in item["hypotheses"]) for item in candidates),
             "configured_trajectory_gate_fits": sum(any(h.get("shadow_passes") for h in item["hypotheses"]) for item in candidates),
             "accepted_shadow": counts["weak_gate_passed"],
+            "accepted_static_projection": counts["accepted:static_projection"],
+            "accepted_moving_projection": counts["accepted:moving_projection"],
             "accepted_fraction_of_observed_components": counts["weak_gate_passed"]/max(len(candidates), 1),
             "unique_weak_association": sum(item["shadow_decision"]["association"] is not None for item in decisions)},
         "scenes": len({item["scene_name"] for item in candidates}),
@@ -362,7 +376,8 @@ def main():
         "exported_negative_pixels": 0, "export_weak_labels": args.export_weak_labels,
         "shadow_precision": None, "shadow_recall": None, "shadow_iou": None, "caster_accuracy": None,
         "training_readiness": "positive_only_requires_independent_negative_supervision_and_disjoint_dev",
-        "static_dark_policy": "retain_unknown_not_negative", "probability_calibrated": False}
+        "static_dark_policy": "projection_supported_yes_else_ignore" if config.allow_static_existence else "retain_unknown_not_negative",
+        "probability_calibrated": False}
     write_json(output/"summary.json", summary)
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
@@ -373,7 +388,7 @@ def main():
         "track_contrast": "same light; real time order versus hardest permutation and frozen-middle control",
         "limitations": ["bounding volumes are not object silhouettes", "single locally planar receiver",
                         "constant scene-light hypothesis may fail", "uncalibrated weak scores, not real shadow probabilities",
-                        "no confident static-shadow acceptance or automatic negative labels",
+                        "static existence uses weak projection support; unique ownership still requires motion evidence",
                         "GT-assisted offline labeling is not evidence of GT-free deployment"]})
     print(summary, flush=True)
     if not counts["windows_processed"]:

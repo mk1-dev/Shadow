@@ -2,6 +2,8 @@
   "protocol": "bev-flow-ablation-v1",
   "variants": {
     "full": {},
+    "without_static": {"existence_mode": "motion"},
+    "legacy_motion": {"existence_mode": "motion", "positive_fusion": "intersection", "negative_policy": "endpoints"},
     "geometry_only": {"feature_gate": "none"},
     "current_only": {"feature_cache": "current-only"},
     "shuffled": {"feature_gate": "shuffled"},
@@ -16,6 +18,6 @@
     "physics_contrast": {"decision_policy": "strict-v2", "independent_light": "off"},
     "physics_shared": {"decision_policy": "strict-v2"},
     "best_projection": {"positive_fusion": "best"},
-    "consensus_projection": {"positive_fusion": "consensus"}
+    "intersection_projection": {"positive_fusion": "intersection"}
   }
 }

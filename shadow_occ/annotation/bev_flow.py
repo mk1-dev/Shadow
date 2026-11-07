@@ -138,8 +138,12 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
     appearance = raw_L.copy()
     scale0, offset0 = exposures[0]["scale"], exposures[0]["offset_L"]
     scale1, offset1 = exposures[1]["scale"], exposures[1]["offset_L"]
+    if not exposures[0].get("valid"):
+        scale0, offset0 = 1.0, 0.0
+    if not exposures[1].get("valid"):
+        scale1, offset1 = 1.0, 0.0
     if not np.isfinite([scale0, offset0, scale1, offset1]).all():
-        raise ValueError("Nonfinite exposure transforms")
+        raise ValueError("Nonfinite valid exposure transforms")
     appearance[1] = scale0*raw_L[1]+offset0
     appearance[2] = scale0*(scale1*raw_L[2]+offset1)+offset0
     delta = np.diff(appearance, axis=0)
@@ -147,8 +151,8 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
     support = receiver.astype(np.float32)
     density = cv2.GaussianBlur(support, (0, 0), sigma)
     means = np.stack([cv2.GaussianBlur(value*support, (0, 0), sigma)/np.maximum(density, 1e-6)
-                      for value in appearance])
-    local_ratio = appearance/np.maximum(means, 1)
+                      for value in raw_L])
+    local_ratio = raw_L/np.maximum(means, 1)
     dark = receiver & (density > 1e-6) & (local_ratio[1] < config.darkness_ratio)
     chroma = np.stack([np.linalg.norm(labs[i+1][..., 1:]-labs[i][..., 1:], axis=-1) for i in range(2)])
     color = (np.exp(-chroma/config.chroma_scale) >= 0.5).all(axis=0)
@@ -157,7 +161,8 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
     recovery = usable & (delta[1] >= config.light_threshold_L)
     previous_support = onset | (np.abs(delta[0]) < config.light_threshold_L)
     next_support = recovery | (np.abs(delta[1]) < config.light_threshold_L)
-    candidate = dark & usable & previous_support & next_support
+    persistent_dark = receiver & (density > 1e-6) & (local_ratio < config.darkness_ratio).all(axis=0)
+    candidate = (dark & usable & previous_support & next_support) | persistent_dark
     flow_support = np.stack(reliability).all(axis=0)
     changed = usable & (np.abs(delta) >= config.light_threshold_L).any(axis=0)
     # A/B/C are explanatory states, not non-shadow/shadow truth. Zero is unknown.
@@ -187,6 +192,7 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "explanation_state": state, "illumination_event": changed,
         "shadow_boundary_onset": onset & candidate, "shadow_boundary_recovery": recovery & candidate,
         "shadow_candidate": candidate, "shadow_flow_supported": flow_support,
+        "shadow_persistent_dark": persistent_dark, "temporal_exposure_valid": np.full(grid.shape, comparable, bool),
         "shadow_same_patch_cycle": onset & recovery & candidate,
         "track_landmarks_world": landmarks.astype(np.float32),
         "physical_object_displacement_world_m": displacement.astype(np.float32),
@@ -204,6 +210,7 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "counts": {"visible_all": int(visible.all(axis=0).sum()), "receiver": int(receiver.sum()),
                    "physical_box_excluded": int(occupied.any(axis=0).sum()),
                    "illumination_events": int(changed.sum()), "shadow_candidates": int(candidate.sum()),
+                   "persistent_dark_receivers": int(persistent_dark.sum()),
                    "flow_supported_receivers": int((flow_support & receiver).sum())},
         "state_legend": {"0": "unknown", "1": "stable_receiver_observation_not_negative_label",
                          "2": "physical_box_projection_support_not_dense_surface_motion",

@@ -24,7 +24,7 @@ read -r -a CAMERAS <<< "${SHADOW_CAMERAS:-CAM_FRONT CAM_FRONT_LEFT CAM_FRONT_RIG
 
 conda activate "$ANNOTATION_ENV"
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
-  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py
+  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py
 fi
 for SPLIT in train val; do
   echo "[1/5] Export $SPLIT raw geometry and dense flow"
@@ -64,12 +64,13 @@ for SPLIT in train val; do
     --output-root "$ROOT_OUT/$SPLIT/bev_flow"
   python -u scripts/build_physics_shadow_labels.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
-    --bev-flow-root "$ROOT_OUT/$SPLIT/bev_flow" --decision-policy factorized-v3 \
+    --bev-flow-root "$ROOT_OUT/$SPLIT/bev_flow" --decision-policy factorized-v3 --existence-mode static-dynamic \
+    --positive-fusion "${SHADOW_POSITIVE_FUSION:-consensus}" \
     --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels"
   echo "[4/5] Export observed shadows and lit endpoints for $SPLIT"
   python -u scripts/build_bev_flow_annotation_manifest.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --labels-root "$ROOT_OUT/$SPLIT/labels" \
-    --output-root "$ROOT_OUT/$SPLIT/teacher"
+    --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}" --output-root "$ROOT_OUT/$SPLIT/teacher"
 done
 
 echo "[5/5] Build shared segmentation and unified VLM datasets"

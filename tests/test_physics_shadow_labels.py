@@ -204,7 +204,7 @@ def test_factorized_existence_does_not_require_other_track_light_votes():
     assert sum(row["weight"] for row in decision["light_weights"]) == pytest.approx(1)
 
 
-def test_factorized_policy_never_approves_static_darkness_without_observed_transitions():
+def test_factorized_policy_needs_a_projection_explanation_not_just_darkness():
     candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["f"], "hypotheses": []}
     assert not factorized_shadow_decision(candidate, [], light_bank(), LabelConfig())["shadow_accepted"]
 

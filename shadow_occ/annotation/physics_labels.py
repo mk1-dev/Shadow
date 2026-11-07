@@ -28,6 +28,7 @@ class LabelConfig:
     require_temporal_contrast: bool = True
     require_independent_light: bool = True
     light_ids: tuple[int, ...] | None = None
+    allow_static_existence: bool = False
 
     def validate(self):
         for name in ("minimum_change_fraction", "minimum_flow_fraction", "minimum_cover",
@@ -200,15 +201,17 @@ def candidate_evidence(mask, maps, config):
     area = int(mask.sum())
     counts = {key: int(np.count_nonzero(mask & maps[key]))
               for key in ("onset", "recovery", "flow_supported", "same_patch_cycle")}
-    reasons = []
+    reasons, temporal_reasons = [], []
     if area < config.minimum_area:
         reasons.append("small_component")
     for key in ("onset", "recovery"):
         if counts[key] < max(config.minimum_change_pixels, config.minimum_change_fraction*area):
-            reasons.append(f"insufficient_{key}_static_dark_is_not_negative")
+            temporal_reasons.append(f"insufficient_{key}_static_dark_is_not_negative")
     if counts["flow_supported"]/max(area, 1) < config.minimum_flow_fraction:
         reasons.append("insufficient_flow_correspondence")
-    return {"area": area, **counts, "reasons": reasons}
+    return {"area": area, **counts, "existence_reasons": reasons.copy(),
+            "temporal_reasons": temporal_reasons,
+            "reasons": reasons if config.allow_static_existence else reasons+temporal_reasons}
 
 
 def trajectory_fit(footprints, mask, onset, recovery):
@@ -261,9 +264,10 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
         ranked = []
         for track in eligible:
             points = track["points"]
-            # Large turns can change shadows too, but are deliberately deferred here.
-            if min(np.linalg.norm(points[1, 0]-points[0, 0]),
-                   np.linalg.norm(points[2, 0]-points[1, 0])) < config.minimum_motion_m:
+            motion = min(np.linalg.norm(points[1, 0]-points[0, 0]),
+                         np.linalg.norm(points[2, 0]-points[1, 0]))
+            moving = motion >= config.minimum_motion_m
+            if not moving and not config.allow_static_existence:
                 continue
             try:
                 key = (track["instance_token"], light_id)
@@ -277,13 +281,15 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             except ValueError:
                 continue
             fit = trajectory_contrast(footprints, local_mask, onset, recovery)
-            shadow_fit_passes = fit["cover"] >= config.minimum_cover and fit["score"] >= config.minimum_score
-            shadow_passes = (fit["cover"] >= config.minimum_cover
+            existence_score = fit["cover"] if config.allow_static_existence else fit["score"]
+            shadow_fit_passes = fit["cover"] >= config.minimum_cover and existence_score >= config.minimum_score
+            shadow_passes = (moving and not report["temporal_reasons"] and fit["cover"] >= config.minimum_cover
                 and min(fit["onset_fit"], fit["recovery_fit"]) >= config.minimum_edge_fit
                 and fit["score"] >= config.minimum_score
                 and (not config.require_temporal_contrast or fit["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain))
             ranked.append({"instance_token": track["instance_token"], "light_id": light_id,
-                           **fit, "shadow_passes": bool(shadow_passes)})
+                           **fit, "existence_score": existence_score, "motion_supported": bool(moving),
+                           "minimum_step_motion_m": float(motion), "shadow_passes": bool(shadow_passes)})
             ranked[-1]["shadow_fit_passes"] = bool(shadow_fit_passes)
         ranked.sort(key=lambda item: (-item["score"], item["instance_token"]))
         if ranked:
@@ -294,7 +300,14 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             best["passes"] = bool(best["shadow_passes"] and best["caster_margin"] >= config.caster_margin)
             best["alternatives"] = ranked[1:]
             rankings.append(best)
-    if not any(item["shadow_passes"] for item in rankings):
+    explanations = [value for item in rankings for value in [item, *item["alternatives"]]]
+    report["projection_fit_hypotheses"] = sum(bool(item["shadow_fit_passes"]) for item in explanations)
+    report["static_projection_fit_hypotheses"] = sum(bool(item["shadow_fit_passes"] and not item["motion_supported"]) for item in explanations)
+    if config.allow_static_existence and not report["projection_fit_hypotheses"]:
+        report["reasons"].append("insufficient_observed_receiver_projection_fit")
+    elif config.allow_static_existence and not any(item["shadow_passes"] for item in explanations):
+        report["reasons"].append("projection_supported_owner_unresolved")
+    elif not any(item["shadow_passes"] for item in rankings):
         report["reasons"].append("no_shadow_fit_beats_temporal_controls")
     elif not any(item["passes"] for item in rankings):
         report["reasons"].append("shadow_fit_but_owner_unresolved")
@@ -383,14 +396,15 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
     if not fits:
         return {"shadow_accepted": False, "selected": None, "association": None,
                 "plausible_hypotheses": [], "reason": "insufficient_observed_receiver_projection_fit"}
-    fits.sort(key=lambda item: (-item["score"], item["light_id"], item["instance_token"]))
+    existence_score = lambda item: item.get("existence_score", item["score"])
+    fits.sort(key=lambda item: (-existence_score(item), item["light_id"], item["instance_token"]))
     best = fits[0]
-    plausible = [item for item in explanations if best["score"]-item["score"] < config.caster_margin]
+    plausible = [item for item in explanations if existence_score(best)-existence_score(item) < config.caster_margin]
     strict = select_shadow_and_caster(candidate, pool, directions, config, support_index=support_index)
     association = strict["association"]
     owners = {item["instance_token"] for item in plausible}
     if (len(owners) != 1 or association is None or association["instance_token"] not in owners
-            or best["score"]-association["score"] >= config.caster_margin):
+            or existence_score(best)-existence_score(association) >= config.caster_margin):
         association = None
     association_reason = "unique_contrast_and_shared_light_support"
     if not config.require_temporal_contrast or not config.require_independent_light:
@@ -404,7 +418,7 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
             association_reason = strict.get("association_reason", strict["reason"])
     light_scores = {}
     for item in fits:
-        light_scores[item["light_id"]] = max(light_scores.get(item["light_id"], -np.inf), item["score"])
+        light_scores[item["light_id"]] = max(light_scores.get(item["light_id"], -np.inf), existence_score(item))
     light_ids = sorted(light_scores)
     log_weights = np.asarray([light_scores[index]-max(light_scores.values()) for index in light_ids])/0.1
     weights = np.exp(log_weights)
@@ -412,6 +426,8 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
     return {"shadow_accepted": True, "selected": best, "association": association,
             "reason": "experimental_factorized_receiver_shadow_support",
             "association_reason": association_reason,
+            "existence_score": existence_score(best),
+            "existence_evidence": "static_projection" if best.get("motion_supported") is False else "moving_projection",
             "plausible_hypotheses": plausible,
             "light_weights": [{"light_id": index, "weight": float(weight)}
                               for index, weight in zip(light_ids, weights)],

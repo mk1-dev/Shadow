@@ -14,7 +14,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.bev_flow import bev_mask_to_image, image_mask_to_bev
-from shadow_occ.annotation.bev_teacher import PROTOCOL, endpoint_negative_masks, merge_trimaps
+from shadow_occ.annotation.bev_teacher import PROTOCOL, endpoint_negative_masks, lit_receiver_negative_mask, merge_trimaps
 from shadow_occ.annotation.data import checked_write_image, digest, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.physics_labels import light_bank, validate_window, window_tracks
 from shadow_occ.annotation.physics_motion import ground_homography
@@ -34,7 +34,7 @@ def load_receiver_evidence(path, sha256):
             "shadow_boundary_onset", "shadow_boundary_recovery", "learned_bev_receiver_support",
             "shadow_flow_supported", "appearance_local_ratio")
     with np.load(path, allow_pickle=False) as archive:
-        return {key: archive[key].copy() for key in keys}
+        return {key: archive[key].copy() for key in (*keys, "appearance_L_raw", "shadow_candidate") if key in archive.files}
 
 
 def main():
@@ -45,9 +45,14 @@ def main():
     parser.add_argument("--minimum-pixels", type=int, default=32)
     parser.add_argument("--minimum-lit-ratio", type=float, default=0.97)
     parser.add_argument("--negative-exclusion-root", help="Optional camera-image risk masks named <frame sample_data_token>.png")
+    parser.add_argument("--negative-policy", choices=["endpoints", "endpoints+lit-receivers"], default="endpoints+lit-receivers")
+    parser.add_argument("--lit-radius-m", type=float, default=12.0)
+    parser.add_argument("--lit-negative-ratio", type=float, default=2.0)
     args = parser.parse_args()
     if args.minimum_pixels < 1 or not 0.8 <= args.minimum_lit_ratio <= 1.5:
         raise ValueError("Invalid region size or lit-endpoint ratio")
+    if not np.isfinite([args.lit_radius_m, args.lit_negative_ratio]).all() or min(args.lit_radius_m, args.lit_negative_ratio) <= 0:
+        raise ValueError("Lit receiver radius and sample ratio must be positive")
     labels_root, base = Path(args.labels_root).resolve(), Path(args.pairs).resolve().parent
     output = Path(args.output_root).resolve()
     if output.exists() and any(output.iterdir()):
@@ -55,7 +60,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     pairs = {row["id"]: row for row in read_rows(args.pairs)}
     decisions = {row["id"]: row for row in read_rows(labels_root/"decisions.jsonl")}
-    frames, counts = defaultdict(list), Counter()
+    frames, counts, lit_windows = defaultdict(list), Counter(), set()
+    negative_audit = []
     starts = {(p["scene_name"], p["camera"], p["sample_token"]): p for p in pairs.values()}
     ends = {(p["scene_name"], p["camera"], p["next_sample_token"]): p for p in pairs.values()}
 
@@ -109,8 +115,9 @@ def main():
         grid = BEVGrid(**evidence["grid"])
         middle = right["frames"][0]
         positive_bev = image_mask_to_bev(target == 1, middle["projection_world_to_image"], arrays["receiver_world_xyz"])
+        positive_bev &= arrays["receiver_valid"]
         tracks, _ = window_tracks(left, right)
-        endpoint_frames = {0: left["frames"][0], 2: right["frames"][1]}
+        endpoint_frames = {0: left["frames"][0], 1: middle, 2: right["frames"][1]}
         exclusions = {}
         if args.negative_exclusion_root:
             for slot, frame in endpoint_frames.items():
@@ -125,11 +132,38 @@ def main():
             decision["shadow_decision"]["plausible_hypotheses"], minimum_lit_ratio=args.minimum_lit_ratio,
             frame_volumes={slot: frame.get("object_volumes_world", []) for slot, frame in endpoint_frames.items()},
             exclusion_masks=exclusions)
+        negative_audit.append({"parent_id": row["id"], "pair_ids": row["physics_pair_ids"], "endpoints": details})
         row = {**row, "physics_protocol": PROTOCOL}
         row["regions"] = [{**region, "id": f"{row['id']}:{region['id']}", "bev_flow": evidence, "teacher_evidence": {"kind": "selected_shadow",
             "parent_id": row["id"]}, **{key: row[key] for key in CASTER_FIELDS if key in row}} for region in row["regions"]]
         add(row, target)
         counts["accepted_shadow_regions"] += 1
+        window = tuple(row["physics_pair_ids"])
+        if args.negative_policy == "endpoints+lit-receivers" and window not in lit_windows:
+            lit_bev, lit_details = lit_receiver_negative_mask(arrays, positive_bev, tracks, left["plane_world"],
+                light_bank(), decision["shadow_decision"]["plausible_hypotheses"], resolution=grid.resolution,
+                volumes=middle.get("object_volumes_world", []), exclusion=exclusions.get(1),
+                minimum_lit_ratio=args.minimum_lit_ratio, radius_m=args.lit_radius_m, negative_ratio=args.lit_negative_ratio)
+            negative_audit.append({"parent_id": row["id"], "pair_ids": row["physics_pair_ids"], "lit_receiver": lit_details})
+            ground = cv2.imread(str(resolve_path(middle["ground_support"], base)), cv2.IMREAD_GRAYSCALE)
+            lit = bev_mask_to_image(lit_bev, middle["projection_world_to_image"], arrays["ground_basis_world"], grid, ground.shape) & (ground > 0)
+            counts[f"lit_receiver:{lit_details['reason']}"] += 1
+            if lit.sum() >= args.minimum_pixels:
+                negative = np.full(lit.shape, 255, np.uint8)
+                negative[lit] = 0
+                identifier = f"{row['id']}:lit_receiver"
+                add({"id": identifier, "scene_name": row["scene_name"], "camera": row["camera"],
+                    "official_split": row["official_split"], "sample_token": row["sample_token"],
+                    "timestamp": row["timestamp"], "image": row["image"], "ground_support": row["ground_support"],
+                    "label_source": "temporal_weak", "physics_protocol": PROTOCOL, "physics_export_enabled": True,
+                    "bev_flow": evidence, "regions": [{"id": identifier, "shadow_label": "NO",
+                        "label_source": "temporal_weak", "bev_flow": evidence,
+                        "teacher_evidence": {"kind": "observed_lit_receiver", "parent_id": row["id"], **lit_details},
+                        "association_source": "unresolved", "association_status": "not_applicable"}]}, negative)
+                lit_windows.add(window)
+                counts["lit_receiver_regions"] += 1
+            else:
+                counts["lit_receiver_negative_too_small"] += 1
         for slot, frame, token in ((0, left["frames"][0], left["sample_token"]),
                                     (2, right["frames"][1], right["next_sample_token"])):
             ground = cv2.imread(str(resolve_path(frame["ground_support"], base)), cv2.IMREAD_GRAYSCALE)
@@ -180,7 +214,7 @@ def main():
                 path = output/"regions"/f"{stem}.png"
                 checked_write_image(path, mask.astype(np.uint8)*255)
                 regions.append({**region, "id": stem, "mask": str(path), "mask_sha256": digest(path),
-                    "proposal_source": "bev_flow_selected_receiver" if value else "bev_flow_lit_endpoint"})
+                    "proposal_source": "bev_flow_selected_receiver" if value else f"bev_flow_{region['teacher_evidence']['kind']}"})
         if not regions:
             continue
         record = {**parent, "id": identifier, "shadow_mask": str(target_path), "mask_encoding": "trimap",
@@ -198,14 +232,15 @@ def main():
         counts["known_shadow_pixels"] += int((target == 1).sum())
         counts["known_lit_pixels"] += int((target == 0).sum())
     write_rows(output/"canonical.jsonl", canonical)
+    write_rows(output/"negative_audit.jsonl", negative_audit)
     write_json(output/"protocol.json", {**vars(args), "protocol": PROTOCOL, "counts": dict(counts),
         "pair_manifest_sha256": digest(args.pairs), "decisions_sha256": digest(labels_root/"decisions.jsonl"),
-        "negative_source": "same receiver observed brighter at an endpoint and outside competing projected shadows",
+        "negative_source": "observed lit endpoints plus compact persistently lit neighbouring receivers outside competing shadows",
         "negative_exclusion_scope": "all annotated endpoint volumes plus optional static-risk masks; not exhaustive unannotated casters",
         "unknown_policy": "all other pixels ignored", "image_policy": "original camera images for BOTH classes"})
     print(dict(counts), flush=True)
     if not canonical or not counts["known_shadow_pixels"] or not counts["known_lit_pixels"]:
-        raise RuntimeError("New BEV-flow teacher needs both observed shadow and lit-endpoint pixels; inspect protocol.json")
+        raise RuntimeError("BEV-flow teacher needs observed shadow and lit-receiver pixels; inspect protocol.json for separate positive/negative counts")
 
 
 if __name__ == "__main__":

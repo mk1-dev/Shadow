@@ -19,7 +19,7 @@ from shadow_occ.annotation.data import (
 )
 from shadow_occ.utils.io import write_json
 from shadow_occ.annotation.temporal import warp
-from shadow_occ.annotation.bev_teacher import PROTOCOL as BEV_TEACHER_PROTOCOL
+from shadow_occ.annotation.bev_teacher import TEACHER_PROTOCOLS
 
 
 def crop_bounds(box, shape, scale):
@@ -81,7 +81,7 @@ def main() -> None:
         if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
             raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
         if row.get("physics_protocol") and (row["physics_protocol"] not in {
-                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3", BEV_TEACHER_PROTOCOL}
+                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3", *TEACHER_PROTOCOLS}
                 or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
             raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
         if row.get("caster_id"):
@@ -117,7 +117,7 @@ def main() -> None:
         if row.get("physics_protocol"):
             if digest(resolve_path(row["shadow_mask"], base)) != row["physics_target_sha256"]:
                 raise ValueError("Physics trimap changed after weak-label export")
-            if np.any(target == 0) and row["physics_protocol"] != BEV_TEACHER_PROTOCOL:
+            if np.any(target == 0) and row["physics_protocol"] not in TEACHER_PROTOCOLS:
                 raise ValueError("This physics protocol does not supply negative shadow labels")
         stem = hashlib.sha256(identifier.encode()).hexdigest()[:24]
         target_path = output / "targets" / f"{stem}.png"
@@ -198,10 +198,11 @@ def main() -> None:
             if not mask.any():
                 counts["empty_regions"] += 1
                 continue
-            if row.get("physics_protocol") == BEV_TEACHER_PROTOCOL:
+            if row.get("physics_protocol") in TEACHER_PROTOCOLS:
                 expected = 1 if region["shadow_label"] == "YES" else 0
                 kind = region.get("teacher_evidence", {}).get("kind")
-                if kind != ("selected_shadow" if expected else "observed_lit_endpoint") or not np.all(target[mask] == expected):
+                kinds = {"selected_shadow"} if expected else {"observed_lit_endpoint", "observed_lit_receiver"}
+                if kind not in kinds or not np.all(target[mask] == expected):
                     raise ValueError("BEV teacher region and observed trimap disagree")
                 if not region.get("bev_flow", {}).get("selection"):
                     raise ValueError("BEV teacher region lacks learned receiver selection")

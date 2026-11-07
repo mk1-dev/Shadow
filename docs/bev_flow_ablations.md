@@ -22,7 +22,9 @@ Recipes are in `configs/bev_flow_ablations.json`.
 
 | Arm | Difference from full |
 |---|---|
-| `full` | Aligned temporal BEV cosine >= 0.3, DIS, factorized-v3, intersection |
+| `full` | Aligned temporal BEV cosine >= 0.3, DIS, static/dynamic factorized-v3, consensus |
+| `without_static` | Disable static existence only; fusion and negative policy unchanged |
+| `legacy_motion` | Old dynamic-only existence, all-explanation intersection and endpoints only |
 | `geometry_only` | No learned feature gate; geometry, DIS and illumination unchanged |
 | `current_only` | Independently exported current-only encoder features; same three-frame gate |
 | `shuffled` | Independently permute valid spatial features in each frame before cosine |
@@ -36,7 +38,7 @@ Recipes are in `configs/bev_flow_ablations.json`.
 | `physics_contrast` | Add true-vs-wrong-time contrast to `physics_bank` |
 | `physics_shared` | Add independent-track light support to `physics_contrast` |
 | `best_projection` | Keep pixels supported by the single best physical explanation |
-| `consensus_projection` | Keep pixels supported by >= 2/3 near-best explanations instead of all |
+| `intersection_projection` | Require all near-best explanations instead of the full arm's 2/3 consensus |
 
 `matched_random` holds final selected-cell count fixed BEFORE connected components
 and caster matching. It does not force equal final label counts. All corruption
@@ -56,6 +58,9 @@ It is not the best direction selected independently for each eval component.
 ## Run on Existing HPC Caches
 
 Wait for data preparation to finish. No existing labels/checkpoints are overwritten.
+For caches prepared before the static-existence fix, first run
+[the CPU static-label rebuild](static_shadow_rebuild.md) and use its output as the
+source root. Old receiver masks already suppressed exposure-failed static windows.
 The first six arms reuse `pairs`, `flow`, and the stored photometric/learned evidence.
 Derived windows keep gates/cosines, not another copy of the large sampled BEV
 feature tensor for every arm. The original frozen cache remains the shared source.
@@ -78,7 +83,7 @@ and flow experiments, change the variant list and use a new output directory:
 
 ```bash
 export SHADOW_ABLATION_ROOT="${SHADOW_ABLATION_SOURCE}_physics_flow_seed0"
-export SHADOW_ABLATION_VARIANTS="full geometry_only geometry_no_dis geometry_no_dis_bev physics_fixed physics_bank physics_contrast physics_shared best_projection consensus_projection"
+export SHADOW_ABLATION_VARIANTS="full without_static geometry_only geometry_no_dis geometry_no_dis_bev physics_fixed physics_bank physics_contrast physics_shared best_projection intersection_projection"
 sbatch --partition=YOUR_CPU_PARTITION slurm/run_bev_flow_ablations.slurm
 ```
 

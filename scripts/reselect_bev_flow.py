@@ -48,11 +48,17 @@ def main():
         events = {"shadow_boundary_onset": delta[0] <= -threshold,
                   "shadow_boundary_recovery": delta[1] >= threshold,
                   "shadow_same_patch_cycle": (delta[0] <= -threshold) & (delta[1] >= threshold)}
+        comparable = arrays.get("temporal_exposure_valid", row.get("exposure_comparable", True))
         for key, event in events.items():
-            arrays[f"{key}_photometric"] = event & original
-        if args.feature_root:
+            arrays[f"{key}_photometric"] = event & original & comparable
+        feature_root = args.feature_root
+        if args.feature_gate == "shuffled" and "learned_bev_receiver_features" not in arrays:
+            feature_root = feature_root or protocol.get("feature_root")
+            if not feature_root:
+                raise ValueError("Shuffled features need the original --feature-root cache")
+        if feature_root:
             previous_sources = row.get("learned_bev", {}).get("sources", [])
-            arrays, row = attach_cached_bev(arrays, row, args.feature_root)
+            arrays, row = attach_cached_bev(arrays, row, feature_root)
             for old, new in zip(previous_sources, row["learned_bev"]["sources"]):
                 for key in ("checkpoint_sha256", "model_config_sha256"):
                     if old.get(key) != new.get(key):
@@ -75,7 +81,8 @@ def main():
         "source_protocol_sha256": digest(protocol_path),
         "source_windows_sha256": digest(source/"windows.jsonl"),
         "receiver_feature_storage": "shared source cache; derived evidence keeps gate results only",
-        "feature_cache_protocol_sha256": digest(Path(args.feature_root)/"cache_protocol.json") if args.feature_root
+        "feature_root": str(feature_root) if feature_root else protocol.get("feature_root"),
+        "feature_cache_protocol_sha256": digest(Path(feature_root)/"cache_protocol.json") if feature_root
             else protocol.get("feature_cache_protocol_sha256"),
         "ablation_scope": "identical geometry, images, illumination and exposure; configurable final gates"})
 

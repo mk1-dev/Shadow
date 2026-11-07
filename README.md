@@ -38,15 +38,19 @@ it does not read `outputs_temporal`, `shadow_labels`, old segmenters or adapters
 Frozen BEV temporal cosine (default >= 0.3) AND registered receiver flow actually
 filter the photometric candidates before caster/light matching.
 
-The new `bev-flow-annotation-v1` teacher exports positive observed shadows and
-weak negative endpoints only where that receiver visibly brightens/darkens,
-looks locally lit at the endpoint, and lies outside competing tracked shadow
-footprints. Other pixels remain IGNORE. Labels from the same physical frame are
+The new `bev-flow-annotation-v2` teacher exports positive observed shadows and
+weak negative endpoints and compact persistently lit neighbouring receivers outside
+competing shadow footprints. Static dark receivers can support shadow existence
+through projection even without vehicle motion or reliable exposure compensation;
+unique caster ownership still uses motion/time contrast. Other pixels remain IGNORE. Labels from the same physical frame are
 merged; contradictory pixels are ignored. Both classes use original camera
 images. VLM examples have the same five-view layout for both classes; boundary
 frames without two adjacent observations contribute only to segmentation.
 
 Set actual HPC paths and use the existing working mature-model environment:
+
+The [static-shadow rebuild workflow](docs/static_shadow_rebuild.md) fixes the
+zero-label failure of job 367774 and reuses existing flow/BEV caches on CPU.
 
 ```bash
 cd /public/home/eng_zhihongli/project/Shadow_update
