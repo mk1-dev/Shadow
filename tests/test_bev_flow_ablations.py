@@ -33,22 +33,22 @@ def receivers():
 
 def test_geometry_only_gate_needs_no_learned_arrays():
     arrays = {key: value for key, value in receivers().items() if not key.startswith("learned")}
-    result, meta = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="none")
+    result, meta = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="none", discovery_mode="hard-intersection")
     assert result["shadow_candidate"].sum() == 16
     assert meta["learned_bev_selection"]["feature_gate"] == "none"
 
 
 def test_repeated_gate_uses_unfiltered_candidates_and_transitions():
-    arrays, meta = select_bev_flow_receivers(receivers(), {"counts": {}}, .3)
+    arrays, meta = select_bev_flow_receivers(receivers(), {"counts": {}}, .3, discovery_mode="hard-intersection")
     assert arrays["shadow_candidate"].sum() == 8
-    arrays, _ = select_bev_flow_receivers(arrays, meta, -.99, feature_gate="none")
+    arrays, _ = select_bev_flow_receivers(arrays, meta, -.99, feature_gate="none", discovery_mode="hard-intersection")
     assert arrays["shadow_candidate"].sum() == 16
     assert arrays["shadow_boundary_onset"].sum() == 16
 
 
 def test_random_gate_matches_aligned_coverage_and_repeats_by_seed():
-    result, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="matched-random", seed=17)
-    repeated, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="matched-random", seed=17)
+    result, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="matched-random", seed=17, discovery_mode="hard-intersection")
+    repeated, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="matched-random", seed=17, discovery_mode="hard-intersection")
     assert result["shadow_candidate"].sum() == 8
     np.testing.assert_array_equal(result["shadow_candidate"], repeated["shadow_candidate"])
 
@@ -56,17 +56,17 @@ def test_random_gate_matches_aligned_coverage_and_repeats_by_seed():
 def test_flow_gate_can_be_restored_after_removal():
     arrays = receivers()
     arrays["shadow_flow_supported"][:2] = False
-    arrays, meta = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="none", flow_gate=False)
+    arrays, meta = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="none", flow_gate=False, discovery_mode="hard-intersection")
     assert arrays["shadow_candidate"].sum() == 16
-    arrays, _ = select_bev_flow_receivers(arrays, meta, feature_gate="none", flow_gate=True)
+    arrays, _ = select_bev_flow_receivers(arrays, meta, feature_gate="none", flow_gate=True, discovery_mode="hard-intersection")
     assert arrays["shadow_candidate"].sum() == 8
 
 
 def test_shuffled_gate_is_deterministic_and_not_in_place_feature_corruption():
     arrays = receivers()
     original = arrays["learned_bev_receiver_features"].copy()
-    result, _ = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="shuffled", seed=3)
-    other, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="shuffled", seed=3)
+    result, _ = select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="shuffled", seed=3, discovery_mode="hard-intersection")
+    other, _ = select_bev_flow_receivers(receivers(), {"counts": {}}, feature_gate="shuffled", seed=3, discovery_mode="hard-intersection")
     np.testing.assert_array_equal(result["shadow_candidate"], other["shadow_candidate"])
     np.testing.assert_array_equal(arrays["learned_bev_receiver_features"], original)
 
@@ -140,7 +140,7 @@ def test_pixel_pr_curve_and_ap_use_class_ties_not_accuracy():
 def test_cached_reselection_restores_old_filtered_transitions_without_feature_copies(tmp_path, monkeypatch):
     import sys
 
-    arrays, row = select_bev_flow_receivers(receivers(), {"id": "window", "counts": {}}, .3)
+    arrays, row = select_bev_flow_receivers(receivers(), {"id": "window", "counts": {}}, .3, discovery_mode="hard-intersection")
     arrays["temporal_illumination_change_L"] = np.stack([np.full((4, 4), -10), np.full((4, 4), 10)])
     for key in list(arrays):
         if key.endswith("_photometric") and key != "shadow_candidate_photometric":
@@ -153,7 +153,7 @@ def test_cached_reselection_restores_old_filtered_transitions_without_feature_co
     write_json(source/"bev_flow_protocol.json", {"config": {"light_threshold_L": 6}})
     output = tmp_path/"none"
     monkeypatch.setattr(sys, "argv", ["reselect", "--source-root", str(source), "--output-root", str(output),
-                                     "--feature-gate", "none", "--mature-object-mode", "off"])
+                                     "--feature-gate", "none", "--mature-object-mode", "off", "--discovery-mode", "hard-intersection"])
     script("reselect_bev_flow").main()
     result = read_rows(output/"windows.jsonl")[0]
     with np.load(result["evidence"], allow_pickle=False) as archive:

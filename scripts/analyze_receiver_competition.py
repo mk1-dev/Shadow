@@ -184,6 +184,7 @@ def main():
                "transition_diagnostics": item.get("transition_diagnostics"),
                "projection_transition_diagnostics": projection_transition_diagnostics(item.get("hypotheses", [])),
                "mature_image_motion": (item.get("bev_flow") or {}).get("mature_image_motion"),
+               "discrepancy_evidence": (item.get("bev_flow") or {}).get("discrepancy_evidence"),
                "projection_control_gain": evidence["projection_control_gain"],
                "trajectory_control_gain": evidence["trajectory_control_gain"],
                "baseline_accepted": baseline["shadow_accepted"],
@@ -250,6 +251,18 @@ def main():
                                             if value.get("proposal_darkness_ratio") is not None}),
         "scope": "unique BEV windows; component rows repeat their source-window proposal counts"})
     raw_events = [row["raw_transition_events"] or {} for row in rows]
+    discovery_windows = [row["discrepancy_discovery"] for row in caster_windows.values() if row.get("discrepancy_discovery")]
+    novel_rows = [row for row in rows if (row["discrepancy_evidence"] or {}).get("novel_before_caster_pixels", 0) > 0]
+    discrepancy_summary = {"windows": len(discovery_windows),
+        "source_counts": {str(code): sum((row.get("proposal_source_counts") or {}).get(str(code), 0)
+            for row in caster_windows.values()) for code in range(1, 8)},
+        "branch_proposed_pixels": sum(row["candidate_cells"] for row in discovery_windows),
+        "novel_before_caster_pixels": sum(row["novel_cells"] for row in discovery_windows),
+        "exclusive_after_caster_pixels": sum(row.get("discrepancy_exclusive_pixels", 0) for row in caster_windows.values()),
+        "components_with_novel_proposals": len(novel_rows),
+        "physics_supported_components_with_novel_proposals": sum(row["competition_supported"] for row in novel_rows),
+        "exported_components_with_novel_proposals": sum(row["exported_positive"] for row in novel_rows),
+        "scope": "proposal pixels summed over unique windows; mixed-component acceptance is not accepted novel-pixel truth"}
     long_states = Counter(row["long_window_track_state"] or "no_best_projection" for row in rows)
     track_windows = {row["window_id"]: row.get("track_state_counts") for row in window_audit
                      if row.get("status") == "caster_proposals" and row.get("track_state_counts")}
@@ -260,6 +273,7 @@ def main():
         "transition_counter_scope": "observed_transition_components and long_event_components below are conditional on best_projection",
         "score_protocols": dict(Counter(row["score_protocol"] for row in rows)),
         "caster_proposals": caster_summary,
+        "discrepancy_proposals": discrepancy_summary,
         "raw_event_components": sum(value.get("observed_transition_types", 0) > 0 for value in raw_events),
         "raw_formation_pixels": sum(value.get("formation_pixels", 0) for value in raw_events),
         "raw_recovery_pixels": sum(value.get("recovery_pixels", 0) for value in raw_events),

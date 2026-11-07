@@ -7,9 +7,11 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from shadow_occ.annotation.data import digest
+from shadow_occ.annotation.data import digest, read_rows, resolve_path
 from shadow_occ.utils.io import write_json
 
 
@@ -18,14 +20,27 @@ def main():
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--config", default=str(ROOT/"configs/bev_flow_ablations.json"))
-    parser.add_argument("--variants", nargs="+", default=["full", "without_mature_3d", "projection_coverage", "geometry_only", "shuffled"])
+    parser.add_argument("--variants", nargs="+", default=["hard_intersection", "appearance_only", "discrepancy_proposal", "bidirectional_proposal"])
     parser.add_argument("--current-cache-root", help="Contains train/ and val/ caches exported with --history-mode current-only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--labels-only", action="store_true", help="Skip segmenter/VLM dataset crop generation")
+    parser.add_argument("--audit-only", action="store_true", help="Stop after physical label diagnostics; no teacher or training datasets")
     parser.add_argument("--light-prior-manifest")
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    frozen_inputs = {}
+    if config.get("protocol") == "discrepancy-discovery-abcd-v1":
+        for split in ("train", "val"):
+            cache = source/split/"bev_flow"
+            windows = read_rows(cache/"windows.jsonl")
+            required = {"observed_flow_valid_by_interval", "expected_geometric_flow_px", "observed_optical_flow_px"}
+            for row in windows:
+                with np.load(resolve_path(row["evidence"], cache), allow_pickle=False) as archive:
+                    if not required.issubset(archive.files):
+                        raise ValueError("Frozen entity-motion audit requires raw flow validity; rebuild receivers from cached pairs/flow first")
+            frozen_inputs[split] = {"windows": len(windows), "windows_sha256": digest(cache/"windows.jsonl"),
+                "protocol_sha256": digest(cache/"bev_flow_protocol.json")}
     if len(set(args.variants)) != len(args.variants) or any(name not in config["variants"] for name in args.variants):
         parser.error("Select unique named variants from the config")
     if output.exists() and any(output.iterdir()):
@@ -39,6 +54,9 @@ def main():
         ROOT/"scripts/build_bev_flow_annotation_manifest.py", ROOT/"shadow_occ/annotation/cached_bev.py",
         ROOT/"shadow_occ/annotation/physics_labels.py", ROOT/"shadow_occ/annotation/bev_teacher.py",
         ROOT/"shadow_occ/annotation/caster_window.py",
+        ROOT/"shadow_occ/annotation/cross_space.py",
+        ROOT/"shadow_occ/annotation/discrepancy_proposals.py",
+        ROOT/"scripts/analyze_receiver_competition.py", ROOT/"scripts/summarize_bev_flow_ablations.py",
         ROOT/"shadow_occ/annotation/physics_motion.py", ROOT/"shadow_occ/annotation/receiver_explanations.py",
         ROOT/"shadow_occ/annotation/mature_objects.py"]}
 
@@ -49,6 +67,8 @@ def main():
 
     for name in args.variants:
         recipe = {"feature_gate": "aligned", "flow_gate": "registered", "minimum_bev_cosine": 0.3,
+            "discovery_mode": "discrepancy", "discrepancy_minimum_score": .35,
+            "discrepancy_minimum_light_change": 1.5, "discrepancy_flow_scale": 3.0,
             "registration": "geometry-dis",
             "decision_policy": "factorized-v3", "light_search": "bank", "fixed_light_id": 0,
             "trajectory_contrast": "on", "independent_light": "on", "positive_fusion": "consensus",
@@ -56,8 +76,10 @@ def main():
             "appearance_prior_weight": 0.2,
             "mature_object_mode": "required",
             "candidate_source": "caster", "temporal_radius": 3,
+            "proposal_entity_motion": "on", "verification_evidence": "native", "caster_motion_control": "observed",
+            "minimum_bev_area_m2": .5, "max_components_per_window": 50,
             "caster_proposal_darkness_ratio": .92,
-            "consensus_fraction": 2/3, **config["variants"][name]}
+            "consensus_fraction": 2/3, **config.get("shared", {}), **config["variants"][name]}
         recipe.setdefault("receiver_competition", "off" if recipe["decision_policy"] == "strict-v2" else "on")
         recipe.setdefault("temporal_evidence", "complete" if recipe["decision_policy"] == "strict-v2" else "available")
         recipe.setdefault("light_prior_mode", "on" if args.light_prior_manifest else "off")
@@ -65,6 +87,8 @@ def main():
         root.mkdir()
         write_json(root/"ablation_protocol.json", {"variant": name, "recipe": recipe, "seed": args.seed,
             "source_root": str(source), "config_sha256": digest(args.config),
+            "audit_only": args.audit_only,
+            "frozen_inputs": frozen_inputs,
             "code_sha256": code_hashes,
             "evaluation_policy": "same official scene split and independent reference; no per-variant eval tuning"})
         teacher_ready = True
@@ -72,6 +96,9 @@ def main():
             origin, target = source/split, root/split
             analysis_root = origin/"flow"
             replacement = []
+            proposal_args = [value for key in ("discrepancy_minimum_score", "discrepancy_minimum_light_change", "discrepancy_flow_scale")
+                             for value in ("--"+key.replace("_", "-"), recipe[key])]
+            proposal_args += ["--proposal-entity-motion", recipe["proposal_entity_motion"]]
             if recipe.get("feature_cache") == "current-only":
                 cache = Path(args.current_cache_root).resolve()/split
                 cache_protocol = json.loads((cache/"cache_protocol.json").read_text(encoding="utf-8"))
@@ -94,16 +121,18 @@ def main():
                     "--extent-m", geometry["extent_m"], "--resolution-m", geometry["resolution_m"],
                     "--light-threshold", geometry["light_threshold_L"],
                     "--feature-gate", recipe["feature_gate"], "--flow-gate", recipe["flow_gate"],
+                    "--discovery-mode", recipe["discovery_mode"],
                     "--object-root", object_root, "--mature-object-mode", recipe["mature_object_mode"],
-                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *features, *prior_args)
+                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *proposal_args, *features, *prior_args)
             else:
                 run("reselect_bev_flow.py", "--source-root", origin/"bev_flow", "--output-root", target/"bev_flow",
                     "--feature-gate", recipe["feature_gate"], "--flow-gate", recipe["flow_gate"],
+                    "--discovery-mode", recipe["discovery_mode"],
                     "--mature-object-mode", recipe["mature_object_mode"],
-                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *replacement)
+                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *proposal_args, *replacement)
             options = [value for key in ("decision_policy", "light_search", "fixed_light_id", "trajectory_contrast",
                 "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight",
-                "temporal_evidence")
+                "temporal_evidence", "verification_evidence", "caster_motion_control", "minimum_bev_area_m2", "max_components_per_window")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
             options += ["--candidate-source", recipe["candidate_source"], "--temporal-radius", recipe["temporal_radius"],
                         "--caster-proposal-darkness-ratio", recipe["caster_proposal_darkness_ratio"]]
@@ -119,6 +148,10 @@ def main():
             if recipe["receiver_competition"] != "off":
                 run("analyze_receiver_competition.py", "--labels-root", target/"labels",
                     "--output-root", target/"competition")
+            if args.audit_only or recipe["caster_motion_control"] != "observed":
+                teacher_ready = False
+                results.append({"variant": name, "split": split, "status": "audit_complete"})
+                continue
             if summary["stage_counts"]["accepted_shadow"] == 0:
                 teacher_ready = False
                 results.append({"variant": name, "split": split, "status": "zero_accepted_shadow"})

@@ -213,9 +213,11 @@ def candidate_evidence(mask, maps, config):
     for key in ("onset", "recovery"):
         if counts[key] < max(config.minimum_change_pixels, config.minimum_change_fraction*area):
             temporal_reasons.append(f"insufficient_{key}_static_dark_is_not_negative")
-    if counts["flow_supported"]/max(area, 1) < config.minimum_flow_fraction:
+    correspondence = maps["flow_supported"] | maps.get("geometric_correspondence", np.zeros_like(mask))
+    if np.count_nonzero(mask & correspondence)/max(area, 1) < config.minimum_flow_fraction:
         reasons.append("insufficient_flow_correspondence")
     return {"area": area, **counts, "existence_reasons": reasons.copy(),
+            "geometric_correspondence": int(np.count_nonzero(mask & maps.get("geometric_correspondence", np.zeros_like(mask)))),
             "temporal_reasons": temporal_reasons,
             "reasons": reasons if config.allow_static_existence else reasons+temporal_reasons}
 

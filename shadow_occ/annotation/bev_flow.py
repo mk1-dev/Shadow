@@ -199,6 +199,10 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "appearance_local_ratio": np.where(receiver[None], local_ratio, np.nan),
         "expected_geometric_flow_px": np.stack(expected), "observed_optical_flow_px": np.stack(observed),
         "flow_residual_px": np.stack(residual), "flow_reliability": np.stack(reliability),
+        "observed_flow_valid_by_interval": np.stack(sampled_flow_valid)
+            & visible[:-1] & visible[1:]
+            & np.isfinite(np.stack(sampled_flows)).all(axis=-1),
+        "appearance_chroma_change": chroma.astype(np.float32),
         "explanation_state": state, "illumination_event": changed,
         "shadow_boundary_onset": onset & candidate, "shadow_boundary_recovery": recovery & candidate,
         "shadow_candidate": candidate, "shadow_flow_supported": flow_support,
@@ -216,6 +220,7 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
     for key, values in object_flows.items():
         arrays[f"box_landmark_{key}"] = np.asarray(values, np.float32).reshape(-1, 2, 9, 2)
     metadata = {"protocol": "bev-flow-discrepancy-v1", "receiver_explanation_protocol": RECEIVER_PROTOCOL,
+        "discovery_config": {"light_threshold_L": config.light_threshold_L, "darkness_ratio": config.darkness_ratio},
         "receiver_observation_legend": OBSERVATION_STATES,
         "pair_ids": [left["id"], right["id"]],
         "scene_name": left["scene_name"], "camera": left["camera"], "official_split": left["official_split"],

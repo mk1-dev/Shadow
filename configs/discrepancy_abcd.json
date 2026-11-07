@@ -1,0 +1,29 @@
+{
+  "protocol": "discrepancy-discovery-abcd-v1",
+  "shared": {
+    "candidate_source": "caster",
+    "mature_object_mode": "required",
+    "verification_evidence": "geometry",
+    "caster_motion_control": "observed",
+    "proposal_entity_motion": "on",
+    "receiver_competition": "on",
+    "decision_policy": "factorized-v3",
+    "existence_mode": "static-dynamic",
+    "temporal_evidence": "available",
+    "positive_fusion": "consensus",
+    "temporal_radius": 3,
+    "discrepancy_minimum_score": 0.35,
+    "discrepancy_minimum_light_change": 1.5,
+    "discrepancy_flow_scale": 3.0,
+    "minimum_bev_area_m2": 0.5,
+    "max_components_per_window": 50
+  },
+  "variants": {
+    "A_hard": {"discovery_mode": "hard-intersection"},
+    "B_cross": {"discovery_mode": "cross-space"},
+    "C_discrepancy": {"discovery_mode": "discrepancy"},
+    "D_no_entity_motion": {"discovery_mode": "discrepancy", "proposal_entity_motion": "off"},
+    "C_bev_shuffled": {"discovery_mode": "discrepancy", "feature_gate": "shuffled"},
+    "C_gt_reverse": {"discovery_mode": "discrepancy", "caster_motion_control": "reverse-time"}
+  }
+}

@@ -59,9 +59,17 @@ def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cach
     original = arrays["shadow_candidate"].copy()
     # This caster-conditioned pool is built from observed signals directly. It is
     # intentionally not defined as a subset of the photometric candidate mask.
-    caster_pool = roi & dark & learned & flow
+    cross_space = "cross_space_receiver" in arrays
+    caster_pool = roi & dark & arrays["cross_space_receiver"] if cross_space else roi & dark & learned & flow
     added = caster_pool & ~original
     arrays["shadow_candidate"] = original | caster_pool if expand else original
+    if "proposal_source_bits" in arrays:
+        arrays["discrepancy_caster_candidate"] = caster_pool if expand else np.zeros_like(receiver)
+        if expand:
+            arrays["proposal_source_bits"][caster_pool] |= 4
+        arrays["discrepancy_exclusive_candidate"] = arrays["proposal_source_bits"] == 2
+    source_counts = ({str(code): int((arrays["proposal_source_bits"] == code).sum()) for code in range(1, 8)}
+                     if "proposal_source_bits" in arrays else None)
     pixel_counts = {
         "caster_roi_pixels": int(roi.sum()),
         "caster_roi_receiver_pixels": int((roi & receiver).sum()),
@@ -75,7 +83,11 @@ def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cach
     return roi, {"original_pixels": int(original.sum()), **pixel_counts,
         "added_observed_pixels": int(added.sum()) if expand else 0,
         "proposal_darkness_ratio": float(proposal_darkness_ratio),
-        "scope": "GT/light ROI proposes a separate observed dark/receiver/BEV/flow pool; projection never creates positive pixels"}
+        "discovery_mode": "discrepancy" if "discrepancy_candidate" in arrays else "cross-space" if cross_space else "hard-intersection",
+        "discrepancy_exclusive_pixels": int(arrays["discrepancy_exclusive_candidate"].sum())
+            if "discrepancy_exclusive_candidate" in arrays else 0,
+        "proposal_source_counts": source_counts,
+        "scope": "GT/light ROI proposes observed dark receivers; projection never creates positive pixels"}
 
 
 def summarize_track_states(states, inconsistent, samples):
@@ -119,15 +131,20 @@ def receiver_chain_support(visible, flow, middle, index):
     return overlap, support, steps
 
 
-def long_transition_evidence(observations, visible, flow, middle, roi):
-    """Keep the event rule unchanged; expose every upstream support loss separately."""
+def long_transition_evidence(observations, visible, flow, middle, roi, *, correspondence="flow-chain"):
+    """Test signed brightness changes with an explicit correspondence policy."""
     onset, recovery = np.zeros_like(visible), np.zeros_like(visible)
     raw, normalized_events, supports = (np.zeros_like(visible) for _ in range(3))
+    registered_supports = np.zeros_like(visible)
     exposures, diagnostics = [], []
     config = EvidenceConfig()
+    if correspondence not in {"flow-chain", "geometry-pair"}:
+        raise ValueError(f"Unknown receiver correspondence: {correspondence}")
     for index in range(len(observations)):
-        overlap, support, step_support = receiver_chain_support(visible, flow, middle, index)
+        overlap, registered, step_support = receiver_chain_support(visible, flow, middle, index)
+        support = overlap if correspondence == "geometry-pair" else registered
         supports[index] = support
+        registered_supports[index] = registered
         background = support & ~roi
         fit = exposure_fit(observations[index], observations[middle], background, config)
         exposures.append(fit)
@@ -158,7 +175,8 @@ def long_transition_evidence(observations, visible, flow, middle, roi):
             stage = "observed_event"
         diagnostics.append({"frame_index": index, "is_reference": index == middle,
             "visible_pixels": int(visible[index].sum()), "visible_overlap_pixels": int(overlap.sum()),
-            "flow_supported_pixels": int(support.sum()), "flow_chain": step_support,
+            "flow_supported_pixels": int(registered.sum()), "flow_chain": step_support,
+            "correspondence_policy": correspondence, "correspondence_supported_pixels": int(support.sum()),
             "roi_excluded_pixels": int((support & roi).sum()),
             "minimum_background_pixels": config.min_background, "exposure": fit,
             "raw_darkening_pixels": int(raw[index].sum()),
@@ -166,7 +184,8 @@ def long_transition_evidence(observations, visible, flow, middle, roi):
             "event_pixels": int((onset[index] | recovery[index]).sum()), "stage": stage})
     return {"onset": onset, "recovery": recovery, "exposures": exposures,
         "raw_darkening": raw, "normalized_darkening": normalized_events,
-        "flow_support": supports, "frame_diagnostics": diagnostics}
+        "flow_support": registered_supports, "correspondence_support": supports,
+        "correspondence_policy": correspondence, "frame_diagnostics": diagnostics}
 
 
 def component_transition_diagnostics(context, mask):
@@ -180,6 +199,7 @@ def component_transition_diagnostics(context, mask):
             "normalized_darkening_pixels": int((context["normalized_darkening"][index] & mask).sum())
                 if info["normalized_darkening_pixels"] is not None else None,
             "flow_supported_pixels": int((context["flow_support"][index] & mask).sum()),
+            "correspondence_supported_pixels": int((context.get("correspondence_support", context["flow_support"])[index] & mask).sum()),
             "onset_pixels": int((context["onset"][index] & mask).sum()),
             "recovery_pixels": int((context["recovery"][index] & mask).sum())})
     return {"frames": frames, "event_pixels": int(((context["onset"] | context["recovery"]).any(axis=0) & mask).sum()),
@@ -284,7 +304,7 @@ def transition_stage_accounting(frames):
 
 
 def long_observations(chain, middle_token, arrays, roi, base, stats, analysis, *, sampling_only=False,
-                      include_observations=False):
+                      include_observations=False, correspondence=None):
     frames = [pair["frames"][0] for pair in chain]+[chain[-1]["frames"][1]]
     samples = [pair["sample_token"] for pair in chain]+[chain[-1]["next_sample_token"]]
     middle = next(index for index, frame in enumerate(frames) if frame["sample_data_token"] == middle_token)
@@ -341,7 +361,8 @@ def long_observations(chain, middle_token, arrays, roi, base, stats, analysis, *
     if sampling_only:
         return {"frames": frames, "middle": middle, "visible": visible, "flow": flow,
                 "sampling_diagnostics": sampling}
-    evidence = long_transition_evidence(np.stack(observations), visible, flow, middle, roi)
+    evidence = long_transition_evidence(np.stack(observations), visible, flow, middle, roi,
+        correspondence=correspondence or ("geometry-pair" if "cross_space_receiver" in arrays else "flow-chain"))
     for diagnostic, trace in zip(evidence["frame_diagnostics"], sampling):
         diagnostic["sampling"] = trace
     tracks, diagnostics, state_counts = summarize_track_states(states, inconsistent, samples)

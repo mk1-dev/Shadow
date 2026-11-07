@@ -12,6 +12,7 @@ from threading import Event, Lock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from shadow_occ.annotation.data import digest
+from shadow_occ.annotation.discrepancy_proposals import DiscrepancyConfig
 from shadow_occ.utils.io import write_json
 
 
@@ -27,6 +28,11 @@ def main():
     parser.add_argument("--reuse-source-analysis", action="store_true",
                         help="New labels on exactly the source's existing BEV windows; no BEV/flow/3D re-export")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--discovery-mode", choices=["discrepancy", "cross-space", "hard-intersection"], default="discrepancy")
+    parser.add_argument("--discrepancy-minimum-score", type=float, default=.35)
+    parser.add_argument("--discrepancy-minimum-light-change", type=float, default=1.5)
+    parser.add_argument("--discrepancy-flow-scale", type=float, default=3.0)
+    parser.add_argument("--proposal-entity-motion", choices=["on", "off"], default="on")
     parser.add_argument("--receiver-competition", choices=["on", "off", "score-only"], default="on")
     parser.add_argument("--audit-only", action="store_true", help="Compare explanations without exporting training data")
     parser.add_argument("--control-shift-m", type=float, default=3.0)
@@ -44,6 +50,8 @@ def main():
     parser.add_argument("--caster-proposal-darkness-ratio", type=float, default=.92)
     parser.add_argument("--temporal-radius", type=int, choices=(1, 2, 3, 4), default=3)
     args = parser.parse_args()
+    DiscrepancyConfig(args.discrepancy_minimum_score,
+        args.discrepancy_minimum_light_change, args.discrepancy_flow_scale).validate()
     if not 0 < args.caster_proposal_darkness_ratio <= 1:
         parser.error("Caster proposal darkness ratio must be in (0, 1]")
     if args.reuse_analysis and args.reuse_source_analysis:
@@ -121,9 +129,19 @@ def main():
         analysis = destination/"bev_flow"
         object_root = (Path(args.mature_object_root).resolve()/split if args.mature_object_root
                        else destination/"mature_bev")
+        def check_discovery_settings(previous):
+            if previous.get("discovery_mode", "hard-intersection") != args.discovery_mode:
+                raise ValueError("Cached discovery mode differs; rebuild in a new output root")
+            if args.discovery_mode == "discrepancy":
+                if previous.get("proposal_entity_motion", "on") != args.proposal_entity_motion:
+                    raise ValueError("Cached proposal entity-motion mode differs; rebuild receivers")
+                for key in ("discrepancy_minimum_score", "discrepancy_minimum_light_change", "discrepancy_flow_scale"):
+                    if previous.get(key) != getattr(args, key):
+                        raise ValueError(f"Cached proposal setting differs: {key}; rebuild receivers")
         if args.reuse_source_analysis:
             original_analysis = origin/"bev_flow"
             previous = json.loads((original_analysis/"bev_flow_protocol.json").read_text(encoding="utf-8"))
+            check_discovery_settings(previous)
             if previous.get("mature_object_mode", "off") != args.mature_object_mode:
                 raise ValueError("Source analysis uses a different 3D mode")
             analysis.symlink_to(original_analysis, target_is_directory=True)
@@ -134,6 +152,7 @@ def main():
                 if not (analysis/name).is_file():
                     raise FileNotFoundError(analysis/name)
             previous = json.loads((analysis/"bev_flow_protocol.json").read_text(encoding="utf-8"))
+            check_discovery_settings(previous)
             if previous.get("mature_object_mode", "off") != args.mature_object_mode:
                 raise ValueError("Cached analysis uses a different 3D prediction mode; rebuild in a new output root")
             if args.mature_object_mode == "required" and Path(previous["object_root"]).resolve() != object_root.resolve():
@@ -143,6 +162,11 @@ def main():
             run("analyze_bev_flow_discrepancy.py", "--pairs", destination/"pairs/pairs.jsonl",
                 "--analysis-root", destination/"flow", "--feature-root", destination/"mature_bev",
                 "--minimum-bev-cosine", shared_protocol.get("minimum_bev_cosine", 0.3),
+                "--discovery-mode", args.discovery_mode,
+                "--discrepancy-minimum-score", args.discrepancy_minimum_score,
+                "--discrepancy-minimum-light-change", args.discrepancy_minimum_light_change,
+                "--discrepancy-flow-scale", args.discrepancy_flow_scale,
+                "--proposal-entity-motion", args.proposal_entity_motion,
                 "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
                 "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
                 "--object-root", object_root, "--mature-object-mode", args.mature_object_mode,

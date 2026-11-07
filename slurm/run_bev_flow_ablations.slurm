@@ -23,6 +23,12 @@ fi
 if [[ "${SHADOW_ABLATION_LABELS_ONLY:-0}" == 1 ]]; then
   EXTRA+=(--labels-only)
 fi
-python -m pytest -q tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_bev_flow_ablations.py tests/test_physics_shadow_labels.py tests/test_physics_shadow_motion.py tests/test_receiver_explanations.py tests/test_mature_objects.py
+if [[ "${SHADOW_ABLATION_AUDIT_ONLY:-0}" == 1 ]]; then
+  EXTRA+=(--audit-only)
+fi
+if [[ -n "${SHADOW_ABLATION_CONFIG:-}" ]]; then
+  EXTRA+=(--config "$SHADOW_ABLATION_CONFIG")
+fi
+python -m pytest -q tests/test_discrepancy_abcd.py tests/test_discrepancy_proposals.py tests/test_cross_space.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_bev_flow_ablations.py tests/test_physics_shadow_labels.py tests/test_physics_shadow_motion.py tests/test_receiver_explanations.py tests/test_mature_objects.py
 python -u scripts/run_bev_flow_ablations.py --source-root "$SOURCE" --output-root "$OUTPUT" \
   --variants "${VARIANTS[@]}" --seed "${SHADOW_ABLATION_SEED:-0}" "${EXTRA[@]}"

@@ -48,6 +48,120 @@ Cloudy/weak/unknown windows are retained, and static shadows are not excluded.
 Use `slurm/tag_shadow_observability.slurm` for the existing audit-case pilot;
 it trains no model and compares the already frozen physical results by stratum.
 
+## Cross-Space Discovery
+
+The default candidate path is now `--discovery-mode discrepancy`. First build
+ground/GT/decoded-3D motion explanations, then compare projected motion and
+receiver appearance with observed flow/RGB on the entire valid receiver grid.
+The new branch does not require a local-darkness threshold, a component seed,
+or an existing appearance proposal. Its thresholded discrepancy map directly
+adds candidates: `appearance UNION discrepancy UNION caster-guided`.
+The previous `cross-space` appearance-first mode remains an explicit baseline;
+`hard-intersection` reproduces the earlier BEV/flow veto policy.
+
+Frozen BEV cosine measures spatial representation stability. Raw forward/backward
+flow validity is stored independently of ground-flow registration support, so a
+trusted `observed flow - geometric flow` residual can be measured without first
+requiring that residual to be small. Missing flow is unknown, not a large anomaly.
+BEV stability and reliable flow residuals now affect new proposal selection,
+not just an auxiliary score. Ground motion and available tracked box-surface
+motion are compared with measured flow; an entity model must explain that flow
+better than the ground model to suppress discrepancy. Unavailable model coverage
+is recorded, not treated as observed free space. Strong, geometrically aligned
+brightness changes can still propose candidates when DIS is unavailable or when
+ground-texture flow matches geometry. Flow error without brightness evidence
+does not create proposals. The score does not override physical acceptance.
+The hypothesis that BEV is relatively insensitive to shadows remains experimental.
+
+GT/light ROIs can extend candidates using actually observed dark ground, without
+requiring learned-BEV or DIS support. Physical matching can use known geometric
+correspondence without pretending that failed optical flow was valid. Long-window
+events use independently visible reference/remote receiver pairs in this mode;
+the original flow-chain support is still reported separately. Existing central
+three-frame visibility and ground-cache consistency requirements are unchanged.
+
+The explicit `hard-intersection` arm reproduces the previous candidate policy.
+New `discrepancy_*` arrays separate the baseline, active branch and newly added
+pixels. `proposal_source_bits` records appearance=1, discrepancy=2, caster=4;
+after caster expansion, bits=2 identify exclusively discrepancy-sourced pixels.
+`cross_space_review/*.jpg` shows baseline/new/novel proposals and entity-motion
+explanations. The competition summary reports the discovery funnel, including
+components containing new proposals. That is not novel-pixel precision.
+Weak proposals do not lower the existing physical transition brightness threshold.
+Lit negative-label rules and caster/light competition scores remain unchanged.
+
+On HPC, first run the focused tests, then the CPU-only audit rebuild using existing
+pairs, DIS and mature BEV/3D caches. No image/flow/encoder re-export or training is
+needed. The following roots are examples from the existing experiment:
+
+```bash
+python -m pytest -q tests/test_discrepancy_proposals.py tests/test_cross_space.py tests/test_cached_bev.py tests/test_bev_flow.py tests/test_bev_flow_ablations.py tests/test_caster_window.py tests/test_rebuild_shadow_analysis.py
+export SHADOW_REBUILD_SOURCE=/public/home/eng_zhihongli/project/Shadow/outputs/shadow_bev_flow_20261107_0715
+export SHADOW_MATURE_OBJECT_ROOT=/public/home/eng_zhihongli/project/Shadow/outputs/shadow_mature_3d_20261107_124905
+export SHADOW_ANNOTATION_ROOT=/public/home/eng_zhihongli/project/Shadow/outputs/shadow_discrepancy_v1
+export SHADOW_DISCOVERY_MODE=discrepancy
+export SHADOW_RECEIVER_AUDIT_ONLY=1
+export SHADOW_REUSE_SOURCE_ANALYSIS=0
+sbatch slurm/rebuild_bev_flow_labels.slurm
+```
+
+The ablation runner defaults to `hard_intersection`, `appearance_only`,
+`discrepancy_proposal`, and `bidirectional_proposal`. Compare `appearance_only`
+against `discrepancy_proposal` to change only active discovery, then compare
+`discrepancy_proposal` against `bidirectional_proposal` to add GT-guided search.
+`cross_space` preserves the previous baseline including caster-guided expansion;
+compare it against `full` for a matched caster-enabled discovery control.
+`discrepancy_geometry` and `discrepancy_shuffled` test the learned BEV reference.
+Three proposal-only settings are exposed: `--discrepancy-minimum-score` (0.35),
+`--discrepancy-minimum-light-change` (1.5 Lab-L), and `--discrepancy-flow-scale`
+(3 working-image pixels). Freeze them on dev before held-out evaluation.
+Cached reselection is supported, but older NPZs without raw flow validity report
+that evidence as unavailable. A rebuild from cached pairs/flow recovers it.
+Do not use `--reuse-source-analysis` to switch an old hard-intersection cache to
+discrepancy: that option intentionally preserves its original candidate policy.
+
+## Frozen A/B/C/D Discovery Audit
+
+Use `configs/discrepancy_abcd.json` for matched experiments. A/B/C/D share the
+caster search, geometric correspondence, signed brightness verification,
+physical score thresholds, light bank, temporal radius and candidate budget.
+A is the old candidate policy with this shared verifier, not a claim to reproduce
+every setting of a historical run. `D_no_entity_motion` removes only the GT/predicted
+surface-motion inputs to the proposal calculation; geometry exclusions and all
+decoded 3D evidence used by later competition remain intact.
+
+`C_bev_shuffled` permutes spatial features. `C_gt_reverse` changes verification
+trajectory time order while holding the centre state and candidate discovery fixed;
+it is a wrong-time control, not a new set of positive training labels. Static
+tracks may be unchanged by this control and should be interpreted separately.
+The discrepancy formula and physical scoring formulas are not changed by these
+switches. Recipes, code hashes and source-window hashes are written to each arm.
+
+The frozen audit needs source windows rebuilt with `observed_flow_valid_by_interval`.
+Old caches missing that field cannot test the entity-motion ablation and are
+rejected before starting this particular experiment. Rebuild once from cached
+pairs/flow/features using the command above; no encoder/flow re-export is needed.
+
+```bash
+export SHADOW_ABLATION_SOURCE="$PWD/outputs/shadow_discrepancy_v1"
+export SHADOW_ABLATION_ROOT="$PWD/outputs/shadow_discrepancy_abcd_v1"
+export SHADOW_ABLATION_CONFIG=configs/discrepancy_abcd.json
+export SHADOW_ABLATION_VARIANTS="A_hard B_cross C_discrepancy D_no_entity_motion C_bev_shuffled C_gt_reverse"
+export SHADOW_ABLATION_AUDIT_ONLY=1
+sbatch -p AMD slurm/run_bev_flow_ablations.slurm
+```
+
+This CPU audit does not build teacher/segmenter/VLM training datasets. Inspect
+`comparison/summary.json`, each split's `competition/summary.json`, and
+`labels/transition_diagnostics.jsonl`. Source-bit histograms distinguish the seven
+appearance/discrepancy/caster combinations. Paired C/D masks report pixels removed
+by entity-motion explanations in the branch and cached appearance/discrepancy
+union before caster expansion; this does not
+prove those removed pixels were false shadows. GT reverse should leave cached
+proposal masks unchanged. Over-budget windows are explicitly skipped, not silently
+truncated. Positive-window coverage is reported separately from teacher pixel
+coverage, which remains unavailable when no teacher dataset is built.
+
 ## Default HPC Pipeline
 
 The [geo-temporal light workflow](docs/geo_temporal_light.md) adds a trainable

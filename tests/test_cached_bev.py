@@ -52,7 +52,7 @@ def test_learned_bev_changes_actual_candidate_selection():
         "shadow_boundary_recovery": full.copy(), "shadow_same_patch_cycle": full.copy()}
     arrays["learned_bev_temporal_cosine"][0, 0, 0] = -0.2
     arrays["shadow_flow_supported"][1, 1] = False
-    arrays, metadata = select_bev_flow_receivers(arrays, {"counts": {}}, 0.3)
+    arrays, metadata = select_bev_flow_receivers(arrays, {"counts": {}}, 0.3, discovery_mode="hard-intersection")
     assert arrays["shadow_candidate"].sum() == 2
     assert not arrays["shadow_candidate"][0, 0]
     assert not arrays["shadow_boundary_onset"][0, 0]

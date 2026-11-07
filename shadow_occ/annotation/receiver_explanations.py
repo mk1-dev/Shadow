@@ -187,6 +187,9 @@ def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
                            for value in dark])
     formed = dark[1] & ~dark[0] & comparable[0] & (delta[0] <= -light_threshold)
     recovered = dark[1] & ~dark[2] & comparable[1] & (delta[1] >= light_threshold)
+    if "discrepancy_onset" in arrays:
+        formed |= arrays["discrepancy_onset"] & receiver & comparable[0] & (delta[0] <= -light_threshold)
+        recovered |= arrays["discrepancy_recovery"] & receiver & comparable[1] & (delta[1] >= light_threshold)
     finite_ratio = np.isfinite(ratio).all(axis=0) & receiver
     persistence = np.exp(-np.ptp(np.nan_to_num(ratio, nan=0), axis=0)/SCORE_CONTRACT["material_ratio_range_scale"])
     texture, texture_valid = [], []
@@ -446,6 +449,10 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
                 "geometry_flow": darkness*ground_fraction*float(arrays["shadow_flow_supported"][mask].mean()),
                 "projection_coverage": max((value["cover"] for value in evaluations), default=0.0),
                 "external_shadow_model": prior_mean,
+                "cross_space_discrepancy": float(arrays["cross_space_discrepancy"][mask].mean())
+                    if "cross_space_discrepancy" in arrays else None,
+                "active_discrepancy": float(arrays["discrepancy_score"][mask].mean())
+                    if "discrepancy_score" in arrays else None,
                 "mature_3d_unexplained": darkness*mature_unexplained_score if mature_unexplained_score is not None else None,
                 "receiver_competition": scores["cast_shadow"]-max(scores[key] for key in scores if key != "cast_shadow")},
             "appearance_prior": {"mean": prior_mean, "context_mean": context_mean,

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, build_bev_flow
 from shadow_occ.annotation.cached_bev import attach_cached_bev, select_bev_flow_receivers
+from shadow_occ.annotation.discrepancy_proposals import DiscrepancyConfig
 from shadow_occ.annotation.data import checked_write_image, digest, load_array, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.physics_io import check_pair_files, load_motion_analysis, read_evidence
 from shadow_occ.annotation.physics_labels import validate_window
@@ -48,6 +49,32 @@ def review_panel(arrays):
         cv2.putText(panel, label, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         result.append(panel)
     return np.vstack([np.hstack(result[:3]), np.hstack(result[3:])])
+
+
+def cross_space_review_panel(arrays):
+    values = [(arrays["cross_space_temporal_candidate"], "temporal appearance candidate"),
+        (arrays["cross_space_static_candidate"], "static appearance: no transition claim"),
+        (arrays["cross_space_bev_stability"], "BEV stability; missing is black"),
+        (arrays["cross_space_discrepancy"], "2D/3D discrepancy; not probability"),
+        (arrays["cross_space_flow_valid"].any(axis=0), "raw flow valid, not ground-flow fit"),
+        (arrays["shadow_flow_supported"], "registered ground-flow support")]
+    if "discrepancy_candidate" in arrays:
+        values = [(arrays["discrepancy_baseline_candidate"], "B: original appearance proposals"),
+            (arrays["discrepancy_candidate"], "C: active discrepancy proposals"),
+            (arrays["discrepancy_novel_candidate"], "C minus B: newly discovered pixels"),
+            (arrays["discrepancy_score"], "active discovery score, not probability"),
+            (arrays["discrepancy_entity_explanation"].max(axis=0), "projected entity-motion explanation"),
+            (arrays["discrepancy_flow_valid"].any(axis=0), "trusted observed versus projected flow")]
+    panels = []
+    for value, title in values:
+        scaled = (np.clip(np.nan_to_num(value), 0, 1)*255).astype(np.uint8)
+        panel = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
+        panel[~arrays["cross_space_receiver"] | ~np.isfinite(value)] = 0
+        panel = cv2.resize(panel, (384, 384), interpolation=cv2.INTER_NEAREST)
+        panel = np.vstack([np.zeros((24, 384, 3), np.uint8), panel])
+        cv2.putText(panel, title, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, .43, (255, 255, 255), 1)
+        panels.append(panel)
+    return np.vstack([np.hstack(panels[:3]), np.hstack(panels[3:])])
 
 
 def motion_review_panel(image, rendered, motion, evidence, lighting_comparable):
@@ -97,6 +124,11 @@ def main():
     parser.add_argument("--analysis-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--feature-root", help="Frozen spatial UniAD/OpenDriveVLA BEV cache")
+    parser.add_argument("--discovery-mode", choices=["discrepancy", "cross-space", "hard-intersection"], default="discrepancy")
+    parser.add_argument("--discrepancy-minimum-score", type=float, default=.35)
+    parser.add_argument("--discrepancy-minimum-light-change", type=float, default=1.5)
+    parser.add_argument("--discrepancy-flow-scale", type=float, default=3.0)
+    parser.add_argument("--proposal-entity-motion", choices=["on", "off"], default="on")
     parser.add_argument("--feature-gate", choices=["aligned", "none", "shuffled", "matched-random"], default="aligned")
     parser.add_argument("--flow-gate", choices=["registered", "none"], default="registered",
                         help="Remove final registration gate only; cached exposure estimation still uses DIS")
@@ -112,6 +144,9 @@ def main():
     parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required",
                         help="Active path requires decoded predictions; off is the explicit GT-geometry baseline")
     args = parser.parse_args()
+    proposal_config = DiscrepancyConfig(args.discrepancy_minimum_score,
+        args.discrepancy_minimum_light_change, args.discrepancy_flow_scale)
+    proposal_config.validate()
     if args.feature_gate != "none" and not args.feature_root:
         parser.error("--feature-root is required unless --feature-gate none")
     object_root = args.object_root or args.feature_root
@@ -187,7 +222,9 @@ def main():
                     images[1], rendered[1], object_motion[1], second, bool(mb["exposure"]["valid"])))
         window_seed = int(hashlib.sha256(f"{args.seed}:{stem}".encode()).hexdigest()[:16], 16)
         arrays, metadata = select_bev_flow_receivers(arrays, metadata, args.minimum_bev_cosine,
-            feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=window_seed)
+            feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=window_seed,
+            discovery_mode=args.discovery_mode, discrepancy_config=proposal_config,
+            proposal_entity_motion=args.proposal_entity_motion)
         if args.omit_receiver_features:
             arrays.pop("learned_bev_receiver_features", None)
         path = output/"windows"/f"{stem}.npz"
@@ -197,12 +234,16 @@ def main():
         counts.update(metadata["counts"])
         if len(windows) <= args.review_limit:
             checked_write_image(output/"review"/f"{stem}.jpg", review_panel(arrays))
+            if args.discovery_mode in {"cross-space", "discrepancy"}:
+                checked_write_image(output/"cross_space_review"/f"{stem}.jpg", cross_space_review_panel(arrays))
         print(f"windows={len(windows)} scene={left['scene_name']} receiver={metadata['counts']['receiver']} "
               f"events={metadata['counts']['illumination_events']} candidates={metadata['counts']['shadow_candidates']}", flush=True)
     write_rows(output/"windows.jsonl", windows)
     write_rows(output/"window_audit.jsonl", audit)
     write_json(output/"bev_flow_protocol.json", {**vars(args), "config": asdict(config),
         "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
+        "cross_space_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/cross_space.py"),
+        "discrepancy_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/discrepancy_proposals.py"),
         "shadow_baseline_manifest_sha256": digest(args.shadow_baseline_manifest) if args.shadow_baseline_manifest else None,
         "protocol": "bev-flow-discrepancy-v1", "pair_manifest_sha256": digest(args.pairs),
         "analysis_protocol_sha256": digest(analysis_protocol),

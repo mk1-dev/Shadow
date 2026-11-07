@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.cached_bev import attach_cached_bev, select_bev_flow_receivers
+from shadow_occ.annotation.discrepancy_proposals import DiscrepancyConfig
 from shadow_occ.annotation.data import digest, read_rows, resolve_path, write_rows
 from shadow_occ.utils.io import write_json
 
@@ -22,12 +23,20 @@ def main():
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--feature-root", help="Optional replacement cache, e.g. current-only features")
+    parser.add_argument("--discovery-mode", choices=["discrepancy", "cross-space", "hard-intersection"], default="discrepancy")
+    parser.add_argument("--discrepancy-minimum-score", type=float, default=.35)
+    parser.add_argument("--discrepancy-minimum-light-change", type=float, default=1.5)
+    parser.add_argument("--discrepancy-flow-scale", type=float, default=3.0)
+    parser.add_argument("--proposal-entity-motion", choices=["on", "off"], default="on")
     parser.add_argument("--feature-gate", choices=["aligned", "none", "shuffled", "matched-random"], default="aligned")
     parser.add_argument("--flow-gate", choices=["registered", "none"], default="registered")
     parser.add_argument("--minimum-bev-cosine", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
     args = parser.parse_args()
+    proposal_config = DiscrepancyConfig(args.discrepancy_minimum_score,
+        args.discrepancy_minimum_light_change, args.discrepancy_flow_scale)
+    proposal_config.validate()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     protocol_path = source/"bev_flow_protocol.json"
     protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
@@ -72,8 +81,12 @@ def main():
                     if old.get(key) != new.get(key):
                         raise ValueError(f"Feature-history comparison changed encoder {key}")
         seed = int(hashlib.sha256(f"{args.seed}:{row['id']}".encode()).hexdigest()[:16], 16)
+        row["discovery_config"] = {key: protocol["config"][key] for key in
+            ("light_threshold_L", "darkness_ratio") if key in protocol["config"]}
         arrays, row = select_bev_flow_receivers(arrays, row, args.minimum_bev_cosine,
-            feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=seed)
+            feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=seed,
+            discovery_mode=args.discovery_mode, discrepancy_config=proposal_config,
+            proposal_entity_motion=args.proposal_entity_motion)
         arrays.pop("learned_bev_receiver_features", None)
         destination = output/"windows"/f"{row['id']}.npz"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +99,8 @@ def main():
     write_json(output/"summary.json", {"windows": len(rows), "counts": dict(counts),
         "candidate_retention": counts["shadow_candidates"]/max(counts["photometric_candidates"], 1)})
     write_json(output/"bev_flow_protocol.json", {**protocol, **vars(args),
+        "cross_space_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/cross_space.py"),
+        "discrepancy_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/discrepancy_proposals.py"),
         "source_protocol_sha256": digest(protocol_path),
         "source_windows_sha256": digest(source/"windows.jsonl"),
         "receiver_feature_storage": "shared source cache; derived evidence keeps gate results only",

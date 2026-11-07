@@ -104,8 +104,16 @@ def attach_cached_bev(arrays, metadata, root):
 
 
 def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
-                              feature_gate="aligned", flow_gate=True, seed=0):
-    """Require a persistent learned receiver representation, not just dark appearance."""
+                              feature_gate="aligned", flow_gate=True, seed=0,
+                              discovery_mode="discrepancy", discrepancy_config=None,
+                              proposal_entity_motion="on"):
+    """Keep physical discovery separate from the explicit hard-intersection arm."""
+    if discovery_mode not in {"discrepancy", "cross-space", "hard-intersection"}:
+        raise ValueError(f"Unknown discovery mode: {discovery_mode}")
+    if proposal_entity_motion not in {"on", "off"}:
+        raise ValueError(f"Unknown proposal entity-motion mode: {proposal_entity_motion}")
+    if discovery_mode != "hard-intersection" and feature_gate == "matched-random":
+        raise ValueError("matched-random is a hard-intersection budget control")
     if feature_gate not in {"aligned", "none", "shuffled", "matched-random"}:
         raise ValueError(f"Unknown feature gate: {feature_gate}")
     if not np.isfinite(minimum_cosine) or not -1 <= minimum_cosine <= 1:
@@ -114,6 +122,11 @@ def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
     observed_flow = arrays.get("shadow_flow_supported_observed", arrays["shadow_flow_supported"]).copy()
     flow = observed_flow if flow_gate else np.ones_like(original)
     rng = np.random.default_rng(seed)
+    cosine = None
+    metadata.pop("discrepancy_discovery", None)
+    for key in list(arrays):
+        if key.startswith("discrepancy_") or key == "proposal_source_bits":
+            del arrays[key]
     consistency = np.full(original.shape, np.nan, np.float32)
     feature_valid = np.ones_like(original)
     if feature_gate == "none":
@@ -152,6 +165,7 @@ def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
             arrays[source] = arrays[key].copy()
         arrays[key] = arrays[source] & selected
     metadata["learned_bev_selection"] = {"minimum_cosine": minimum_cosine,
+        "discovery_mode": discovery_mode,
         "feature_gate": feature_gate, "flow_gate": flow_gate, "seed": int(seed),
         "rule": "photometric AND configured_registration AND configured_feature_gate",
         "photometric_candidate_cells": int(original.sum()), "selected_cells": int(selected.sum()),
@@ -159,8 +173,49 @@ def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
         "selection_fraction": float(selected.sum()/max(original.sum(), 1)),
         "feature_rejected_cells": int((original & ~learned).sum()),
         "flow_rejected_cells": int((original & ~flow).sum())}
+    if discovery_mode in {"cross-space", "discrepancy"}:
+        from shadow_occ.annotation.cross_space import discover_cross_space
+
+        config = metadata.get("discovery_config", {})
+        metadata["cross_space_discovery"] = discover_cross_space(arrays, cosine=cosine,
+            light_threshold=config.get("light_threshold_L", 6.0),
+            darkness_ratio=config.get("darkness_ratio", .88))
+        if discovery_mode == "discrepancy":
+            from shadow_occ.annotation.discrepancy_proposals import propose_discrepancy
+
+            baseline = arrays["shadow_candidate"].copy()
+            # Only the discovery arm loses entity-motion inputs in this control.
+            # Keep the original cache intact for downstream physical verification.
+            proposal_arrays = arrays if proposal_entity_motion == "on" else {
+                key: value for key, value in arrays.items()
+                if key not in {"box_surface_expected_flow_px", "mature_expected_object_flow_px"}}
+            metadata["discrepancy_discovery"] = propose_discrepancy(proposal_arrays, cosine=cosine,
+                baseline=baseline, light_threshold=config.get("light_threshold_L", 6.0), config=discrepancy_config)
+            if proposal_arrays is not arrays:
+                arrays.update({key: value for key, value in proposal_arrays.items() if key.startswith("discrepancy_")})
+            metadata["discrepancy_discovery"]["proposal_entity_motion"] = proposal_entity_motion
+            arrays["proposal_source_bits"] = baseline.astype(np.uint8) | (arrays["discrepancy_candidate"].astype(np.uint8) << 1)
+            arrays["shadow_candidate"] = baseline | arrays["discrepancy_candidate"]
+            arrays["shadow_boundary_onset"] |= arrays["discrepancy_onset"]
+            arrays["shadow_boundary_recovery"] |= arrays["discrepancy_recovery"]
+            arrays["shadow_same_patch_cycle"] = arrays["shadow_boundary_onset"] & arrays["shadow_boundary_recovery"]
+        selected = arrays["shadow_candidate"]
+        metadata["learned_bev_selection"].update(
+            rule="cross-space appearance discovery; hard intersection recorded as counterfactual",
+            hard_intersection_cells=int((original & learned & flow).sum()),
+            selected_cells=int(selected.sum()), selection_fraction=float(selected.sum()/max(original.sum(), 1)),
+            feature_rejected_cells=0, flow_rejected_cells=0)
+        if discovery_mode == "discrepancy":
+            metadata["learned_bev_selection"]["rule"] = "appearance baseline UNION active 3D/2D discrepancy proposals"
+    else:
+        metadata.pop("cross_space_discovery", None)
+        for key in list(arrays):
+            if key.startswith("cross_space_"):
+                del arrays[key]
     metadata["counts"]["photometric_candidates"] = int(original.sum())
     metadata["counts"]["shadow_candidates"] = int(selected.sum())
+    metadata["counts"]["discrepancy_proposals"] = int(arrays["discrepancy_candidate"].sum()) if "discrepancy_candidate" in arrays else 0
+    metadata["counts"]["discrepancy_novel_proposals"] = int(arrays["discrepancy_novel_candidate"].sum()) if "discrepancy_novel_candidate" in arrays else 0
     if "shadow_persistent_dark" in arrays:
         metadata["counts"]["selected_persistent_dark"] = int((selected & arrays["shadow_persistent_dark"]).sum())
     return arrays, metadata

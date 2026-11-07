@@ -45,7 +45,7 @@ def test_replay_shares_exact_windows_without_export_or_analysis(tmp_path, monkey
 
     monkeypatch.setattr(module.subprocess, "Popen", Process)
     monkeypatch.setattr(sys, "argv", ["rebuild", "--source-root", str(source), "--output-root", str(output),
-        "--reuse-source-analysis", "--audit-only"])
+        "--reuse-source-analysis", "--audit-only", "--discovery-mode", "hard-intersection"])
     module.main()
     assert len(commands) == 4
     assert {Path(command[1]).name for command in commands} == {

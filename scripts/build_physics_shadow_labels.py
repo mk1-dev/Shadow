@@ -66,6 +66,32 @@ def projectable_shadow_support(mask, explanations, track_map, plane, directions,
     return fuse_shadow_support(mask, footprints, policy, consensus_fraction), rejected
 
 
+def verification_observations(arrays, threshold):
+    """Shared signed geometry evidence for matched discovery ablations."""
+    receiver = arrays["receiver_valid"]
+    delta = arrays["temporal_illumination_change_L"]
+    comparable = np.broadcast_to(arrays.get("temporal_exposure_valid_by_interval",
+        arrays.get("temporal_exposure_valid", False)), delta.shape)
+    supported = comparable & receiver[None] & np.isfinite(delta)
+    if "appearance_chroma_change" in arrays:
+        supported &= np.isfinite(arrays["appearance_chroma_change"]) & (arrays["appearance_chroma_change"] <= 12*np.log(2))
+    return supported[0] & (delta[0] <= -threshold), supported[1] & (delta[1] >= threshold)
+
+
+def verification_tracks(tracks, context, control):
+    """Perturb verification time only; discovery and the centre state stay fixed."""
+    if control == "observed":
+        return tracks, context
+    reversed_tracks = [{**track, "points": track["points"][::-1].copy()} for track in tracks]
+    if context is None:
+        return reversed_tracks, None
+    order = np.arange(len(context["frames"]))
+    other = order[order != context["middle"]]
+    order[other] = other[::-1]
+    return reversed_tracks, {**context, "tracks": {key: value[order].copy() for key, value in context["tracks"].items()},
+        "polygon_cache": {}, "caster_motion_control": control}
+
+
 def main():
     parser = argparse.ArgumentParser("Joint 3D/2D weak-label gate; audit-only unless explicitly enabled.")
     parser.add_argument("--pairs", required=True)
@@ -97,6 +123,10 @@ def main():
     parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
     parser.add_argument("--temporal-evidence", choices=["available", "complete"],
                         help="Use observed signed boundary events; default available for factorized-v3, complete for strict-v2")
+    parser.add_argument("--verification-evidence", choices=["native", "geometry"], default="native",
+                        help="geometry uses identical signed receiver observations for all discovery arms")
+    parser.add_argument("--caster-motion-control", choices=["observed", "reverse-time"], default="observed",
+                        help="Counterfactual verification only; keep candidate discovery and middle GT boxes fixed")
     parser.add_argument("--light-prior-manifest", help="Frozen learned or astronomical per-window light distributions")
     parser.add_argument("--light-prior-weight", type=float, default=.15)
     parser.add_argument("--observability-manifest", help="Zero-shot RGB votes; metadata and ordering only, never label acceptance")
@@ -245,7 +275,10 @@ def main():
                 "onset": bev_arrays["shadow_boundary_onset"], "recovery": bev_arrays["shadow_boundary_recovery"],
                 "flow_supported": bev_arrays["shadow_flow_supported"],
                 "same_patch_cycle": bev_arrays["shadow_same_patch_cycle"]}
-            if config.allow_partial_temporal:
+            if "cross_space_receiver" in bev_arrays:
+                rank_maps["geometric_correspondence"] = bev_arrays["cross_space_receiver"]
+                maps["geometric_correspondence"] = maps["visible"].copy()
+            if config.allow_partial_temporal and "cross_space_receiver" not in bev_arrays:
                 rank_maps["onset"] = bev_arrays["receiver_boundary_formation"] & rank_maps["dark"]
                 rank_maps["recovery"] = bev_arrays["receiver_boundary_recovery"] & rank_maps["dark"]
                 rank_maps["same_patch_cycle"] = rank_maps["onset"] & rank_maps["recovery"]
@@ -259,7 +292,7 @@ def main():
                 polygon_cache, light_prior, expand=args.candidate_source == "caster",
                 proposal_darkness_ratio=args.caster_proposal_darkness_ratio)
             rank_maps["dark"] = bev_arrays["shadow_candidate"]
-            if config.allow_partial_temporal:
+            if config.allow_partial_temporal and "cross_space_receiver" not in bev_arrays:
                 rank_maps["onset"] = bev_arrays["receiver_boundary_formation"] & rank_maps["dark"]
                 rank_maps["recovery"] = bev_arrays["receiver_boundary_recovery"] & rank_maps["dark"]
                 rank_maps["same_patch_cycle"] = rank_maps["onset"] & rank_maps["recovery"]
@@ -272,13 +305,28 @@ def main():
             counts["caster_windows_with_added"] += int(expanded["added"] > 0)
             chain = extend_pairs(left, right, successor, predecessor, args.temporal_radius)
             if len(chain) > 2:
-                extended_context = long_observations(chain, frame["sample_data_token"], bev_arrays, roi, base, stats, analysis)
+                extended_context = long_observations(chain, frame["sample_data_token"], bev_arrays, roi, base, stats, analysis,
+                    correspondence="geometry-pair" if args.verification_evidence == "geometry" else None)
             counts[f"temporal_frames:{len(chain)+1}"] += 1
             audit.append({"left_pair": left["id"], "right_pair": right["id"], "window_id": bev_ref["id"],
                 "status": "caster_proposals", **expanded,
+                "cross_space_discovery": bev_ref.get("cross_space_discovery"),
+                "discrepancy_discovery": bev_ref.get("discrepancy_discovery"),
                 "temporal_frames": len(chain)+1,
                 "track_state_counts": extended_context["track_state_counts"] if extended_context else None})
+            if args.verification_evidence == "geometry":
+                onset, recovery = verification_observations(bev_arrays,
+                    bev_protocol.get("config", {}).get("light_threshold_L", 6.0))
+                bev_arrays["receiver_boundary_formation"] = onset
+                bev_arrays["receiver_boundary_recovery"] = recovery
+                rank_maps.update(onset=onset & rank_maps["dark"], recovery=recovery & rank_maps["dark"],
+                    same_patch_cycle=onset & recovery & rank_maps["dark"], geometric_correspondence=bev_arrays["receiver_valid"])
+                maps["geometric_correspondence"] = maps["visible"].copy()
+        hypothesis_tracks, hypothesis_context = verification_tracks(tracks, extended_context, args.caster_motion_control)
+        if args.caster_motion_control != "observed":
+            polygon_cache = {}
         transition_record = {"window_id": window_id, "scene_name": left["scene_name"],
+            "verification_evidence": args.verification_evidence, "caster_motion_control": args.caster_motion_control,
             "observability": observability,
             "camera": left["camera"], "long_window_available": extended_context is not None,
             "timestamps": extended_context["timestamps"] if extended_context else None,
@@ -291,6 +339,13 @@ def main():
         # Never bridge gaps across unsupported receivers by dilation or closing.
         number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
         components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
+        transition_record.update(candidate_pixels=int(rank_maps["dark"].sum()),
+            components_before_area_filter=number-1, components_after_area_filter=len(components),
+            small_components=number-1-len(components))
+        if grid is not None and "discrepancy_candidate" in bev_arrays:
+            for name in ("discrepancy_candidate", "discrepancy_novel_candidate", "discrepancy_exclusive_candidate"):
+                transition_record[name+"_pixels"] = int(bev_arrays[name].sum())
+                counts[name+"_pixels"] += int(bev_arrays[name].sum())
         counts["small_components"] += number-1-len(components)
         if len(components) > args.max_components_per_window:
             counts["component_limit_windows"] += 1
@@ -321,9 +376,9 @@ def main():
                                      "timestamp": adjacent["camera_timestamp"]})
         for component in components:
             rank_mask = labels == component
-            hypotheses, report = rank_hypotheses(rank_mask, rank_maps, tracks, plane, basis, rank_projection,
+            hypotheses, report = rank_hypotheses(rank_mask, rank_maps, hypothesis_tracks, plane, basis, rank_projection,
                                                   directions, rank_config, polygon_cache=polygon_cache, light_prior=light_prior,
-                                                  temporal_context=extended_context)
+                                                  temporal_context=hypothesis_context)
             competition = None
             if args.receiver_competition != "off":
                 competition = explain_component(rank_mask, bev_arrays, hypotheses, polygon_cache,
@@ -352,6 +407,9 @@ def main():
                 component_path = output/"bev_regions"/f"{stem}.npz"
                 component_path.parent.mkdir(parents=True, exist_ok=True)
                 pooled = {}
+                if "proposal_source_bits" in bev_arrays:
+                    pooled["proposal_source_bits"] = np.where(rank_mask, bev_arrays["proposal_source_bits"], 0)
+                    pooled["discrepancy_score"] = np.where(rank_mask, bev_arrays["discrepancy_score"], 0)
                 if "learned_bev_receiver_features" in bev_arrays:
                     features = bev_arrays["learned_bev_receiver_features"].astype(np.float32)
                     support = bev_arrays["learned_bev_valid"] & rank_mask[None]
@@ -364,6 +422,20 @@ def main():
                     "mature_image_motion": bev_ref.get("mature_image_motion"),
                     "grid": bev_ref["grid"],
                     "selection": bev_ref.get("learned_bev_selection"),
+                    "cross_space_discovery": bev_ref.get("cross_space_discovery"),
+                    "discrepancy_discovery": bev_ref.get("discrepancy_discovery"),
+                    "discrepancy_evidence": ({"proposal_pixels": int((rank_mask & bev_arrays["discrepancy_candidate"]).sum()),
+                        "source_counts": {str(code): int((rank_mask & (bev_arrays["proposal_source_bits"] == code)).sum()) for code in range(1, 8)},
+                        "novel_before_caster_pixels": int((rank_mask & bev_arrays["discrepancy_novel_candidate"]).sum()),
+                        "exclusive_after_caster_pixels": int((rank_mask & bev_arrays["discrepancy_exclusive_candidate"]).sum()),
+                        "mean_score": float(bev_arrays["discrepancy_score"][rank_mask].mean())}
+                        if "discrepancy_candidate" in bev_arrays else None),
+                    "cross_space_evidence": ({"temporal_pixels": int((rank_mask & bev_arrays["cross_space_temporal_candidate"]).sum()),
+                        "static_pixels": int((rank_mask & bev_arrays["cross_space_static_candidate"]).sum()),
+                        "mean_discrepancy": float(bev_arrays["cross_space_discrepancy"][rank_mask].mean()),
+                        "bev_valid_fraction": float(bev_arrays["cross_space_bev_valid"][rank_mask].mean()),
+                        "flow_valid_fraction": float(bev_arrays["cross_space_flow_valid"][:, rank_mask].mean())}
+                        if "cross_space_discrepancy" in bev_arrays else None),
                     "evidence_sha256": bev_ref["evidence_sha256"], "component": str(component_path),
                     "component_sha256": digest(component_path), "area_m2": float(rank_mask.sum()*grid.resolution**2),
                     "coordinate_frame": "fixed anchor ego x/y; rows=y, columns=x",

@@ -74,6 +74,39 @@ def evaluate_reference(canonical, reference, reference_base, bootstrap, seed):
     return result
 
 
+def paired_discovery(root, left, right, split):
+    """Compare masks on identical cached windows, not independently surviving regions."""
+    folders = [Path(root)/name/split/"bev_flow" for name in (left, right)]
+    if not all((folder/"windows.jsonl").exists() for folder in folders):
+        return None
+    rows = [{row["id"]: row for row in read_rows(folder/"windows.jsonl")} for folder in folders]
+    if rows[0].keys() != rows[1].keys():
+        raise ValueError("Paired discovery requires identical windows")
+    counts = {key: {"left_only": 0, "right_only": 0, "intersection": 0} for key in
+              ("discrepancy_candidate", "shadow_candidate")}
+    coverage = {name: {"available_windows": 0, "observed_pixels": 0, "explained_pixels": 0} for name in ("left", "right")}
+    for window_id in rows[0]:
+        a, b = [values[window_id] for values in rows]
+        if a["grid"] != b["grid"]:
+            raise ValueError("Paired discovery grids differ")
+        with np.load(resolve_path(a["evidence"], folders[0]), allow_pickle=False) as first, np.load(
+                resolve_path(b["evidence"], folders[1]), allow_pickle=False) as second:
+            if not np.array_equal(first["receiver_valid"], second["receiver_valid"]):
+                raise ValueError("Paired discovery receiver geometry differs")
+            for name, archive in (("left", first), ("right", second)):
+                if "discrepancy_entity_explanation_valid" in archive:
+                    coverage[name]["available_windows"] += 1
+                    coverage[name]["observed_pixels"] += int(archive["discrepancy_entity_explanation_valid"].any(axis=0).sum())
+                    coverage[name]["explained_pixels"] += int((archive["discrepancy_entity_explanation"] > 0).any(axis=0).sum())
+            for key in counts:
+                x, y = first[key].astype(bool), second[key].astype(bool)
+                counts[key]["left_only"] += int((x & ~y).sum())
+                counts[key]["right_only"] += int((y & ~x).sum())
+                counts[key]["intersection"] += int((x & y).sum())
+    return {"left": left, "right": right, "windows": len(rows[0]), "pixels": counts, "entity_motion_coverage": coverage,
+        "scope": "fixed-window branch and appearance/discrepancy union before caster expansion; not shadow correctness"}
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--root", required=True)
@@ -107,12 +140,24 @@ def main():
             labels = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
             teacher_path = folder/"teacher/protocol.json"
             teacher = json.loads(teacher_path.read_text(encoding="utf-8")) if teacher_path.exists() else {}
+            competition_path = folder/"competition/summary.json"
+            competition = json.loads(competition_path.read_text(encoding="utf-8")) if competition_path.exists() else {}
+            decision_path = folder/"labels/decisions.jsonl"
+            decisions = read_rows(decision_path) if decision_path.exists() else []
+            positive = [item for item in decisions if item["exported_label"] == "YES"]
             result = {"variant": root.name, "split": split, "recipe": protocol["recipe"],
                 "windows": len(windows), "photometric_cells": counts, "selected_cells": selected,
                 "analysis_protocol_sha256": bev_protocol["analysis_protocol_sha256"],
                 "candidate_retention": ratio(selected, counts), "label_stages": labels.get("stage_counts"),
                 "receiver_competition": labels.get("receiver_competition"),
                 "teacher_counts": teacher.get("counts"), "reference_quality": None}
+            result.update(receiver_cells=sum(row["counts"]["receiver"] for row in windows),
+                discrepancy_proposals=competition.get("discrepancy_proposals"),
+                label_counts=labels.get("counts"),
+                exported_unique_caster=sum(item["shadow_decision"]["association"] is not None for item in positive),
+                exported_yes_unresolved=sum(item["shadow_decision"]["association"] is None for item in positive),
+                positive_window_coverage=ratio(len({(item["bev_flow"] or {})["window_id"] for item in positive}), len(windows)),
+                candidate_budget_policy="whole over-budget windows skipped; no silent top-k selection")
             if reference is not None:
                 official = [row for row in reference if row["official_split"] == split]
                 canonical_path = folder/"teacher/canonical.jsonl"
@@ -122,7 +167,11 @@ def main():
             results.append(result)
     if not results:
         raise ValueError("No ablation protocols found")
-    write_json(Path(args.output_root)/"summary.json", {"variants": results,
+    controls = {split: {
+        "entity_motion": paired_discovery(args.root, "C_discrepancy", "D_no_entity_motion", split),
+        "gt_time": paired_discovery(args.root, "C_discrepancy", "C_gt_reverse", split),
+        "bev_shuffle": paired_discovery(args.root, "C_discrepancy", "C_bev_shuffled", split)} for split in ("train", "val")}
+    write_json(Path(args.output_root)/"summary.json", {"variants": results, "paired_controls": controls,
         "reference_sha256": digest(args.reference_manifest) if args.reference_manifest else None,
         "quality_scope": "agreement with supplied independent reference" if reference is not None else "coverage only; precision not measured"})
     lines = ["# BEV-Flow Ablations", "", "| Variant | Split | Windows | Selected cells | Retention | Accepted regions |", "|---|---|---:|---:|---:|---:|"]

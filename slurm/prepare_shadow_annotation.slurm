@@ -76,6 +76,10 @@ for SPLIT in train val; do
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
     --feature-root "$ROOT_OUT/$SPLIT/mature_bev" --minimum-bev-cosine "${SHADOW_BEV_MIN_COSINE:-0.3}" \
     --mature-object-mode "${SHADOW_MATURE_OBJECT_MODE:-required}" \
+    --discovery-mode "${SHADOW_DISCOVERY_MODE:-discrepancy}" \
+    --discrepancy-minimum-score "${SHADOW_DISCREPANCY_MINIMUM_SCORE:-0.35}" \
+    --discrepancy-minimum-light-change "${SHADOW_DISCREPANCY_MINIMUM_LIGHT_CHANGE:-1.5}" \
+    --discrepancy-flow-scale "${SHADOW_DISCREPANCY_FLOW_SCALE:-3.0}" \
     --output-root "$ROOT_OUT/$SPLIT/bev_flow" "${BASELINE_ARGS[@]}"
   python -u scripts/build_physics_shadow_labels.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
