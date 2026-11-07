@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from shadow_occ.annotation.data import (
-    SOURCES, assert_disjoint, checked_write_image, digest, group_split,
+    SOURCES, assert_disjoint, checked_write_image, digest, group_splits,
     load_array, make_target, read_rows, resolve_path, write_rows,
 )
 from shadow_occ.utils.io import write_json
@@ -37,6 +37,15 @@ def context_bounds(box, shape, caster_box=None, policy="proposal"):
         box = [min(box[0], caster_box[0]), min(box[1], caster_box[1]),
                max(box[2], caster_box[2]), max(box[3], caster_box[3])]
     return crop_bounds(box, shape, 2.5)
+
+
+def validate_manifest_row(row):
+    if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
+        raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
+    if row.get("physics_protocol") and (row["physics_protocol"] not in {
+            "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3", *TEACHER_PROTOCOLS}
+            or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
+        raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
 
 
 def main() -> None:
@@ -76,14 +85,25 @@ def main() -> None:
 
     official_scenes = create_splits_scenes()
     inputs = [(row, Path(path).resolve().parent) for path in args.manifest for row in read_rows(path)]
+    scene_labels, scene_official = defaultdict(set), {}
+    for original, _ in inputs:
+        row = dict(original)
+        validate_manifest_row(row)
+        if row.get("caster_id") and row["caster_id"] in casters:
+            row = {**casters[row["caster_id"]], **row}
+        scene = row["scene_name"]
+        if scene in excluded:
+            continue
+        if scene_official.setdefault(scene, row["official_split"]) != row["official_split"]:
+            raise ValueError(f"Conflicting official splits for {scene}")
+        scene_labels[scene].update(region.get("shadow_label") for region in row.get("regions", []))
+    scene_splits = {}
+    for official_split in set(scene_official.values()):
+        grouped = [scene for scene, value in scene_official.items() if value == official_split]
+        scene_splits.update(group_splits(grouped, official_split, args.dev_fraction, args.seed, scene_labels))
     for original, base in inputs:
         row = dict(original)
-        if row.get("physics_protocol") and row.get("physics_export_enabled") is not True:
-            raise ValueError("Physics audit-only output is not training data; inspect the gate before explicit weak export")
-        if row.get("physics_protocol") and (row["physics_protocol"] not in {
-                "three-frame-physics-weak-v1", "three-frame-track-contrast-v2", "factorized-receiver-shadow-v3", *TEACHER_PROTOCOLS}
-                or row.get("label_source") != "temporal_weak" or row.get("mask_encoding") != "trimap"):
-            raise ValueError("Physics labels must retain their weak-label protocol and trimap encoding")
+        validate_manifest_row(row)
         if row.get("caster_id"):
             if row["caster_id"] not in casters:
                 raise ValueError(f"Unknown caster_id: {row['caster_id']}")
@@ -103,9 +123,7 @@ def main() -> None:
         if scene in excluded:
             counts["excluded_rows"] += 1
             continue
-        split = group_split(scene, row["official_split"], args.dev_fraction, args.seed)
-        if scene_splits.setdefault(scene, split) != split:
-            raise ValueError(f"Conflicting official splits for {scene}")
+        split = scene_splits[scene]
         image_path = resolve_path(row["image"], Path(args.casters).resolve().parent if row.get("caster_id") else base)
         if image_splits.setdefault(str(image_path), split) != split:
             raise ValueError("The same image appears across data splits")

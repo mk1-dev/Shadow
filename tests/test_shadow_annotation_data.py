@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from shadow_occ.annotation.data import assert_disjoint, group_split, make_target
+from shadow_occ.annotation.data import assert_disjoint, group_split, group_splits, make_target
 from shadow_occ.annotation.metrics import BinaryMetrics, auc, region_summary
 
 
@@ -26,6 +26,18 @@ def test_official_val_cannot_be_randomly_assigned_to_training():
     assert group_split("scene-0001", "val", 0.15, 0) == "eval"
     with pytest.raises(ValueError, match="Scene leakage"):
         assert_disjoint([{"scene_name": "a", "split": "train"}], [{"scene_name": "a"}])
+
+
+def test_small_scene_partition_keeps_class_aware_nonempty_dev():
+    labels = {"scene-a": {"YES"}, "scene-b": {"YES", "NO"}, "scene-c": {"NO"},
+              "scene-d": {"YES", "NO"}, "scene-e": {"YES"}}
+    splits = group_splits(labels, "train", 0.15, 0, labels)
+    dev = {scene for scene, split in splits.items() if split == "dev"}
+    train = set(splits)-dev
+    assert dev and train
+    assert {"YES", "NO"} <= set().union(*(labels[scene] for scene in dev))
+    assert {"YES", "NO"} <= set().union(*(labels[scene] for scene in train))
+    assert set(group_splits(["scene-0001"], "val", 0.15, 0).values()) == {"eval"}
 
 
 def test_pixel_metrics_exclude_unknown_and_auc_handles_ties():

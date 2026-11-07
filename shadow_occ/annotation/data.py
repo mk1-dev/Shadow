@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from itertools import combinations
 import json
 from pathlib import Path
 from typing import Iterable
@@ -102,6 +103,49 @@ def group_split(scene: str, official_split: str, dev_fraction: float, seed: int)
         raise ValueError(f"Unknown official_split: {official_split}")
     number = int(hashlib.sha256(f"{seed}:{scene}".encode()).hexdigest()[:12], 16)
     return "dev" if number / float(16**12) < dev_fraction else "train"
+
+
+def group_splits(scenes, official_split, dev_fraction, seed, labels_by_scene=None):
+    """Partition complete scene groups, retaining a nonempty class-aware dev set when possible."""
+    scenes = sorted(set(scenes))
+    if official_split in {"val", "mini_val", "eval", "test"}:
+        return {scene: "eval" for scene in scenes}
+    if official_split not in {"train", "mini_train", "external"}:
+        raise ValueError(f"Unknown official_split: {official_split}")
+    if len(scenes) < 2:
+        return {scene: "train" for scene in scenes}
+    labels_by_scene = labels_by_scene or {}
+    required = set().union(*(labels_by_scene.get(scene, set()) for scene in scenes)) & {"YES", "NO"}
+    target = max(1, min(len(scenes)-1, int(round(len(scenes)*dev_fraction))))
+    ranked = sorted(scenes, key=lambda scene: int(hashlib.sha256(
+        f"{seed}:{scene}".encode()).hexdigest()[:12], 16), reverse=True)
+
+    def valid(development):
+        training = set(scenes)-development
+        if not development or not training:
+            return False
+        if not required:
+            return True
+        dev_labels = set().union(*(labels_by_scene.get(scene, set()) for scene in development))
+        train_labels = set().union(*(labels_by_scene.get(scene, set()) for scene in training))
+        return required <= dev_labels and required <= train_labels
+
+    development = set(ranked[:target])
+    if not valid(development):
+        fixed = None
+        for removed in sorted(development, key=ranked.index):
+            for added in ranked[target:]:
+                trial = (development-{removed}) | {added}
+                if valid(trial):
+                    fixed = trial
+                    break
+            if fixed is not None:
+                break
+        if fixed is not None:
+            development = fixed
+        elif len(scenes) <= 12:
+            development = next((set(choice) for choice in combinations(ranked, target) if valid(set(choice))), development)
+    return {scene: "dev" if scene in development else "train" for scene in scenes}
 
 
 def assert_disjoint(train: list[dict], other: list[dict]) -> None:
