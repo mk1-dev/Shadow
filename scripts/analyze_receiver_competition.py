@@ -11,6 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import checked_write_image, digest, read_rows, write_rows
+from shadow_occ.annotation.caster_window import receiver_sampling_summary, transition_stage_accounting
 from shadow_occ.annotation.diagnostics import average_precision
 from shadow_occ.annotation.metrics import auc
 from shadow_occ.utils.io import write_json
@@ -102,6 +103,9 @@ def transition_stage_summary(rows, windows):
     for row in rows:
         alignments.update(row["projection_transition_diagnostics"]["event_alignment_reasons"])
     return {"windows_with_diagnostics": len(windows),
+        "stage_accounting": transition_stage_accounting(frames),
+        "receiver_sampling": receiver_sampling_summary([
+            frame["sampling"] for window in windows for frame in window["frames"] if "sampling" in frame]),
         "windows_with_long_observations": sum(window["long_window_available"] for window in windows),
         "nonreference_frame_comparisons": len(frames),
         "frame_stage_counts": dict(Counter(frame["stage"] for frame in frames)),

@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 from shadow_occ.annotation.caster_window import (
     caster_proposals, component_transition_diagnostics, extend_pairs, extended_trajectory_fit,
     long_transition_evidence,
+    sample_receiver_flow, sample_receiver_frame, receiver_sampling_summary,
 )
 from shadow_occ.annotation.physics_labels import footprint_mask
 from tests.test_physics_shadow_labels import boxes, projection
@@ -120,3 +122,65 @@ def test_static_footprint_events_report_no_predicted_change():
         "polygon_cache": {}, "onset": onset, "recovery": np.zeros_like(onset)}
     fit = extended_trajectory_fit(context, "car", 0, direction, [0, 0, 1, 0], projection(), mask)
     assert fit["edge_fit"] == 0 and fit["event_alignment"][0]["reason"] == "no_predicted_change"
+
+
+def sampling_case():
+    world = np.array([[[2.25, 2.25, 1.]]])
+    frame = {"sample_data_token": "camera", "image_size_wh": [8, 6],
+        "projection_world_to_image": np.eye(3, 4).tolist()}
+    return world, frame, np.ones((6, 8), bool), np.ones((1, 1), bool)
+
+
+def test_receiver_projection_uses_xy_pixels_and_preserves_strict_support():
+    world, frame, ground, receiver = sampling_case()
+    coordinates, visible, trace = sample_receiver_frame(world, frame, ground, receiver)
+    np.testing.assert_array_equal(coordinates, [[[2.25, 2.25]]])
+    assert visible.all() and trace["in_image_pixels"] == 1
+    assert trace["zero_support_reason"] == "supported"
+
+
+@pytest.mark.parametrize("failure", ["empty_source_ground", "empty_anchor_receiver", "no_front_projection", "outside_image"])
+def test_receiver_sampling_separates_geometry_and_source_mask_failures(failure):
+    world, frame, ground, receiver = sampling_case()
+    if failure == "empty_source_ground":
+        ground[:] = False
+    elif failure == "empty_anchor_receiver":
+        receiver[:] = False
+    elif failure == "no_front_projection":
+        world[..., 2] = -1
+    else:
+        world[..., 0] = 20
+    _, visible, trace = sample_receiver_frame(world, frame, ground, receiver)
+    assert not visible.any() and trace["zero_support_reason"] == failure
+
+
+def test_binary_sampling_erosion_is_diagnostic_not_relaxed_support():
+    world, frame, ground, receiver = sampling_case()
+    ground[:] = False
+    ground[2, 2] = True
+    coordinates, visible, trace = sample_receiver_frame(world, frame, ground, receiver)
+    assert not visible.any() and trace["zero_support_reason"] == "ground_bilinear_rejection"
+    assert trace["ground_nearest_pixels"] == 1 and trace["ground_bilinear_pixels"] == 0
+    supported, flow_trace = sample_receiver_flow({"receiver_flow_supported": ground}, coordinates, ground.shape, receiver)
+    assert not supported.any() and flow_trace["zero_support_reason"] == "flow_bilinear_rejection"
+    assert flow_trace["source_supported_pixels"] == 1
+
+
+def test_receiver_sampling_rejects_different_image_pixel_frames():
+    world, frame, ground, receiver = sampling_case()
+    with pytest.raises(ValueError, match="pixel frame"):
+        sample_receiver_frame(world, frame, ground[:4], receiver)
+    coordinates, _, _ = sample_receiver_frame(world, frame, ground, receiver)
+    with pytest.raises(ValueError, match="pixel frame"):
+        sample_receiver_flow({"receiver_flow_supported": ground[:4]}, coordinates, ground.shape, receiver)
+
+
+def test_receiver_sampling_summary_keeps_empty_reference_separate():
+    world, frame, ground, receiver = sampling_case()
+    receiver[:] = False
+    _, _, trace = sample_receiver_frame(world, frame, ground, receiver)
+    trace.update(is_reference=True, relative_frame=0, cached_central_visibility_mismatch_pixels=0)
+    summary = receiver_sampling_summary([trace])
+    assert summary["empty_reference_receiver_frames"] == 1
+    assert summary["cached_central_mismatch_frames"] == 0
+    assert summary["flow_comparisons"] == 0
