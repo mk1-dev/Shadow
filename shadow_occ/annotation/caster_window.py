@@ -29,9 +29,12 @@ def extend_pairs(left, right, forward, backward, radius):
     return chain
 
 
-def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cache, light_prior=None, expand=True):
+def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cache, light_prior=None,
+                     expand=True, proposal_darkness_ratio=.92):
     from shadow_occ.annotation.physics_labels import footprint_polygon
 
+    if not 0 < proposal_darkness_ratio <= 1:
+        raise ValueError("Caster proposal darkness ratio must be in (0, 1]")
     roi = np.zeros(arrays["receiver_valid"].shape, np.uint8)
     for track in tracks:
         for light_id, direction in enumerate(directions):
@@ -45,15 +48,63 @@ def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cach
                     cv2.fillConvexPoly(roi, polygon, 1)
             except ValueError:
                 continue
-    dark = arrays["receiver_valid"] & (arrays["appearance_local_ratio"][1] < .88)
-    learned = arrays.get("learned_bev_receiver_support", np.ones_like(dark))
-    flow = arrays["shadow_flow_supported"]
+    roi = roi > 0
+    receiver = arrays["receiver_valid"]
+    ratio = arrays["appearance_local_ratio"][1]
+    dark = receiver & np.isfinite(ratio) & (ratio < proposal_darkness_ratio)
+    learned = arrays.get("learned_bev_receiver_support", np.ones_like(receiver)) & receiver
+    flow = arrays["shadow_flow_supported"] & receiver
     original = arrays["shadow_candidate"].copy()
-    added = dark & (roi > 0) & learned & flow
-    arrays["shadow_candidate"] = original | added if expand else original
-    return roi > 0, {"original_pixels": int(original.sum()), "caster_roi_pixels": int((roi > 0).sum()),
-        "added_observed_pixels": int((added & ~original).sum()) if expand else 0,
-        "scope": "GT/light swept ROI proposes search only; observed darkness, BEV and flow are still required"}
+    # This caster-conditioned pool is built from observed signals directly. It is
+    # intentionally not defined as a subset of the photometric candidate mask.
+    caster_pool = roi & dark & learned & flow
+    added = caster_pool & ~original
+    arrays["shadow_candidate"] = original | caster_pool if expand else original
+    pixel_counts = {
+        "caster_roi_pixels": int(roi.sum()),
+        "caster_roi_receiver_pixels": int((roi & receiver).sum()),
+        "caster_roi_dark_pixels": int((roi & dark).sum()),
+        "caster_roi_flow_pixels": int((roi & flow).sum()),
+        "caster_roi_bev_pixels": int((roi & learned).sum()),
+        "caster_own_component_pixels": int(caster_pool.sum()),
+        "overlap_original": int((caster_pool & original).sum()),
+        "added": int(added.sum()),
+    }
+    return roi, {"original_pixels": int(original.sum()), **pixel_counts,
+        "added_observed_pixels": int(added.sum()) if expand else 0,
+        "proposal_darkness_ratio": float(proposal_darkness_ratio),
+        "scope": "GT/light ROI proposes a separate observed dark/receiver/BEV/flow pool; projection never creates positive pixels"}
+
+
+def summarize_track_states(states, inconsistent, samples):
+    """Separate complete GT tracks from partial observations; never fill gaps."""
+    complete, diagnostics = {}, {}
+    counts = {"seen": len(states), "complete": 0, "partial": 0, "inconsistent": 0, "missing_samples": 0}
+    for token, values in states.items():
+        missing = [sample for sample in samples if sample not in values]
+        if token in inconsistent:
+            status = "inconsistent"
+            counts["inconsistent"] += 1
+        elif missing:
+            status = "partial"
+            counts["partial"] += 1
+        else:
+            status = "complete"
+            counts["complete"] += 1
+            complete[token] = np.asarray([values[sample] for sample in samples], np.float64)
+        counts["missing_samples"] += len(missing)
+        diagnostics[token] = {"status": status, "observed_samples": len(samples)-len(missing),
+            "missing_samples": len(missing), "missing_sample_tokens": missing}
+    return complete, diagnostics, counts
+
+
+def trajectory_track_state(context, token):
+    if context is None:
+        return {"status": "no_long_window", "observed_samples": None, "missing_samples": None}
+    if len(context["frames"]) <= 3:
+        return {"status": "three_frame_only", "observed_samples": len(context["frames"]), "missing_samples": None}
+    return context["track_state_diagnostics"].get(token, {
+        "status": "unseen", "observed_samples": 0, "missing_samples": len(context["sample_tokens"])})
 
 
 def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
@@ -110,11 +161,11 @@ def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
             onset[index] = became_dark
         else:
             recovery[index] = became_dark
-    tracks = {token: np.asarray([values[sample] for sample in samples], np.float64)
-              for token, values in states.items() if token not in inconsistent and all(sample in values for sample in samples)}
+    tracks, diagnostics, state_counts = summarize_track_states(states, inconsistent, samples)
     return {"frames": frames, "sample_tokens": samples, "middle": middle, "onset": onset,
         "recovery": recovery, "visible": visible, "tracks": tracks, "exposures": exposures,
-        "polygon_cache": {}, "timestamps": [frame["camera_timestamp"] for frame in frames]}
+        "polygon_cache": {}, "timestamps": [frame["camera_timestamp"] for frame in frames],
+        "track_state_diagnostics": diagnostics, "track_state_counts": state_counts}
 
 
 def extended_trajectory_fit(context, token, light_id, direction, plane, projection, mask):

@@ -342,7 +342,12 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
                        and value["light_id"] == best["light_id"] and value.get("motion_supported")), default=0.0)
     projection_strength = (best["score"]*float(np.clip(
         max(gain, motion_gain)/SCORE_CONTRACT["projection_gain_scale"], 0, 1))) if best else 0.0
-    events = arrays["receiver_boundary_formation"] | arrays["receiver_boundary_recovery"]
+    formation = arrays["receiver_boundary_formation"] & mask
+    recovery = arrays["receiver_boundary_recovery"] & mask
+    events = formation | recovery
+    raw_transition = {"formation_pixels": int(formation.sum()), "recovery_pixels": int(recovery.sum()),
+        "observed_pixels": int(events.sum()), "observed_transition_types": int(formation.any())+int(recovery.any()),
+        "scope": "unconditional component events in the central triplet; not selected by best_projection"}
     extended = (best["transitions"].get("long_window") or {}) if best else {}
     observed_fraction = max((events & mask).sum()/area, extended.get("transition_fraction", 0))
     transition = float(np.clip(observed_fraction/SCORE_CONTRACT["transition_fraction_scale"], 0, 1))
@@ -421,7 +426,8 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
             "winner": winner, "winner_margin": float(margin), "scores": scores,
             "shadow_supported": accepted, "ground_fraction": ground_fraction,
             "entity_fraction": entity_fraction, "unknown_fraction": unknown_fraction,
-            "transition_fraction": float((events & mask).sum()/area), "material_persistence": persistence,
+            "transition_fraction": float(events.sum()/area), "raw_transition_events": raw_transition,
+            "material_persistence": persistence,
             "matched_transition_strength": float(transition), "material_nonresponse_fraction": float(nonresponse),
             "static_appearance_is_shared_evidence": True,
             "without_mature_3d": {"winner": without_order[0], "shadow_supported": without_supported,

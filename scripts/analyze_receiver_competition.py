@@ -96,13 +96,18 @@ def main():
     rows, winners, scenes, panels = [], Counter(), defaultdict(Counter), []
     items = read_rows(root/"decisions.jsonl")
     selected_reviews = review_ids(items, args.review_limit, args.seed)
+    window_audit = read_rows(root/"window_audit.jsonl")
+    caster_windows = {row["window_id"]: row for row in window_audit
+                      if row.get("status") == "caster_proposals" and row.get("window_id")}
     for item in items:
         evidence = item.get("receiver_competition")
         if evidence is None:
             raise ValueError("Run labels with --receiver-competition on or score-only")
         decision = item["shadow_decision"]
         baseline = decision.get("baseline_projection_decision", decision)
+        best = evidence.get("best_projection") or {}
         row = {"id": item["id"], "scene_name": item["scene_name"], "camera": item["camera"],
+               "window_id": (item.get("bev_flow") or {}).get("window_id"),
                "image": item["image"], "mask": item["mask"], "winner": evidence["winner"],
                "scores": evidence["scores"], "winner_margin": evidence["winner_margin"],
                "baseline_scores": evidence["baseline_scores"],
@@ -112,7 +117,12 @@ def main():
                "without_mature_3d": evidence.get("without_mature_3d"),
                "matched_transition_strength": evidence.get("matched_transition_strength", 0),
                "material_nonresponse_fraction": evidence.get("material_nonresponse_fraction", 0),
-               "best_projection_transitions": (evidence.get("best_projection") or {}).get("transitions"),
+               "raw_transition_events": evidence.get("raw_transition_events"),
+               "best_projection_transitions": best.get("transitions"),
+               "best_projection_instance_token": best.get("instance_token"),
+               "best_projection_light_id": best.get("light_id"),
+               "long_window_track_state": best.get("long_window_track_state"),
+               "long_window_missing_samples": best.get("long_window_missing_samples"),
                "light_prior": {"confidence": item["light_prior"]["confidence"],
                    "model_source": item["light_prior"].get("model_source")} if item.get("light_prior") else None,
                "temporal_window": item.get("temporal_window"), "caster_proposals": item.get("caster_proposals"),
@@ -123,6 +133,8 @@ def main():
                "competition_supported": evidence["shadow_supported"],
                "exported_positive": item["exported_label"] == "YES"}
         rows.append(row)
+        if row["window_id"] is not None and row["caster_proposals"] is not None:
+            caster_windows.setdefault(row["window_id"], row["caster_proposals"])
         winners[row["winner"]] += 1
         scenes[row["scene_name"]].update({"components": 1, "baseline_accepted": int(row["baseline_accepted"]),
             "competition_supported": int(row["competition_supported"]), "exported_positive": int(row["exported_positive"])})
@@ -167,8 +179,27 @@ def main():
         panels += [np.zeros_like(panels[0]) for _ in range((-len(panels)) % per_row)]
         checked_write_image(output/"contact_sheet.jpg", np.vstack([
             np.hstack(panels[index:index+per_row]) for index in range(0, len(panels), per_row)]))
+    caster_keys = ("caster_roi_pixels", "caster_roi_receiver_pixels", "caster_roi_dark_pixels",
+        "caster_roi_flow_pixels", "caster_roi_bev_pixels", "caster_own_component_pixels",
+        "overlap_original", "added_observed_pixels")
+    caster_summary = {key: sum(int(value.get(key, 0)) for value in caster_windows.values()) for key in caster_keys}
+    caster_summary.update({"windows": len(caster_windows), "windows_with_added":
+        sum(int(value.get("added_observed_pixels", 0) > 0) for value in caster_windows.values()),
+        "proposal_darkness_ratios": sorted({value.get("proposal_darkness_ratio") for value in caster_windows.values()
+                                            if value.get("proposal_darkness_ratio") is not None}),
+        "scope": "unique BEV windows; component rows repeat their source-window proposal counts"})
+    raw_events = [row["raw_transition_events"] or {} for row in rows]
+    long_states = Counter(row["long_window_track_state"] or "no_best_projection" for row in rows)
+    track_windows = {row["window_id"]: row.get("track_state_counts") for row in window_audit
+                     if row.get("status") == "caster_proposals" and row.get("track_state_counts")}
+    track_totals = {key: sum(int(value.get(key, 0)) for value in track_windows.values())
+                    for key in ("seen", "complete", "partial", "inconsistent", "missing_samples")}
     write_json(output/"summary.json", {"components": len(rows), "winner_counts": dict(winners),
         "score_protocols": dict(Counter(row["score_protocol"] for row in rows)),
+        "caster_proposals": caster_summary,
+        "raw_event_components": sum(value.get("observed_transition_types", 0) > 0 for value in raw_events),
+        "raw_formation_pixels": sum(value.get("formation_pixels", 0) for value in raw_events),
+        "raw_recovery_pixels": sum(value.get("recovery_pixels", 0) for value in raw_events),
         "matched_transition_components": sum(row["matched_transition_strength"] > 0 for row in rows),
         "observed_transition_components": sum((row["best_projection_transitions"] or {}).get(
             "observed_transition_types", 0) > 0 for row in rows),
@@ -179,6 +210,16 @@ def main():
         "long_matched_components": sum(((row["best_projection_transitions"] or {}).get("long_window") or {}).get(
             "edge_fit", 0) > 0 for row in rows),
         "temporal_frame_counts": dict(Counter((row["temporal_window"] or {}).get("frames", 3) for row in rows)),
+        "temporal_window_frame_counts": dict(Counter(row.get("temporal_frames", 3) for row in window_audit
+                                                     if row.get("status") == "caster_proposals")),
+        "gt_track_state_totals": {"windows": len(track_windows), **track_totals,
+            "scope": "sum over unique windows; GT vehicle track states, not shadow truth"},
+        "long_window_track_state_counts": dict(long_states),
+        "transition_metric_scope": {
+            "raw_event_components": "component mask in the central triplet, unconditional on caster projection",
+            "observed_transition_components": "selected best_projection transitions only",
+            "long_event_components": "selected best_projection long-window transitions only",
+            "long_matched_components": "selected best_projection long-window edge_fit > 0"},
         "mature_3d_counterfactual": {
             "available": sum(row["without_mature_3d"] is not None for row in rows),
             "without_mature_supported": sum(bool((row["without_mature_3d"] or {}).get("shadow_supported")) for row in rows),

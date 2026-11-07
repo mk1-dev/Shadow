@@ -97,6 +97,8 @@ def main():
     parser.add_argument("--light-prior-weight", type=float, default=.15)
     parser.add_argument("--candidate-source", choices=["photometric", "caster"],
                         help="Default caster for factorized BEV labels; GT projection expands search, never creates positive pixels")
+    parser.add_argument("--caster-proposal-darkness-ratio", type=float, default=.92,
+                        help="Observed-middle-frame darkness for the caster-conditioned proposal pool; not a final score")
     parser.add_argument("--temporal-radius", type=int, default=3, help="1=3 frames, 2=5, 3=7, 4=9 when consecutive cached pairs exist")
     args = parser.parse_args()
     args.receiver_competition = args.receiver_competition or (
@@ -113,7 +115,7 @@ def main():
     args.candidate_source = args.candidate_source or ("caster" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "photometric")
     if not 1 <= args.temporal_radius <= 4:
         parser.error("Temporal radius must be between 1 and 4")
-    if args.max_components_per_window < 1 or args.review_limit < 0:
+    if args.max_components_per_window < 1 or args.review_limit < 0 or not 0 < args.caster_proposal_darkness_ratio <= 1:
         raise ValueError("Invalid processing limits")
     if not 0 <= args.fixed_light_id < len(light_bank()) or not 0 < args.consensus_fraction <= 1:
         parser.error("Invalid fixed light ID or consensus fraction")
@@ -235,17 +237,28 @@ def main():
         polygon_cache, extended_context, expanded = {}, None, None
         if grid is not None:
             roi, expanded = caster_proposals(bev_arrays, tracks, directions, plane, rank_projection,
-                polygon_cache, light_prior, expand=args.candidate_source == "caster")
+                polygon_cache, light_prior, expand=args.candidate_source == "caster",
+                proposal_darkness_ratio=args.caster_proposal_darkness_ratio)
             rank_maps["dark"] = bev_arrays["shadow_candidate"]
             if config.allow_partial_temporal:
                 rank_maps["onset"] = bev_arrays["receiver_boundary_formation"] & rank_maps["dark"]
                 rank_maps["recovery"] = bev_arrays["receiver_boundary_recovery"] & rank_maps["dark"]
                 rank_maps["same_patch_cycle"] = rank_maps["onset"] & rank_maps["recovery"]
             counts["caster_added_observed_pixels"] += expanded["added_observed_pixels"]
+            for key in ("caster_roi_pixels", "caster_roi_receiver_pixels", "caster_roi_dark_pixels",
+                        "caster_roi_flow_pixels", "caster_roi_bev_pixels", "caster_own_component_pixels",
+                        "overlap_original"):
+                counts[key] += expanded[key]
+            counts["caster_added_pixels"] += expanded["added"]
+            counts["caster_windows_with_added"] += int(expanded["added"] > 0)
             chain = extend_pairs(left, right, successor, predecessor, args.temporal_radius)
             if len(chain) > 2:
                 extended_context = long_observations(chain, frame["sample_data_token"], bev_arrays, roi, base, stats, analysis)
             counts[f"temporal_frames:{len(chain)+1}"] += 1
+            audit.append({"left_pair": left["id"], "right_pair": right["id"], "window_id": bev_ref["id"],
+                "status": "caster_proposals", **expanded,
+                "temporal_frames": len(chain)+1,
+                "track_state_counts": extended_context["track_state_counts"] if extended_context else None})
         # Never bridge gaps across unsupported receivers by dilation or closing.
         number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
         components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
@@ -343,7 +356,17 @@ def main():
                     "timestamps": extended_context["timestamps"] if extended_context else [value["camera_timestamp"] for value in
                         (left["frames"][0], frame, right["frames"][1])],
                     "exposures": extended_context["exposures"] if extended_context else None,
-                    "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else len(tracks)},
+                    "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else len(tracks),
+                    "track_state_counts": extended_context["track_state_counts"] if extended_context else
+                        {"seen": len(tracks), "complete": len(tracks), "partial": 0, "inconsistent": 0, "missing_samples": 0},
+                    **({"gt_tracks_seen": extended_context["track_state_counts"]["seen"],
+                        "gt_tracks_complete": extended_context["track_state_counts"]["complete"],
+                        "gt_tracks_partial": extended_context["track_state_counts"]["partial"],
+                        "gt_tracks_inconsistent": extended_context["track_state_counts"]["inconsistent"],
+                        "gt_missing_samples": extended_context["track_state_counts"]["missing_samples"]}
+                       if extended_context else {
+                        "gt_tracks_seen": len(tracks), "gt_tracks_complete": len(tracks), "gt_tracks_partial": 0,
+                        "gt_tracks_inconsistent": 0, "gt_missing_samples": 0})},
                 "evidence": report, "casters": caster_metadata, "physics_context": context,
                 "bev_flow": bev_component, "receiver_competition": competition})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
@@ -511,6 +534,7 @@ def main():
         "receiver_score_protocol": SCORE_PROTOCOL,
         "light_prior_sha256": digest(args.light_prior_manifest) if args.light_prior_manifest else None,
         "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
+        "caster_window_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/caster_window.py"),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),
         "coordinate_frame": "BEV caster matching; observed middle-camera trimaps" if args.bev_flow_root else "middle camera pixels; metric receiver points in world ground plane",

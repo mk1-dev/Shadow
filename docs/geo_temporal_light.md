@@ -76,8 +76,12 @@ extracting useful additional image information; the input ablations must test it
 
 `--candidate-source caster` rasterizes the union of GT caster/light footprints
 across the central triplet as a search ROI. Newly proposed pixels must still
-be observed dark ground with frozen BEV and flow support. Projection never
-creates positive pixels by itself. `photometric` keeps the old candidate pool.
+be observed dark ground with frozen BEV and flow support. The caster-conditioned
+pool is built independently from the photometric `shadow_candidate` mask and
+then unioned with it. Its default middle-frame proposal ratio is `0.92`; this
+ratio controls proposal recall only and is not a final shadow score. Projection
+never creates positive pixels by itself. `photometric` keeps the old candidate
+pool.
 
 `--temporal-radius 1/2/3/4` requests 3/5/7/9 frames, default 7, by following
 consecutive cached pairs from the same scene and camera. Missing observations
@@ -94,8 +98,10 @@ invalid exposure supply no invented temporal evidence. Static shadow existence
 retains its separate projection branch.
 
 The recorded actual frame count, timestamps, exposure fits and complete-track
-count show whether long evidence was really used. All contributing frame/sample
-IDs participate in the independent-light exclusion, including remote frames.
+count show whether long evidence was really used. GT track states are split into
+`seen / complete / partial / inconsistent`, with explicit missing-sample counts;
+missing states are never extrapolated. All contributing frame/sample IDs
+participate in the independent-light exclusion, including remote frames.
 The segmenter/VLM training interfaces remain unchanged; no training is started
 by the default refinement audit.
 
@@ -137,3 +143,15 @@ Compare full, without_light_prior, photometric_candidates, three_frame,
 without_mature_3d and complete_temporal. The expanded pool changes component IDs;
 report candidate counts and annotation coverage, not just accepted counts or an
 unmatched old/new precision claim. Freeze split/thresholds before final eval.
+
+For the first expanded-pool audit, inspect each unique-window stage separately:
+`caster_roi_pixels -> caster_roi_receiver_pixels -> caster_roi_dark_pixels ->
+caster_roi_flow_pixels -> caster_roi_bev_pixels -> caster_own_component_pixels`,
+then `overlap_original` and `added_observed_pixels`. These fields are written to
+`window_audit.jsonl` even when a window produces no components, and aggregated
+under `caster_proposals` in the competition summary.
+
+`observed_transition_components` remains conditional on the selected
+`best_projection.transitions`. Use `raw_event_components` for the unconditional
+central-triplet event count, and `long_window_track_state_counts` to identify
+whether a selected caster was complete, partial, inconsistent or unseen.

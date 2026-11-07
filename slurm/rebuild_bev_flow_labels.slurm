@@ -49,5 +49,6 @@ python -u scripts/rebuild_bev_flow_labels.py \
   --appearance-prior-weight "${SHADOW_APPEARANCE_PRIOR_WEIGHT:-0.2}" \
   --mature-object-mode "${SHADOW_MATURE_OBJECT_MODE:-required}" \
   --candidate-source "${SHADOW_CANDIDATE_SOURCE:-caster}" \
+  --caster-proposal-darkness-ratio "${SHADOW_CASTER_PROPOSAL_DARKNESS_RATIO:-0.92}" \
   --temporal-radius "${SHADOW_TEMPORAL_RADIUS:-3}" \
   "${REUSE_ARGS[@]}"

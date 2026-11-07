@@ -102,13 +102,18 @@ Compare these fields under `<train|val>/competition/summary.json`:
 - `winner_counts`: fewer unjustified material decisions is not automatically
   more correct shadows; inspect unknown and shadow outcomes separately.
 - `observed_transition_components` / `matched_transition_components`: whether
-  actual signed changes provide usable caster-conditioned support.
+  actual signed changes provide usable caster-conditioned support. These are
+  conditional on the selected `best_projection.transitions`, not counts over all
+  raw events; use `raw_event_components` for the unconditional component count.
 - `mature_3d_counterfactual`: identical-candidate changes due only to mature
   entity-motion evidence.
 - `baseline_accepted`, `competition_supported`, `exported_positive`: survival
   before competition, after competition, and after mask fusion respectively.
 - Label summary `unique_weak_association`: actual exported association support,
   not merely the existence of GT object tracks.
+- `long_window_track_state_counts`: selected caster state coverage in the actual
+  temporal window (`complete / partial / inconsistent / unseen`). Runs requesting
+  seven frames do not imply complete GT states for every caster.
 
 Per-component `best_projection_transitions` includes observed/expected pixel
 counts, match fractions and nonresponse. `without_mature_3d` and

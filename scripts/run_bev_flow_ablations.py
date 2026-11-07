@@ -38,6 +38,7 @@ def main():
         ROOT/"scripts/reselect_bev_flow.py", ROOT/"scripts/build_physics_shadow_labels.py",
         ROOT/"scripts/build_bev_flow_annotation_manifest.py", ROOT/"shadow_occ/annotation/cached_bev.py",
         ROOT/"shadow_occ/annotation/physics_labels.py", ROOT/"shadow_occ/annotation/bev_teacher.py",
+        ROOT/"shadow_occ/annotation/caster_window.py",
         ROOT/"shadow_occ/annotation/physics_motion.py", ROOT/"shadow_occ/annotation/receiver_explanations.py",
         ROOT/"shadow_occ/annotation/mature_objects.py"]}
 
@@ -55,6 +56,7 @@ def main():
             "appearance_prior_weight": 0.2,
             "mature_object_mode": "required",
             "candidate_source": "caster", "temporal_radius": 3,
+            "caster_proposal_darkness_ratio": .92,
             "consensus_fraction": 2/3, **config["variants"][name]}
         recipe.setdefault("receiver_competition", "off" if recipe["decision_policy"] == "strict-v2" else "on")
         recipe.setdefault("temporal_evidence", "complete" if recipe["decision_policy"] == "strict-v2" else "available")
@@ -103,7 +105,8 @@ def main():
                 "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight",
                 "temporal_evidence")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
-            options += ["--candidate-source", recipe["candidate_source"], "--temporal-radius", recipe["temporal_radius"]]
+            options += ["--candidate-source", recipe["candidate_source"], "--temporal-radius", recipe["temporal_radius"],
+                        "--caster-proposal-darkness-ratio", recipe["caster_proposal_darkness_ratio"]]
             if recipe["light_prior_mode"] == "on":
                 if not args.light_prior_manifest:
                     parser.error("This light-prior arm requires --light-prior-manifest")

@@ -9,7 +9,7 @@ import numpy as np
 
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.annotation.illumination import light_prior_bonus
-from shadow_occ.annotation.caster_window import extended_trajectory_fit
+from shadow_occ.annotation.caster_window import extended_trajectory_fit, trajectory_track_state
 
 
 @dataclass(frozen=True)
@@ -299,6 +299,7 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             fit["complete_score"], fit["complete_temporal_gain"] = fit["score"], fit["temporal_gain"]
             extended = extended_trajectory_fit(temporal_context, track["instance_token"], light_id,
                 direction, plane, projection, mask) if temporal_context is not None else None
+            track_state = trajectory_track_state(temporal_context, track["instance_token"])
             if config.allow_partial_temporal:
                 fit["score"], fit["temporal_gain"] = fit["available_score"], fit["available_temporal_gain"]
                 fit["control"] = fit["available_control"]
@@ -308,6 +309,9 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
                     fit["available_temporal_gain"] = extended["temporal_gain"]
                     moving = extended["movement_m"] >= config.minimum_motion_m
             fit["long_window"] = extended
+            fit["long_window_track_state"] = track_state["status"]
+            fit["long_window_missing_samples"] = track_state["missing_samples"]
+            fit["long_window_observed_samples"] = track_state["observed_samples"]
             existence_score = fit["cover"] if config.allow_static_existence else fit["score"]
             shadow_fit_passes = fit["cover"] >= config.minimum_cover and existence_score >= config.minimum_score
             required_pixels = max(config.minimum_change_pixels, config.minimum_change_fraction*local_mask.sum())

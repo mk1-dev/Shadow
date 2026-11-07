@@ -39,8 +39,11 @@ def main():
     parser.add_argument("--light-prior-manifest")
     parser.add_argument("--light-prior-weight", type=float, default=.15)
     parser.add_argument("--candidate-source", choices=["photometric", "caster"], default="caster")
+    parser.add_argument("--caster-proposal-darkness-ratio", type=float, default=.92)
     parser.add_argument("--temporal-radius", type=int, choices=(1, 2, 3, 4), default=3)
     args = parser.parse_args()
+    if not 0 < args.caster_proposal_darkness_ratio <= 1:
+        parser.error("Caster proposal darkness ratio must be in (0, 1]")
     if args.reuse_analysis and args.reuse_source_analysis:
         parser.error("Choose retrying this output or reusing source windows, not both")
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
@@ -164,6 +167,7 @@ def main():
                 "--appearance-prior-weight", args.appearance_prior_weight,
                 "--light-prior-weight", args.light_prior_weight,
                 "--candidate-source", args.candidate_source, "--temporal-radius", args.temporal_radius,
+                "--caster-proposal-darkness-ratio", args.caster_proposal_darkness_ratio,
                 "--output-root", labels, *light_args, owner=split)
         else:
             print(f"REUSING labels split={split}", flush=True)
@@ -171,7 +175,7 @@ def main():
         if label_protocol.get("receiver_competition", "off") != args.receiver_competition:
             raise ValueError("Cached label competition mode differs; choose a new output root")
         if args.reuse_analysis:
-            for key in ("candidate_source", "temporal_radius", "light_prior_weight"):
+            for key in ("candidate_source", "caster_proposal_darkness_ratio", "temporal_radius", "light_prior_weight"):
                 if label_protocol.get(key) != getattr(args, key):
                     raise ValueError(f"Cached label setting differs: {key}; use a new output root")
             expected_light = digest(args.light_prior_manifest) if args.light_prior_manifest else None

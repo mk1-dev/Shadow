@@ -1,6 +1,8 @@
 import numpy as np
 
-from shadow_occ.annotation.caster_window import caster_proposals, extend_pairs, extended_trajectory_fit
+from shadow_occ.annotation.caster_window import (
+    caster_proposals, extend_pairs, extended_trajectory_fit, summarize_track_states,
+)
 from shadow_occ.annotation.physics_labels import footprint_mask
 from tests.test_physics_shadow_labels import boxes, projection
 from tests.test_receiver_explanations import receiver_case
@@ -26,6 +28,29 @@ def test_gt_roi_expands_only_observed_dark_supported_ground():
     arrays["learned_bev_receiver_support"][:] = False
     caster_proposals(arrays, [{"instance_token": "car"}], [[1, 0, -1]], [0, 0, 1, 0], projection(), cache)
     assert not arrays["shadow_candidate"].any()
+
+
+def test_caster_pool_is_observed_signal_not_an_original_candidate_subset():
+    arrays, mask, _, polygons = receiver_case()
+    arrays["shadow_candidate"] = np.zeros_like(mask)
+    arrays["learned_bev_receiver_support"] = np.ones_like(mask)
+    arrays["appearance_local_ratio"][1][mask] = .90
+    roi, metadata = caster_proposals(arrays, [{"instance_token": "car"}], [[1, 0, -1]],
+        [0, 0, 1, 0], projection(), {("car", 0): polygons["car", 0]}, proposal_darkness_ratio=.92)
+    assert roi.any() and metadata["caster_own_component_pixels"] == mask.sum()
+    assert metadata["overlap_original"] == 0 and metadata["added"] == mask.sum()
+    assert arrays["shadow_candidate"][mask].all()
+
+
+def test_partial_gt_tracks_are_reported_and_never_extrapolated():
+    points = np.zeros((9, 3))
+    states = {"complete": {"s0": points, "s1": points, "s2": points},
+              "partial": {"s0": points, "s1": points},
+              "inconsistent": {"s0": points, "s1": points, "s2": points}}
+    complete, diagnostics, counts = summarize_track_states(states, {"inconsistent"}, ["s0", "s1", "s2"])
+    assert set(complete) == {"complete"}
+    assert counts == {"seen": 3, "complete": 1, "partial": 1, "inconsistent": 1, "missing_samples": 1}
+    assert diagnostics["partial"]["missing_sample_tokens"] == ["s2"]
 
 
 def test_long_window_uses_consecutive_camera_frames_without_crossing_scene():
