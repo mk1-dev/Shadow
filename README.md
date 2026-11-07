@@ -37,6 +37,17 @@ The [receiver competition workflow](docs/receiver_competition.md) combines these
 with ground-flow and illumination-boundary evidence. Feature-only caches need
 one mature-model inference export first; then audit on CPU before training.
 
+## Current Audit Priority
+
+Keep physical scores and model training frozen while running two independent
+checks: [receiver geometry consistency](docs/receiver_geometry_consistency.md)
+on all source windows, and [zero-shot RGB scene observability](docs/shadow_scene_observability.md)
+on clean temporal images. The latter prioritizes useful observation conditions;
+it does not provide shadow truth, masks, caster IDs or geometry validity.
+Cloudy/weak/unknown windows are retained, and static shadows are not excluded.
+Use `slurm/tag_shadow_observability.slurm` for the existing audit-case pilot;
+it trains no model and compares the already frozen physical results by stratum.
+
 ## Default HPC Pipeline
 
 The [geo-temporal light workflow](docs/geo_temporal_light.md) adds a trainable

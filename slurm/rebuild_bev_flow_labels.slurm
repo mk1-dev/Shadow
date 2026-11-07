@@ -36,6 +36,10 @@ fi
 if [[ -n "${SHADOW_LIGHT_PRIOR_MANIFEST:-}" ]]; then
   REUSE_ARGS+=(--light-prior-manifest "$SHADOW_LIGHT_PRIOR_MANIFEST")
 fi
+if [[ -n "${SHADOW_OBSERVABILITY_MANIFEST:-}" ]]; then
+  REUSE_ARGS+=(--observability-manifest "$SHADOW_OBSERVABILITY_MANIFEST"
+    --observability-order "${SHADOW_OBSERVABILITY_ORDER:-original}")
+fi
 python -u scripts/rebuild_bev_flow_labels.py \
   --source-root "${SHADOW_REBUILD_SOURCE:?Set the existing cached preparation root}" \
   --output-root "${SHADOW_ANNOTATION_ROOT:?Set a new output directory}" \

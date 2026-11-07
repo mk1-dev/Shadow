@@ -38,6 +38,8 @@ def main():
     parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
     parser.add_argument("--light-prior-manifest")
     parser.add_argument("--light-prior-weight", type=float, default=.15)
+    parser.add_argument("--observability-manifest")
+    parser.add_argument("--observability-order", choices=["original", "priority"], default="original")
     parser.add_argument("--candidate-source", choices=["photometric", "caster"], default="caster")
     parser.add_argument("--caster-proposal-darkness-ratio", type=float, default=.92)
     parser.add_argument("--temporal-radius", type=int, choices=(1, 2, 3, 4), default=3)
@@ -57,6 +59,10 @@ def main():
     args.shadow_baseline_manifest = args.shadow_baseline_manifest or shared_protocol.get("shadow_baseline_manifest")
     baseline_args = ["--shadow-baseline-manifest", args.shadow_baseline_manifest] if args.shadow_baseline_manifest else []
     light_args = ["--light-prior-manifest", args.light_prior_manifest] if args.light_prior_manifest else []
+    observability_args = (["--observability-manifest", args.observability_manifest,
+        "--observability-order", args.observability_order] if args.observability_manifest else [])
+    if args.observability_order == "priority" and not args.observability_manifest:
+        parser.error("Priority ordering requires observability-manifest")
     config = shared_protocol["config"]
     provenance = {"shared_source_bev_protocol": {
         "path": str(shared_protocol_path), "sha256": digest(shared_protocol_path)}, "splits": {}}
@@ -168,13 +174,16 @@ def main():
                 "--light-prior-weight", args.light_prior_weight,
                 "--candidate-source", args.candidate_source, "--temporal-radius", args.temporal_radius,
                 "--caster-proposal-darkness-ratio", args.caster_proposal_darkness_ratio,
-                "--output-root", labels, *light_args, owner=split)
+                "--output-root", labels, *light_args, *observability_args, owner=split)
         else:
             print(f"REUSING labels split={split}", flush=True)
         label_protocol = json.loads((labels/"label_protocol.json").read_text(encoding="utf-8"))
         if label_protocol.get("receiver_competition", "off") != args.receiver_competition:
             raise ValueError("Cached label competition mode differs; choose a new output root")
         if args.reuse_analysis:
+            if (label_protocol.get("observability_sha256") != (digest(args.observability_manifest) if args.observability_manifest else None)
+                    or label_protocol.get("observability_order", "original") != args.observability_order):
+                raise ValueError("Cached observability tags/order differ; use a new output root")
             for key in ("candidate_source", "caster_proposal_darkness_ratio", "temporal_radius", "light_prior_weight"):
                 if label_protocol.get(key) != getattr(args, key):
                     raise ValueError(f"Cached label setting differs: {key}; use a new output root")

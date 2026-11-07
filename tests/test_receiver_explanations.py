@@ -397,6 +397,13 @@ def test_active_bev_label_and_baseline_audit_pipeline(tmp_path, monkeypatch):
     sampled = json.loads((sampling/"train/summary.json").read_text())
     assert sampled["windows"] == 1 and sampled["cached_central_comparisons"] == 3
     assert (sampling/"train/windows.jsonl").exists()
+    consistency = script("audit_receiver_consistency").audit_split(
+        source/"train", tmp_path/"consistency", review_limit=0)
+    assert consistency["camera_tokens"] == 3
+    assert consistency["grid_consistency"]["windows"] == 1
+    assert consistency["grid_consistency"]["frame_identity_failures"] == 0
+    for offset in ("-1", "0", "1"):
+        assert consistency["grid_consistency"]["comparisons_by_relative_frame"][offset]["original64_vs_cached"]["xor_pixels"] == 0
     review = script("audit_shadow_geometry")
     by_id = {pair["id"]: pair for pair in pairs}
     forward = {(*(pair[key] for key in ("scene_name", "official_split", "camera")), pair["sample_token"]): pair for pair in pairs}
@@ -414,6 +421,31 @@ def test_active_bev_label_and_baseline_audit_pipeline(tmp_path, monkeypatch):
     assert (destination/"flow_stages.npz").exists()
     assert (destination/"observations.npz").exists()
     assert json.loads((destination/"audit.json").read_text())["case_id"] == item["id"]
+    from shadow_occ.annotation.observability import rgb_windows
+    from tests.test_shadow_observability import assessment, make_vote
+
+    rgb = rgb_windows(pairs, manifest.parent, "clean RGB prompt")
+    tag_manifest, tag_votes = tmp_path/"observability_inputs.jsonl", tmp_path/"observability_votes.jsonl"
+    write_rows(tag_manifest, rgb)
+    write_rows(tag_votes, [make_vote(row, assessment(shadow_observability="not_observed")) for row in rgb])
+    tagged_labels = tmp_path/"tagged_labels"
+    monkeypatch.setattr(sys, "argv", ["labels", "--pairs", str(manifest), "--analysis-root", str(flow),
+        "--bev-flow-root", str(bev), "--decision-policy", "factorized-v3", "--export-weak-labels",
+        "--observability-manifest", str(tag_votes), "--observability-order", "priority", "--output-root", str(tagged_labels)])
+    script("build_physics_shadow_labels").main()
+    tagged = read_rows(tagged_labels/"decisions.jsonl")
+    assert {row["id"]: row["exported_label"] for row in tagged} == {row["id"]: row["exported_label"] for row in decisions}
+    assert all(row["observability"]["stratum"] == "LOW_SIGNAL" for row in tagged)
+    assert [row["receiver_competition"]["scores"] for row in tagged] == [row["receiver_competition"]["scores"] for row in decisions]
+    shutil.copytree(labels, source/"train/labels")
+    report_root = tmp_path/"observability_report"
+    monkeypatch.setattr(sys, "argv", ["analysis", "--source-root", str(source), "--splits", "train",
+        "--manifest", str(tag_manifest), "--votes", str(tag_votes), "--output-root", str(report_root)])
+    script("analyze_shadow_observability").main()
+    report = json.loads((report_root/"summary.json").read_text())
+    assert report["splits"]["train"]["LOW_SIGNAL"]["windows"] == 1
+    assert report["splits"]["train"]["ALL_SOURCE"]["components"] == len(decisions)
+    assert len(read_rows(report_root/"priority_windows.jsonl")) == 1
 
 
 def test_transition_diagnostics_do_not_require_accepted_best_projection():

@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -24,6 +25,7 @@ from shadow_occ.annotation.physics_labels import (
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.annotation.illumination import PROTOCOL as LIGHT_PROTOCOL, validate_prior
+from shadow_occ.annotation.observability import for_window as window_observability, vote_index
 from shadow_occ.annotation.caster_window import (
     caster_proposals, component_transition_diagnostics, extend_pairs, long_observations,
 )
@@ -97,12 +99,16 @@ def main():
                         help="Use observed signed boundary events; default available for factorized-v3, complete for strict-v2")
     parser.add_argument("--light-prior-manifest", help="Frozen learned or astronomical per-window light distributions")
     parser.add_argument("--light-prior-weight", type=float, default=.15)
+    parser.add_argument("--observability-manifest", help="Zero-shot RGB votes; metadata and ordering only, never label acceptance")
+    parser.add_argument("--observability-order", choices=["original", "priority"], default="original")
     parser.add_argument("--candidate-source", choices=["photometric", "caster"],
                         help="Default caster for factorized BEV labels; GT projection expands search, never creates positive pixels")
     parser.add_argument("--caster-proposal-darkness-ratio", type=float, default=.92,
                         help="Observed-middle-frame darkness for the caster-conditioned proposal pool; not a final score")
     parser.add_argument("--temporal-radius", type=int, default=3, help="1=3 frames, 2=5, 3=7, 4=9 when consecutive cached pairs exist")
     args = parser.parse_args()
+    if args.observability_order == "priority" and not args.observability_manifest:
+        parser.error("Priority ordering requires observability-manifest")
     args.receiver_competition = args.receiver_competition or (
         "on" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "off")
     if args.receiver_competition != "off" and not args.bev_flow_root:
@@ -162,6 +168,14 @@ def main():
             raise ValueError("Duplicate camera/sample pair")
         successor[key] = pair
         predecessor[(*key[:3], pair["next_sample_token"])] = pair
+    observability_votes = vote_index(read_rows(args.observability_manifest)) if args.observability_manifest else {}
+    observations = {}
+    for left in pairs:
+        right = successor.get((left["scene_name"], left["official_split"], left["camera"], left["next_sample_token"]))
+        if right is not None:
+            observations[left["id"]] = window_observability(observability_votes, left, right)
+    if args.observability_order == "priority":
+        pairs = sorted(pairs, key=lambda left: observations.get(left["id"], {}).get("stratum") != "PRIORITY")
     counts, candidates, audit, transition_audit = Counter(), [], [], []
     directions = light_bank()
     checked = set()
@@ -171,6 +185,9 @@ def main():
             counts["pairs_without_successor"] += 1
             continue
         counts["windows_attempted"] += 1
+        window_started = time.perf_counter()
+        observability = observations[left["id"]]
+        counts[f"observability:{observability['stratum']}"] += 1
         for pair in (left, right):
             if pair["id"] not in checked:
                 check_pair_files(pair, base)
@@ -261,14 +278,16 @@ def main():
                 "status": "caster_proposals", **expanded,
                 "temporal_frames": len(chain)+1,
                 "track_state_counts": extended_context["track_state_counts"] if extended_context else None})
-        transition_audit.append({"window_id": window_id, "scene_name": left["scene_name"],
+        transition_record = {"window_id": window_id, "scene_name": left["scene_name"],
+            "observability": observability,
             "camera": left["camera"], "long_window_available": extended_context is not None,
             "timestamps": extended_context["timestamps"] if extended_context else None,
             "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else None,
             "track_state_counts": extended_context["track_state_counts"] if extended_context else None,
             "frames": extended_context["frame_diagnostics"] if extended_context else [],
             "central_onset_pixels": int(rank_maps["onset"].sum()),
-            "central_recovery_pixels": int(rank_maps["recovery"].sum())})
+            "central_recovery_pixels": int(rank_maps["recovery"].sum())}
+        transition_audit.append(transition_record)
         # Never bridge gaps across unsupported receivers by dilation or closing.
         number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
         components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
@@ -276,6 +295,7 @@ def main():
         if len(components) > args.max_components_per_window:
             counts["component_limit_windows"] += 1
             audit.append({"left_pair": left["id"], "right_pair": right["id"], "status": "too_many_components", "count": len(components)})
+            transition_record["processing_seconds"] = time.perf_counter()-window_started
             continue
         track_map = {track["instance_token"]: track for track in tracks}
         context = {"scene_name": left["scene_name"], "camera": left["camera"],
@@ -359,6 +379,7 @@ def main():
                 "timestamp": frame["camera_timestamp"], "mask": str(path), "mask_sha256": digest(path),
                 "ground_points": str(ground_path), "hypotheses": hypotheses,
                 "light_prior": light_prior,
+                "observability": observability,
                 "caster_proposals": expanded,
                 "association_frame_tokens": [value["sample_data_token"] for value in extended_context["frames"]] if extended_context else [],
                 "association_sample_tokens": extended_context["sample_tokens"] if extended_context else [],
@@ -385,6 +406,7 @@ def main():
                 "bev_flow": bev_component, "receiver_competition": competition})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
             counts.update(f"temporal_evidence_reason:{reason}" for reason in report.get("temporal_reasons", []))
+        transition_record["processing_seconds"] = time.perf_counter()-window_started
         counts["windows_processed"] += 1
         print(f"windows={counts['windows_processed']} components={len(components)} tracks={len(tracks)} scene={left['scene_name']}", flush=True)
     # Only other tracks outside the query's camera frames AND physical samples vote.
@@ -507,8 +529,14 @@ def main():
     write_rows(output/"decisions.jsonl", decisions)
     write_rows(output/"window_audit.jsonl", audit)
     write_rows(output/"transition_diagnostics.jsonl", transition_audit)
+    if args.observability_manifest:
+        write_rows(output/"observability_windows.jsonl", [{"left_pair": pair_id, **value}
+                                                       for pair_id, value in observations.items()])
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
+        "observability": {"enabled": bool(args.observability_manifest), "order": args.observability_order,
+            "windows_by_stratum": dict(Counter(value["stratum"] for value in observations.values())),
+            "policy": "all windows retained; visual strata never create YES/NO, enable physical gates or alter their scores"},
         "decision_policy": args.decision_policy,
         "existence_mode": "static-dynamic" if config.allow_static_existence else "motion",
         "ablation": {key: getattr(args, key) for key in ("light_search", "fixed_light_id", "trajectory_contrast",
@@ -548,6 +576,7 @@ def main():
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
         "receiver_score_protocol": SCORE_PROTOCOL,
         "light_prior_sha256": digest(args.light_prior_manifest) if args.light_prior_manifest else None,
+        "observability_sha256": digest(args.observability_manifest) if args.observability_manifest else None,
         "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
         "caster_window_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/caster_window.py"),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),

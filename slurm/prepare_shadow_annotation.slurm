@@ -23,11 +23,16 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFER
 read -r -a CAMERAS <<< "${SHADOW_CAMERAS:-CAM_FRONT CAM_FRONT_LEFT CAM_FRONT_RIGHT}"
 BASELINE_ARGS=()
 LIGHT_ARGS=()
+OBSERVABILITY_ARGS=()
 if [[ -n "${SHADOW_BASELINE_MANIFEST:-}" ]]; then
   BASELINE_ARGS+=(--shadow-baseline-manifest "$SHADOW_BASELINE_MANIFEST")
 fi
 if [[ -n "${SHADOW_LIGHT_PRIOR_MANIFEST:-}" ]]; then
   LIGHT_ARGS+=(--light-prior-manifest "$SHADOW_LIGHT_PRIOR_MANIFEST")
+fi
+if [[ -n "${SHADOW_OBSERVABILITY_MANIFEST:-}" ]]; then
+  OBSERVABILITY_ARGS+=(--observability-manifest "$SHADOW_OBSERVABILITY_MANIFEST"
+    --observability-order "${SHADOW_OBSERVABILITY_ORDER:-original}")
 fi
 
 conda activate "$ANNOTATION_ENV"
@@ -82,7 +87,7 @@ for SPLIT in train val; do
     --minimum-explanation-margin "${SHADOW_MIN_EXPLANATION_MARGIN:-0.05}" \
     --appearance-prior-weight "${SHADOW_APPEARANCE_PRIOR_WEIGHT:-0.2}" \
     --candidate-source "${SHADOW_CANDIDATE_SOURCE:-caster}" --temporal-radius "${SHADOW_TEMPORAL_RADIUS:-3}" \
-    --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels" "${LIGHT_ARGS[@]}"
+    --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels" "${LIGHT_ARGS[@]}" "${OBSERVABILITY_ARGS[@]}"
   if [[ "${SHADOW_RECEIVER_COMPETITION:-on}" != off ]]; then
     python -u scripts/analyze_receiver_competition.py \
       --labels-root "$ROOT_OUT/$SPLIT/labels" --output-root "$ROOT_OUT/$SPLIT/competition"

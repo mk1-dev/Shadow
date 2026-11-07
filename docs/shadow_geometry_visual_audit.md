@@ -101,3 +101,7 @@ plane and timing before fitting a light network. If directions cover the dark
 region but not its signed change, inspect complete track states and the per-frame
 event/projection panels. None of these audits measures shadow precision without
 an independent reference.
+
+For same-camera-token mask provenance, pixel IoU and isolated precision checks,
+use the [Receiver Geometry Consistency Audit](receiver_geometry_consistency.md).
+It consumes the existing artifacts rather than rerunning the visual workflow.

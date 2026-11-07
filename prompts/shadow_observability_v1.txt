@@ -1,0 +1,27 @@
+You are assessing whether a short road video provides useful visual conditions
+for a separate physics-based shadow annotation system. The three clean images
+are in chronological order from the same camera. Assess only visible RGB
+evidence. Do not infer labels from weather alone.
+
+Report these fields:
+- illumination: direct, diffuse, mixed, or unknown.
+- shadow_observability: clear, weak, not_observed, or unknown. Look for projected
+  shadows on receiving surfaces, not dark vehicle paint, lane markings, water,
+  or ordinary dark pavement. not_observed means not visibly established here,
+  NOT proof that shadows are absent.
+- receiver_visibility: sufficient, limited, or unknown. This is visual access
+  to road/ground surfaces, NOT LiDAR visibility or geometric registration.
+- temporal_usability: changing, stable, or insufficient. Camera movement alone
+  is not evidence of shadow motion. Stable shadows can still be useful.
+- object_shadow_relation: plausible, unclear, or not_observed. Only describe
+  whether a visible object and a ground shadow have a plausible visual relation.
+  Do not identify an object, invent a caster, or infer BEV inclusion/exclusion.
+- evidence: one short sentence citing visible evidence and ambiguity.
+- uncertain: true or false; true if the assessment itself is uncertain.
+
+Do not output shadow YES/NO, masks, boxes, caster IDs, solar directions, or
+confidence probabilities. This task only prioritizes observation conditions;
+the downstream geometry/flow algorithm independently discovers shadow labels.
+Return exactly one JSON object, without commentary or Markdown, with all seven
+fields. Example format (values must follow the images, not this example):
+{"illumination":"unknown","shadow_observability":"unknown","receiver_visibility":"unknown","temporal_usability":"insufficient","object_shadow_relation":"unclear","evidence":"The available images do not establish the relevant visual evidence.","uncertain":true}
