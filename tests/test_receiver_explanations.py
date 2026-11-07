@@ -272,7 +272,7 @@ def test_active_bev_label_and_baseline_audit_pipeline(tmp_path, monkeypatch):
     write_rows(flow/"pair_metrics.jsonl", metrics)
     bev, labels, audit = tmp_path/"bev", tmp_path/"labels", tmp_path/"audit"
     monkeypatch.setattr(sys, "argv", ["analyze", "--pairs", str(manifest), "--analysis-root", str(flow),
-        "--feature-gate", "none", "--extent-m", "4", "--output-root", str(bev)])
+        "--feature-gate", "none", "--extent-m", "4", "--mature-object-mode", "off", "--output-root", str(bev)])
     script("analyze_bev_flow_discrepancy").main()
     monkeypatch.setattr(sys, "argv", ["labels", "--pairs", str(manifest), "--analysis-root", str(flow),
         "--bev-flow-root", str(bev), "--decision-policy", "factorized-v3", "--export-weak-labels", "--output-root", str(labels)])

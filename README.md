@@ -6,18 +6,21 @@ The active experiment is **BEV-Flow-Guided Shadow Annotation**. Reuse the mature
 UniAD/OpenDriveVLA BEVFormer as a frozen encoder, align its spatial features with
 three-frame physical BEV and image flow, and generate receiver-grounded shadow
 regions for the existing segmenter and unified VLM. OCC training remains the
-next stage. Existing 3D object GT supplies the physical tracks.
+next stage. Existing 3D object GT supplies the physical caster tracks. Decoded
+mature-model 3D predictions provide a separate entity/motion explanation, not
+shadow ground truth and not a replacement for the GT caster trajectories.
 
 The executable BEV path is:
 
 ```text
-existing UniAD/OpenDriveVLA BEVFormer -> frozen spatial BEV cache
+existing UniAD/OpenDriveVLA -> frozen BEV + predicted 3D boxes/tracks/velocity
 nuScenes 3D tracks / ground / poses -> physical BEV and geometric expected flow
 three camera frames / optical flow -> aligned brightness and observed flow
                                     |
                    common world receiver / fixed BEV grid
                                     |
-            BEV components -> caster/light trajectory matching
+        BEV components -> GT caster/light trajectory matching
+        predicted 3D surface motion <-> measured image optical flow
                                     |
        entity / material / shadow / unknown explanation competition
                                     |
@@ -28,10 +31,11 @@ Use `scripts/export_mature_bev.py` in the existing OpenDriveVLA environment;
 Shadow does not copy or retrain that encoder. The CPU join and label builder run
 in the annotation environment. See [BEV redesign and HPC commands](docs/shadow_track_contrast_v2.md#bev-flow-redesign).
 
-The [receiver competition workflow](docs/receiver_competition.md) implements the
-2D-appearance versus 3D-entity comparison: ray-volume exclusion, separate ground
-flow and illumination-boundary evidence, and real/shifted caster explanations.
-Start with its CPU audit on existing caches before submitting another training run.
+The [3D motion workflow](docs/mature_3d_motion.md) connects decoded mature-model
+boxes/tracks to image-space motion, alongside GT caster/light trajectory matching.
+The [receiver competition workflow](docs/receiver_competition.md) combines these
+with ground-flow and illumination-boundary evidence. Feature-only caches need
+one mature-model inference export first; then audit on CPU before training.
 
 ## Default HPC Pipeline
 

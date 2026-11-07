@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--flow-gate", choices=["registered", "none"], default="registered")
     parser.add_argument("--minimum-bev-cosine", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     protocol_path = source/"bev_flow_protocol.json"
@@ -41,6 +42,13 @@ def main():
         with np.load(path, allow_pickle=False) as archive:
             arrays = {key: archive[key].copy() for key in archive.files
                 if key != "learned_bev_receiver_features" or args.feature_gate == "shuffled"}
+        if args.mature_object_mode == "required":
+            if not row.get("mature_objects") or "mature_entity_probability" not in arrays:
+                raise ValueError("Source lacks decoded 3D results; upgrade the mature object cache and rebuild first")
+        else:
+            arrays = {key: value for key, value in arrays.items() if not key.startswith("mature_")}
+            row = {key: value for key, value in row.items() if key not in {"mature_objects", "mature_image_motion"}}
+            row["counts"] = {key: value for key, value in row["counts"].items() if not key.startswith("mature_")}
         original = arrays["shadow_candidate_photometric"]
         threshold = protocol["config"]["light_threshold_L"]
         delta = arrays["temporal_illumination_change_L"]

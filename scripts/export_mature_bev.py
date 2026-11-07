@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.cached_bev import spatial_bev, write_cached_bev
 from shadow_occ.annotation.data import digest, read_rows
+from shadow_occ.annotation.mature_objects import object_frame_source, objects_from_uniad, write_cached_objects
 from shadow_occ.data.nuscenes_adapter import NuScenesAdapter
 from shadow_occ.utils.io import write_json
 
@@ -52,6 +53,8 @@ def main():
     parser.add_argument("--ann-file", help="Use train or val nuScenes infos with the existing TEST pipeline")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--history-mode", choices=["temporal", "current-only"], default="temporal")
+    parser.add_argument("--minimum-object-score", type=float, default=0.25)
+    parser.add_argument("--objects-only", action="store_true", help="Export missing 3D predictions alongside an existing feature cache")
     args = parser.parse_args()
     external = Path(args.external_root).resolve()
     config_path = Path(args.model_config)
@@ -78,6 +81,7 @@ def main():
         if adapter.nusc.get("sample", token)["scene_token"] == scene) for scene in scenes}
     exporter.import_plugin_modules(cfg)
     dataset = exporter.custom_build_dataset(cfg.data.test)
+    class_names = list(dataset.CLASSES)
     indices = sorted((i for i, info in enumerate(dataset.data_infos) if info["scene_token"] in scenes
                       and info["timestamp"] <= latest_needed[info["scene_token"]]
                       and (args.history_mode == "temporal" or info["token"] in needed)),
@@ -98,6 +102,8 @@ def main():
     model = exporter.build_model_from_cfg(cfg, str(checkpoint), torch.device("cuda:0"), False)
     model.requires_grad_(False)
     source = {"encoder": "UniAD/OpenDriveVLA BEVFormer", "mode": "frozen ordered inference",
+        "payload": "objects_only" if args.objects_only else "spatial_features_and_3d_predictions",
+        "minimum_object_score": args.minimum_object_score,
         "history_mode": args.history_mode,
         "checkpoint_sha256": digest(checkpoint), "model_config_sha256": digest(config_path),
         "external_exporter_sha256": digest(external/"scripts/export_uniad_pth.py")}
@@ -125,15 +131,21 @@ def main():
         with torch.no_grad():
             _, result = model(return_loss=False, rescale=True, **data)
         if token in needed:
-            value = result["result_track"]["bev_embed"].detach().float().cpu().numpy()
-            height, width = int(cfg.bev_h_), int(cfg.bev_w_)
-            if height == width == 100 and value.shape[0] == 200*200:
-                height = width = 200  # Existing UniAD upsample_bev_if_tiny output.
-            feature = spatial_bev(value, height, width)
             timestamp = adapter.nusc.get("sample_data", record.lidar_token)["timestamp"]
-            write_cached_bev(output, token, feature, record, timestamp, cfg.point_cloud_range, source)
+            objects = objects_from_uniad(result["result_track"], record, timestamp,
+                                          class_names, args.minimum_object_score)
+            if args.objects_only:
+                write_cached_objects(output, token, objects,
+                    object_frame_source(record, timestamp, cfg.point_cloud_range, source))
+            else:
+                value = result["result_track"]["bev_embed"].detach().float().cpu().numpy()
+                height, width = int(cfg.bev_h_), int(cfg.bev_w_)
+                if height == width == 100 and value.shape[0] == 200*200:
+                    height = width = 200  # Existing UniAD upsample_bev_if_tiny output.
+                feature = spatial_bev(value, height, width)
+                write_cached_bev(output, token, feature, record, timestamp, cfg.point_cloud_range, source, objects=objects)
             saved.add(token)
-            print(f"saved={len(saved)}/{len(needed)} sample={token} shape={feature.shape}", flush=True)
+            print(f"saved={len(saved)}/{len(needed)} sample={token} predicted_objects={len(objects['objects'])}", flush=True)
         del result
         if saved == needed:
             break

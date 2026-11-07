@@ -4,6 +4,12 @@ The active default now adds [receiver explanation competition](receiver_competit
 after the projection baseline described below. Use its CPU audit before training.
 `--receiver-competition off` retains the coverage-only label decision for comparison.
 
+Current full-path rebuilds additionally require decoded mature-model 3D predictions.
+Old feature-only caches need the one-GPU export in [3D motion workflow](mature_3d_motion.md)
+first. The commands below otherwise describe the historical GT-geometry baseline;
+set `SHADOW_MATURE_OBJECT_MODE=off` explicitly to reproduce that baseline, or set
+`SHADOW_MATURE_OBJECT_ROOT` to the new decoded-object root for the active method.
+
 ## Structural Fix
 
 The previous factorized policy split existence and ownership only at the final

@@ -2,11 +2,18 @@
 
 ## Active path
 
+The active path now requires decoded mature-model 3D predictions in addition to
+BEV features. Upgrade feature-only caches using [3D motion export](mature_3d_motion.md).
+GT tracks still supply caster/light hypotheses; predicted boxes provide an
+independent entity explanation. The ray/GT-volume calculation below is auxiliary
+visibility geometry, not the source of the mature model's 3D output.
+
 ```text
 nuScenes pairs + cached DIS + frozen UniAD/OpenDriveVLA BEV
+  + decoded predicted 3D boxes / tracks / velocity
   -> observed ground receivers in a fixed three-frame BEV
   -> camera rays intersect all-class 3D box volumes
-  -> geometric ground flow / box-surface motion proxy / illumination boundaries
+  -> ground flow / predicted 3D surface motion / illumination boundaries
   -> appearance candidates with learned receiver support
   -> real caster/light projections versus shifted-caster controls
   -> entity / material / cast-shadow / unknown explanation scores
@@ -87,6 +94,8 @@ export SHADOW_REBUILD_SOURCE="$PWD/outputs/shadow_bev_flow_static_v2_parallel2_2
 export SHADOW_ANNOTATION_ROOT="$PWD/outputs/shadow_receiver_audit_$(date +%Y%m%d_%H%M%S)"
 export SHADOW_RECEIVER_COMPETITION=on
 export SHADOW_RECEIVER_AUDIT_ONLY=1
+# Set this to the decoded-object export root from docs/mature_3d_motion.md.
+export SHADOW_MATURE_OBJECT_ROOT=/path/to/decoded_objects
 mkdir -p logs
 sbatch slurm/rebuild_bev_flow_labels.slurm
 ```

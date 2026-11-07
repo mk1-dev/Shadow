@@ -220,7 +220,7 @@ def test_bev_pipeline_matches_in_bev_and_exports_camera_regions(tmp_path, monkey
     write_json(feature_root/"cache_protocol.json", {"encoder": "synthetic test"})
     bev = tmp_path/"bev"
     monkeypatch.setattr(sys, "argv", ["analyze", "--pairs", str(manifest), "--analysis-root", str(analysis),
-        "--output-root", str(bev), "--feature-root", str(feature_root), "--extent-m", "4"])
+        "--output-root", str(bev), "--feature-root", str(feature_root), "--extent-m", "4", "--mature-object-mode", "off"])
     script("analyze_bev_flow_discrepancy").main()
     builder = script("build_physics_shadow_labels")
     calls, original = [], builder.rank_hypotheses

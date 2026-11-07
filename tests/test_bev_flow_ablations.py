@@ -152,7 +152,8 @@ def test_cached_reselection_restores_old_filtered_transitions_without_feature_co
     write_rows(source/"windows.jsonl", [{**row, "evidence": str(path), "evidence_sha256": digest(path)}])
     write_json(source/"bev_flow_protocol.json", {"config": {"light_threshold_L": 6}})
     output = tmp_path/"none"
-    monkeypatch.setattr(sys, "argv", ["reselect", "--source-root", str(source), "--output-root", str(output), "--feature-gate", "none"])
+    monkeypatch.setattr(sys, "argv", ["reselect", "--source-root", str(source), "--output-root", str(output),
+                                     "--feature-gate", "none", "--mature-object-mode", "off"])
     script("reselect_bev_flow").main()
     result = read_rows(output/"windows.jsonl")[0]
     with np.load(result["evidence"], allow_pickle=False) as archive:

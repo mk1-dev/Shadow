@@ -11,12 +11,19 @@ from shadow_occ.annotation.data import digest
 from shadow_occ.utils.io import write_json
 
 
-def write_cached_bev(output, token, feature, record, timestamp, pc_range, source):
+def write_cached_bev(output, token, feature, record, timestamp, pc_range, source, objects=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     path = output/f"{token}.npz"
     np.savez_compressed(path, bev_chw=feature.astype(np.float16))
+    object_reference = {}
+    if objects is not None:
+        from shadow_occ.annotation.mature_objects import object_frame_source, write_cached_objects
+
+        object_reference = write_cached_objects(output, token, objects,
+            object_frame_source(record, timestamp, pc_range, source))
     write_json(output/f"{token}.json", {**source, "sample_token": token, "scene_name": record.scene_name,
+        **object_reference,
         "coordinate_frame": "LIDAR_TOP", "lidar_to_world": (record.lidar_ego_to_global @ record.lidar_sensor_to_ego).tolist(),
         "pc_range": list(pc_range), "shape_chw": list(feature.shape), "feature_sha256": digest(path),
         "layout": "C,H,W; rows=y; columns=x; cell centres", "timestamp": timestamp})

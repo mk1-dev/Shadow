@@ -20,6 +20,7 @@ from shadow_occ.annotation.data import checked_write_image, digest, load_array, 
 from shadow_occ.annotation.physics_io import check_pair_files, load_motion_analysis, read_evidence
 from shadow_occ.annotation.physics_labels import validate_window
 from shadow_occ.annotation.receiver_explanations import attach_appearance_prior
+from shadow_occ.annotation.mature_objects import attach_mature_objects
 from shadow_occ.utils.io import write_json
 
 
@@ -35,9 +36,11 @@ def review_panel(arrays):
     state = np.zeros((*arrays["explanation_state"].shape, 3), np.uint8)
     for code, color in ((1, (100, 100, 100)), (2, (0, 100, 255)), (3, (0, 220, 220))):
         state[arrays["receiver_observation_state"] == code] = color
+    if "mature_entity_probability" in arrays:
+        state[arrays["mature_entity_probability"][1] >= .25] = (255, 100, 60)
     change = arrays["receiver_boundary_formation"] | arrays["receiver_boundary_recovery"]
     state[change] = (0, 220, 220)
-    panels.append((state, "ground / 3D entity / light boundary"))
+    panels.append((state, "ground / GT orange / model blue / light"))
     result = []
     for panel, label in panels:
         panel = cv2.resize(panel, (384, 384), interpolation=cv2.INTER_NEAREST)
@@ -45,6 +48,47 @@ def review_panel(arrays):
         cv2.putText(panel, label, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         result.append(panel)
     return np.vstack([np.hstack(result[:3]), np.hstack(result[3:])])
+
+
+def motion_review_panel(image, rendered, motion, evidence, lighting_comparable):
+    overlay = image.copy()
+    entity = rendered["confidence"] >= .25
+    overlay[entity] = (.6*overlay[entity]+.4*np.array([255, 100, 60])).astype(np.uint8)
+    supported = np.isfinite(motion["expected"]).all(axis=-1)
+    yy, xx = np.where(supported)
+    indices = np.linspace(0, max(len(xx)-1, 0), min(len(xx), 180), dtype=int)
+    arrows = []
+    for field in (motion["expected"], evidence["flow_t_to_next"]):
+        canvas = image.copy()
+        for index in indices:
+            x, y = int(xx[index]), int(yy[index])
+            delta = field[y, x]
+            if np.isfinite(delta).all():
+                endpoint = tuple(np.rint([x, y]+delta).astype(int))
+                cv2.arrowedLine(canvas, (x, y), endpoint, (0, 230, 230), 1, tipLength=.25)
+        arrows.append(canvas)
+    advantage = motion["ground_residual"]-motion["object_residual"]
+    light = evidence.get("delta_L", np.full(image.shape[:2], np.nan))
+    light_valid = evidence["visible_ground"] & lighting_comparable & np.isfinite(light)
+    maps = []
+    for value, valid, extent in ((advantage, np.isfinite(advantage), 5.), (light, light_valid, 15.)):
+        scaled = np.clip((np.nan_to_num(value)/extent+1)*127.5, 0, 255).astype(np.uint8)
+        heat = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
+        heat[~valid] = (image[~valid]*.25).astype(np.uint8)
+        maps.append(heat)
+    panels = [(image, "current frame"), (overlay, "decoded 3D predictions"),
+              (arrows[0], "3D expected surface flow"), (arrows[1], "2D flow at the same pixels"),
+              (maps[0], "ground error - object error (px)"),
+              (maps[1], "registered light change" if lighting_comparable else "light change unavailable")]
+    tiles = []
+    for value, label in panels:
+        tile = np.zeros((240, 384, 3), np.uint8)
+        scale = min(384/value.shape[1], 216/value.shape[0])
+        value = cv2.resize(value, (max(1, round(value.shape[1]*scale)), max(1, round(value.shape[0]*scale))))
+        tile[24:24+value.shape[0], :value.shape[1]] = value
+        cv2.putText(tile, label, (5, 17), cv2.FONT_HERSHEY_SIMPLEX, .43, (255, 255, 255), 1)
+        tiles.append(tile)
+    return np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
 
 
 def main():
@@ -64,9 +108,15 @@ def main():
     parser.add_argument("--review-limit", type=int, default=20)
     parser.add_argument("--omit-receiver-features", action="store_true", help="Retain cosine/gates but do not duplicate sampled feature tensors")
     parser.add_argument("--shadow-baseline-manifest", help="Optional per-frame external shadow probability maps")
+    parser.add_argument("--object-root", help="Decoded mature 3D cache; defaults to --feature-root")
+    parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required",
+                        help="Active path requires decoded predictions; off is the explicit GT-geometry baseline")
     args = parser.parse_args()
     if args.feature_gate != "none" and not args.feature_root:
         parser.error("--feature-root is required unless --feature-gate none")
+    object_root = args.object_root or args.feature_root
+    if args.mature_object_mode == "required" and not object_root:
+        parser.error("Decoded 3D comparison requires --object-root or --feature-root")
     if not -1 <= args.minimum_bev_cosine <= 1:
         raise ValueError("BEV cosine threshold must be in [-1,1]")
     config = BEVFlowConfig(extent_m=args.extent_m, resolution_m=args.resolution_m, light_threshold_L=args.light_threshold)
@@ -116,6 +166,25 @@ def main():
         stem = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
         if args.feature_gate != "none":
             arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
+        if args.mature_object_mode == "required":
+            feature_sources = metadata.get("learned_bev", {}).get("sources")
+            arrays, metadata, rendered, object_motion = attach_mature_objects(
+                arrays, metadata, frames, (first, second), object_root, feature_sources)
+            motion_path = output/"image_motion"/f"{stem}.npz"
+            motion_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(motion_path,
+                predicted_entity_probability=np.stack([value["confidence"] for value in rendered]),
+                predicted_entity_depth=np.stack([value["depth"] for value in rendered]),
+                expected_object_flow_px=np.stack([value["expected"] for value in object_motion]),
+                observed_optical_flow_px=np.stack([first["flow_t_to_next"], second["flow_t_to_next"]]),
+                object_flow_residual_px=np.stack([value["object_residual"] for value in object_motion]),
+                ground_flow_residual_px=np.stack([value["ground_residual"] for value in object_motion]),
+                entity_motion_fit=np.stack([value["entity_fit"] for value in object_motion]))
+            metadata["mature_image_motion"] = {"path": str(motion_path), "sha256": digest(motion_path),
+                "coordinates": "working camera pixels; intervals 0->1 and 1->2", "gt_used": False}
+            if len(windows) < args.review_limit:
+                checked_write_image(output/"motion_review"/f"{stem}.jpg", motion_review_panel(
+                    images[1], rendered[1], object_motion[1], second, bool(mb["exposure"]["valid"])))
         window_seed = int(hashlib.sha256(f"{args.seed}:{stem}".encode()).hexdigest()[:16], 16)
         arrays, metadata = select_bev_flow_receivers(arrays, metadata, args.minimum_bev_cosine,
             feature_gate=args.feature_gate, flow_gate=args.flow_gate == "registered", seed=window_seed)
@@ -139,6 +208,8 @@ def main():
         "analysis_protocol_sha256": digest(analysis_protocol),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"),
         "feature_cache_protocol_sha256": digest(Path(args.feature_root)/"cache_protocol.json") if args.feature_root else None,
+        "object_root": str(Path(object_root).resolve()) if object_root else None,
+        "mature_objects_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/mature_objects.py"),
         "coordinates": "fixed first-sample ego x/y; common world receiver for all three frames",
         "learned_encoder": "cached UniAD/OpenDriveVLA BEVFormer" if args.feature_root else None,
         "registration_mode": motion_protocol.get("registration_mode", "geometry-dis"),

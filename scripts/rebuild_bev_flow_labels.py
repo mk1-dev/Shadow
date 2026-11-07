@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--minimum-explanation-margin", type=float, default=0.05)
     parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
     parser.add_argument("--shadow-baseline-manifest")
+    parser.add_argument("--mature-object-root", help="Parent containing train/ and val/ decoded prediction caches")
+    parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     if source == output or output.exists() and any(output.iterdir()) and not args.reuse_analysis:
@@ -99,10 +101,17 @@ def main():
             "pair_manifest_sha256": digest(origin/"pairs/pairs.jsonl"),
             "motion_protocol_sha256": digest(origin/"flow/analysis_protocol.json")}
         analysis = destination/"bev_flow"
+        object_root = (Path(args.mature_object_root).resolve()/split if args.mature_object_root
+                       else destination/"mature_bev")
         if args.reuse_analysis:
             for name in ("bev_flow_protocol.json", "windows.jsonl", "summary.json"):
                 if not (analysis/name).is_file():
                     raise FileNotFoundError(analysis/name)
+            previous = json.loads((analysis/"bev_flow_protocol.json").read_text(encoding="utf-8"))
+            if previous.get("mature_object_mode", "off") != args.mature_object_mode:
+                raise ValueError("Cached analysis uses a different 3D prediction mode; rebuild in a new output root")
+            if args.mature_object_mode == "required" and Path(previous["object_root"]).resolve() != object_root.resolve():
+                raise ValueError("Cached analysis uses another 3D prediction cache; rebuild in a new output root")
             print(f"REUSING analysis split={split}", flush=True)
         else:
             run("analyze_bev_flow_discrepancy.py", "--pairs", destination/"pairs/pairs.jsonl",
@@ -110,6 +119,7 @@ def main():
                 "--minimum-bev-cosine", shared_protocol.get("minimum_bev_cosine", 0.3),
                 "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
                 "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
+                "--object-root", object_root, "--mature-object-mode", args.mature_object_mode,
                 "--output-root", analysis, *baseline_args, owner=split)
         def complete_labels(path):
             return all((path/name).is_file()

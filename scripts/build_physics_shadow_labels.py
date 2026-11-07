@@ -264,6 +264,8 @@ def main():
                         for t in range(3)]).astype(np.float32)
                 np.savez_compressed(component_path, component_mask=rank_mask, **pooled)
                 bev_component = {"window_id": bev_ref["id"], "evidence": str(evidence_path),
+                    "mature_objects": bev_ref.get("mature_objects"),
+                    "mature_image_motion": bev_ref.get("mature_image_motion"),
                     "grid": bev_ref["grid"],
                     "selection": bev_ref.get("learned_bev_selection"),
                     "evidence_sha256": bev_ref["evidence_sha256"], "component": str(component_path),

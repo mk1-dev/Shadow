@@ -106,6 +106,9 @@ def main():
                "image": item["image"], "mask": item["mask"], "winner": evidence["winner"],
                "scores": evidence["scores"], "winner_margin": evidence["winner_margin"],
                "baseline_scores": evidence["baseline_scores"],
+               "mature_3d": evidence.get("mature_3d"),
+               "motion_diagnostics": evidence.get("motion_diagnostics"),
+               "mature_image_motion": (item.get("bev_flow") or {}).get("mature_image_motion"),
                "projection_control_gain": evidence["projection_control_gain"],
                "trajectory_control_gain": evidence["trajectory_control_gain"],
                "baseline_accepted": baseline["shadow_accepted"],
@@ -157,6 +160,8 @@ def main():
         checked_write_image(output/"contact_sheet.jpg", np.vstack([
             np.hstack(panels[index:index+per_row]) for index in range(0, len(panels), per_row)]))
     write_json(output/"summary.json", {"components": len(rows), "winner_counts": dict(winners),
+        "mature_3d_components": sum(row["mature_3d"] is not None for row in rows),
+        "mature_motion_components": sum((row["mature_3d"] or {}).get("motion_observed_fraction", 0) > 0 for row in rows),
         "baseline_accepted": sum(row["baseline_accepted"] for row in rows),
         "competition_supported": sum(row["competition_supported"] for row in rows),
         "exported_positive": sum(row["exported_positive"] for row in rows),

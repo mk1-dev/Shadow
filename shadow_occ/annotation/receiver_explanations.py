@@ -272,6 +272,26 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
               "cast_shadow": ground_fraction*(SCORE_CONTRACT["shadow"]["projection_strength"]*projection_strength
                   +SCORE_CONTRACT["shadow"]["boundary_transition"]*transition) if best else 0.0,
               "unknown": unknown_fraction}
+    mature_evidence = None
+    mature_unexplained_score = None
+    if "mature_entity_probability" in arrays:
+        mature_domain = arrays["mature_inference_domain"][1] & mask
+        probability = arrays["mature_entity_probability"][1]
+        motion_fit = arrays["mature_entity_motion_fit"][1]
+        if mature_domain.any():
+            available = mature_domain & np.isfinite(motion_fit)
+            confidence = probability[mature_domain]
+            effective_fit = np.where(np.isfinite(motion_fit[mature_domain]), motion_fit[mature_domain], .5)
+            entity_score = float(np.mean(confidence*effective_fit))
+            scores["physical_entity"] = max(scores["physical_entity"], entity_score)
+            mature_unexplained_score = float(1-confidence.mean())
+            mature_evidence = {"predicted_entity_mean": float(confidence.mean()),
+                "entity_motion_score": entity_score, "motion_observed_fraction": float(available.sum()/area),
+                "inference_domain_fraction": float(mature_domain.sum()/area),
+                "unexplained_receiver_fraction": float((mature_domain & (probability < .25)).sum()/area),
+                "absence_is_free_space": False, "gt_used": False}
+        else:
+            mature_evidence = {"inference_domain_fraction": 0.0, "absence_is_free_space": False, "gt_used": False}
     prior = arrays.get("external_shadow_probability")
     prior_mean, context_mean, prior_contrast, prior_coverage = None, None, 0.0, 0.0
     if prior is not None:
@@ -302,6 +322,10 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
         values = arrays[name][:, mask] if name in arrays else np.empty(0)
         values = values[np.isfinite(values)]
         motion_diagnostics[name+"_median"] = float(np.median(values)) if len(values) else None
+    for name in ("mature_object_flow_residual_px", "mature_ground_flow_residual_px"):
+        values = arrays[name][1][mask] if name in arrays else np.empty(0)
+        values = values[np.isfinite(values)]
+        motion_diagnostics[name+"_median"] = float(np.median(values)) if len(values) else None
     return {"protocol": PROTOCOL, "winner": winner, "winner_margin": float(margin), "scores": scores,
             "shadow_supported": accepted, "ground_fraction": ground_fraction,
             "entity_fraction": entity_fraction, "unknown_fraction": unknown_fraction,
@@ -317,11 +341,13 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
                 "geometry_flow": darkness*ground_fraction*float(arrays["shadow_flow_supported"][mask].mean()),
                 "projection_coverage": max((value["cover"] for value in evaluations), default=0.0),
                 "external_shadow_model": prior_mean,
+                "mature_3d_unexplained": darkness*mature_unexplained_score if mature_unexplained_score is not None else None,
                 "receiver_competition": scores["cast_shadow"]-max(scores[key] for key in scores if key != "cast_shadow")},
             "appearance_prior": {"mean": prior_mean, "context_mean": context_mean,
                 "contrast": prior_contrast, "coverage": prior_coverage,
                 "requires_discriminative_projection": True},
             "motion_diagnostics": motion_diagnostics,
+            "mature_3d": mature_evidence,
             "config": asdict(config), "score_contract": SCORE_CONTRACT, "scores_are_probabilities": False}
 
 

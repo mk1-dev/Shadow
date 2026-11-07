@@ -28,7 +28,7 @@ fi
 
 conda activate "$ANNOTATION_ENV"
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
-  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py
+  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py tests/test_mature_objects.py
 fi
 for SPLIT in train val; do
   echo "[1/5] Export $SPLIT raw geometry and dense flow"
@@ -54,6 +54,7 @@ for SPLIT in train val; do
     --external-root "${UNIAD_ROOT:?Set the mature OpenDriveVLA repository}" \
     --model-config "${UNIAD_MODEL_CONFIG:-projects/configs/stage1_track_map/base_track_map.py}" \
     --checkpoint "${UNIAD_CHECKPOINT:?Set the mature encoder checkpoint}" \
+    --minimum-object-score "${SHADOW_MIN_OBJECT_SCORE:-0.25}" \
     --ann-file "$INFOS" --dataroot "$NUSC_ROOT" \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --output-root "$ROOT_OUT/$SPLIT/mature_bev"
 done
@@ -65,6 +66,7 @@ for SPLIT in train val; do
   python -u scripts/analyze_bev_flow_discrepancy.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
     --feature-root "$ROOT_OUT/$SPLIT/mature_bev" --minimum-bev-cosine "${SHADOW_BEV_MIN_COSINE:-0.3}" \
+    --mature-object-mode "${SHADOW_MATURE_OBJECT_MODE:-required}" \
     --output-root "$ROOT_OUT/$SPLIT/bev_flow" "${BASELINE_ARGS[@]}"
   python -u scripts/build_physics_shadow_labels.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
