@@ -370,3 +370,33 @@ def test_active_bev_label_and_baseline_audit_pipeline(tmp_path, monkeypatch):
     assert report["components"] == len(decisions) and report["reference_metrics"] is None
     assert report["exported_positive"] == 0
     assert (audit/"contact_sheet.jpg").exists()
+    assert (labels/"transition_diagnostics.jsonl").exists()
+    stages = json.loads((audit/"transition_stages.json").read_text())
+    assert stages["components_with_diagnostics"] == len(decisions)
+    assert stages["windows_with_diagnostics"] > 0
+
+
+def test_transition_diagnostics_do_not_require_accepted_best_projection():
+    module = script("analyze_receiver_competition")
+    hypotheses = [{"shadow_fit_passes": False, "long_window": {
+        "observed_transition_types": 1, "edge_fit": .5,
+        "event_alignment": [{"reason": "matched"}]}, "alternatives": []}]
+    projections = module.projection_transition_diagnostics(hypotheses)
+    row = {"best_projection_transitions": None, "projection_transition_diagnostics": projections,
+        "transition_diagnostics": {"central_onset_pixels": 1, "central_recovery_pixels": 0,
+            "long_window": {"event_pixels": 1, "frames": [{"raw_darkening_pixels": 1,
+                "normalized_darkening_pixels": 1}]}}}
+    summary = module.transition_stage_summary([row], [])
+    assert summary["central_event_components"] == 1
+    assert summary["observed_long_event_components"] == 1
+    assert summary["any_hypothesis_long_match_components"] == 1
+    assert summary["hypothesis_event_alignment_reasons"] == {"matched": 1}
+
+
+def test_missing_transition_diagnostics_are_not_reported_as_observed_zero():
+    module = script("analyze_receiver_competition")
+    row = {"transition_diagnostics": None,
+        "projection_transition_diagnostics": module.projection_transition_diagnostics([])}
+    summary = module.transition_stage_summary([row], [])
+    assert summary["components_with_diagnostics"] == 0
+    assert summary["windows_with_diagnostics"] == 0

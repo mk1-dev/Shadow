@@ -56,6 +56,80 @@ def caster_proposals(arrays, tracks, directions, plane, projection, polygon_cach
         "scope": "GT/light swept ROI proposes search only; observed darkness, BEV and flow are still required"}
 
 
+def long_transition_evidence(observations, visible, flow, middle, roi):
+    """Keep the event rule unchanged; expose every upstream support loss separately."""
+    onset, recovery = np.zeros_like(visible), np.zeros_like(visible)
+    raw, normalized_events, supports = (np.zeros_like(visible) for _ in range(3))
+    exposures, diagnostics = [], []
+    config = EvidenceConfig()
+    for index in range(len(observations)):
+        overlap = visible[index] & visible[middle]
+        support = overlap.copy()
+        step_support = []
+        for step in range(min(index, middle), max(index, middle)):
+            before = int(support.sum())
+            support &= flow[step]
+            step_support.append({"pair_index": step, "before_pixels": before,
+                                 "after_pixels": int(support.sum())})
+        supports[index] = support
+        background = support & ~roi
+        fit = exposure_fit(observations[index], observations[middle], background, config)
+        exposures.append(fit)
+        delta = observations[middle]-observations[index]
+        raw[index] = overlap & (delta <= -6)
+        if index != middle and fit["valid"]:
+            normalized = fit["scale"]*observations[index]+fit["offset_L"]
+            normalized_events[index] = overlap & (observations[middle]-normalized <= -6)
+            event = normalized_events[index] & support
+            if index < middle:
+                onset[index] = event
+            else:
+                recovery[index] = event
+        if index == middle:
+            stage = "reference_frame"
+        elif not overlap.any():
+            stage = "no_visible_overlap"
+        elif not support.any():
+            stage = "flow_chain_removed_support"
+        elif not fit["valid"]:
+            stage = ("roi_excluded_background" if fit["reason"] == "insufficient_background"
+                     and support.sum() >= config.min_background else fit["reason"])
+        elif not normalized_events[index].any():
+            stage = "no_normalized_darkening"
+        elif not (onset[index] | recovery[index]).any():
+            stage = "flow_removed_darkening"
+        else:
+            stage = "observed_event"
+        diagnostics.append({"frame_index": index, "is_reference": index == middle,
+            "visible_pixels": int(visible[index].sum()), "visible_overlap_pixels": int(overlap.sum()),
+            "flow_supported_pixels": int(support.sum()), "flow_chain": step_support,
+            "roi_excluded_pixels": int((support & roi).sum()),
+            "minimum_background_pixels": config.min_background, "exposure": fit,
+            "raw_darkening_pixels": int(raw[index].sum()),
+            "normalized_darkening_pixels": int(normalized_events[index].sum()) if fit["valid"] and index != middle else None,
+            "event_pixels": int((onset[index] | recovery[index]).sum()), "stage": stage})
+    return {"onset": onset, "recovery": recovery, "exposures": exposures,
+        "raw_darkening": raw, "normalized_darkening": normalized_events,
+        "flow_support": supports, "frame_diagnostics": diagnostics}
+
+
+def component_transition_diagnostics(context, mask):
+    """Count observations without conditioning on a surviving caster projection."""
+    if context is None:
+        return None
+    frames = []
+    for index, info in enumerate(context["frame_diagnostics"]):
+        frames.append({"frame_index": index, "is_reference": info["is_reference"], "stage": info["stage"],
+            "raw_darkening_pixels": int((context["raw_darkening"][index] & mask).sum()),
+            "normalized_darkening_pixels": int((context["normalized_darkening"][index] & mask).sum())
+                if info["normalized_darkening_pixels"] is not None else None,
+            "flow_supported_pixels": int((context["flow_support"][index] & mask).sum()),
+            "onset_pixels": int((context["onset"][index] & mask).sum()),
+            "recovery_pixels": int((context["recovery"][index] & mask).sum())})
+    return {"frames": frames, "event_pixels": int(((context["onset"] | context["recovery"]).any(axis=0) & mask).sum()),
+        "scope": "observed component events before caster/light selection; raw darkness is not a shadow label"}
+
+
 def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
     frames = [pair["frames"][0] for pair in chain]+[chain[-1]["frames"][1]]
     samples = [pair["sample_token"] for pair in chain]+[chain[-1]["next_sample_token"]]
@@ -93,27 +167,11 @@ def long_observations(chain, middle_token, arrays, roi, base, stats, analysis):
             evidence, _ = read_evidence(chain[len(flow)], stats, analysis)
             flow.append(sample_at(evidence["receiver_flow_supported"].astype(np.float32), coordinates) >= .999)
     observations, visible = np.stack(observations), np.stack(visible)
-    onset, recovery = np.zeros_like(visible), np.zeros_like(visible)
-    exposures = []
-    for index in range(len(frames)):
-        support = visible[index] & visible[middle]
-        for step in range(min(index, middle), max(index, middle)):
-            support &= flow[step]
-        background = support & ~roi
-        fit = exposure_fit(observations[index], observations[middle], background, EvidenceConfig())
-        exposures.append(fit)
-        if index == middle or not fit["valid"]:
-            continue
-        normalized = fit["scale"]*observations[index]+fit["offset_L"]
-        became_dark = support & (observations[middle]-normalized <= -6)
-        if index < middle:
-            onset[index] = became_dark
-        else:
-            recovery[index] = became_dark
+    evidence = long_transition_evidence(observations, visible, flow, middle, roi)
     tracks = {token: np.asarray([values[sample] for sample in samples], np.float64)
               for token, values in states.items() if token not in inconsistent and all(sample in values for sample in samples)}
-    return {"frames": frames, "sample_tokens": samples, "middle": middle, "onset": onset,
-        "recovery": recovery, "visible": visible, "tracks": tracks, "exposures": exposures,
+    return {"frames": frames, "sample_tokens": samples, "middle": middle, **evidence,
+        "visible": visible, "tracks": tracks,
         "polygon_cache": {}, "timestamps": [frame["camera_timestamp"] for frame in frames]}
 
 
@@ -153,6 +211,17 @@ def extended_trajectory_fit(context, token, light_id, direction, plane, projecti
 
     order = np.arange(len(footprints))
     score, edge = fit(order)
+    alignment = []
+    for index, kind, event in events:
+        current_event = event & footprints[middle]
+        change = footprints[middle] & ~footprints[index] & local
+        matched = event & change
+        reason = ("matched" if matched.any() else "outside_current_footprint" if not current_event.any()
+                  else "no_predicted_change" if not change.any() else "outside_predicted_change")
+        alignment.append({"frame_index": index, "kind": kind, "event_pixels": int(event.sum()),
+            "in_current_footprint_pixels": int(current_event.sum()),
+            "predicted_change_pixels": int(change.sum()), "matched_pixels": int(matched.sum()),
+            "reason": reason})
     controls = [fit(order[::-1])[0], fit(np.roll(order, 1))[0], fit(np.roll(order, -1))[0],
                 fit(np.full(len(order), middle))[0]]
     before = np.logical_or.reduce(context["onset"][:, section[0], section[1]], axis=0) & local
@@ -163,4 +232,5 @@ def extended_trajectory_fit(context, token, light_id, direction, plane, projecti
         "onset_pixels": int(before.sum()), "recovery_pixels": int(after.sum()),
         "transition_fraction": float((before | after).sum()/max(local.sum(), 1)),
         "observed_transition_types": int(before.any())+int(after.any()), "movement_m": movement,
+        "event_alignment": alignment,
         "frames": len(order), "control": "hardest reversed/cyclic/frozen trajectory on identical observations"}

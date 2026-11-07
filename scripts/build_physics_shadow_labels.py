@@ -24,7 +24,9 @@ from shadow_occ.annotation.physics_labels import (
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.annotation.illumination import PROTOCOL as LIGHT_PROTOCOL, validate_prior
-from shadow_occ.annotation.caster_window import caster_proposals, extend_pairs, long_observations
+from shadow_occ.annotation.caster_window import (
+    caster_proposals, component_transition_diagnostics, extend_pairs, long_observations,
+)
 from shadow_occ.annotation.receiver_explanations import (
     PROTOCOL as RECEIVER_PROTOCOL, SCORE_PROTOCOL, CompetitionConfig, apply_competition, explain_component,
     receiver_evidence,
@@ -158,7 +160,7 @@ def main():
             raise ValueError("Duplicate camera/sample pair")
         successor[key] = pair
         predecessor[(*key[:3], pair["next_sample_token"])] = pair
-    counts, candidates, audit = Counter(), [], []
+    counts, candidates, audit, transition_audit = Counter(), [], [], []
     directions = light_bank()
     checked = set()
     for left in tqdm(pairs, desc="3D / ground / flow / light joint gate", unit="pair", mininterval=5):
@@ -246,6 +248,13 @@ def main():
             if len(chain) > 2:
                 extended_context = long_observations(chain, frame["sample_data_token"], bev_arrays, roi, base, stats, analysis)
             counts[f"temporal_frames:{len(chain)+1}"] += 1
+        transition_audit.append({"window_id": window_id, "scene_name": left["scene_name"],
+            "camera": left["camera"], "long_window_available": extended_context is not None,
+            "timestamps": extended_context["timestamps"] if extended_context else None,
+            "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else None,
+            "frames": extended_context["frame_diagnostics"] if extended_context else [],
+            "central_onset_pixels": int(rank_maps["onset"].sum()),
+            "central_recovery_pixels": int(rank_maps["recovery"].sum())})
         # Never bridge gaps across unsupported receivers by dilation or closing.
         number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
         components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
@@ -344,6 +353,10 @@ def main():
                         (left["frames"][0], frame, right["frames"][1])],
                     "exposures": extended_context["exposures"] if extended_context else None,
                     "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else len(tracks)},
+                "transition_diagnostics": {
+                    "central_onset_pixels": int((rank_mask & rank_maps["onset"]).sum()),
+                    "central_recovery_pixels": int((rank_mask & rank_maps["recovery"]).sum()),
+                    "long_window": component_transition_diagnostics(extended_context, rank_mask)},
                 "evidence": report, "casters": caster_metadata, "physics_context": context,
                 "bev_flow": bev_component, "receiver_competition": competition})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
@@ -469,6 +482,7 @@ def main():
     write_rows(output/"canonical.jsonl", canonical)
     write_rows(output/"decisions.jsonl", decisions)
     write_rows(output/"window_audit.jsonl", audit)
+    write_rows(output/"transition_diagnostics.jsonl", transition_audit)
     split_counts = Counter(row["official_split"] for row in canonical if row["regions"][0]["shadow_label"] == "YES")
     summary = {"counts": dict(counts), "components": len(candidates), "exported_positive_by_official_split": dict(split_counts),
         "decision_policy": args.decision_policy,

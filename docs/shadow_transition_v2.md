@@ -120,3 +120,52 @@ adds explicit caster-driven candidate expansion and longer observations; evaluat
 those as separate arms, not as an identical-population comparison.
 No improved precision or training readiness is claimed before HPC results.
 Local execution of model/tests was not performed for this update.
+
+## Long-Window Event Diagnostics
+
+The diagnostic replay keeps the event threshold, exposure fit, candidate gates,
+competition scores and training decisions unchanged. It records observations
+before selecting `best_projection`:
+
+- `<split>/labels/transition_diagnostics.jsonl`: one row per processed window,
+  including windows without surviving components. Each non-reference comparison
+  records visible overlap, support after every flow-chain step, pixels excluded
+  by the caster ROI, exposure parameters/reason, raw darkening, normalized
+  darkening and supported events. Reference-frame fits are excluded from summary
+  failure counts.
+- `<split>/competition/transition_stages.json`: window-level exposure failure
+  counts and component-level event/matching coverage. A shared exposure fit is
+  counted once per window comparison, not once per component.
+- `decisions.jsonl` and `competition/components.jsonl`: component observations
+  independent of the selected projection. All tested hypotheses are summarized,
+  including hypotheses failing absolute projection acceptance.
+- Each tested long fit with events includes `event_alignment`: event pixels,
+  overlap with the current footprint, predicted-change pixels and matching pixels
+  per observation. Zero matches distinguish `outside_current_footprint`,
+  `no_predicted_change`, and `outside_predicted_change`.
+
+Raw darkening is an uncorrected brightness difference, not a valid temporal event
+or a shadow label. Invalid exposure has a null normalized-darkening count, not
+zero. Legacy outputs missing diagnostics report coverage explicitly; running only
+the analysis script cannot recover omitted observations. The older
+`observed_transition_components` and `long_event_components` counters remain
+conditional on `best_projection`.
+
+Replay the completed caster/long audit on CPU in a new directory:
+
+```bash
+cd /public/home/eng_zhihongli/project/Shadow
+export SHADOW_PROJECT_ROOT="$PWD"
+export SHADOW_CONDA_ENV=shadow_annotator
+export SHADOW_REBUILD_SOURCE="$PWD/outputs/shadow_caster_long_audit_v2_20261107_185046"
+export SHADOW_ANNOTATION_ROOT="$PWD/outputs/shadow_transition_stages_$(date +%Y%m%d_%H%M%S)"
+export SHADOW_REUSE_SOURCE_ANALYSIS=1 SHADOW_REUSE_ANALYSIS=0
+export SHADOW_RECEIVER_AUDIT_ONLY=1 SHADOW_RECEIVER_COMPETITION=on
+export SHADOW_MATURE_OBJECT_MODE=required
+export SHADOW_CANDIDATE_SOURCE=caster SHADOW_TEMPORAL_RADIUS=3
+unset SHADOW_LIGHT_PRIOR_MANIFEST
+sbatch --export=ALL slurm/rebuild_bev_flow_labels.slurm
+```
+
+The existing Slurm entry runs the diagnostic regression tests on HPC. This is
+not a new model-training job and does not repeat BEV export or DIS estimation.
