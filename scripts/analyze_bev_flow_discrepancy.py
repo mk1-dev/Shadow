@@ -16,9 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, build_bev_flow
 from shadow_occ.annotation.cached_bev import attach_cached_bev, select_bev_flow_receivers
-from shadow_occ.annotation.data import checked_write_image, digest, load_array, resolve_path, write_rows
+from shadow_occ.annotation.data import checked_write_image, digest, load_array, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.physics_io import check_pair_files, load_motion_analysis, read_evidence
 from shadow_occ.annotation.physics_labels import validate_window
+from shadow_occ.annotation.receiver_explanations import attach_appearance_prior
 from shadow_occ.utils.io import write_json
 
 
@@ -33,8 +34,10 @@ def review_panel(arrays):
         panels.append((panel, label))
     state = np.zeros((*arrays["explanation_state"].shape, 3), np.uint8)
     for code, color in ((1, (100, 100, 100)), (2, (0, 100, 255)), (3, (0, 220, 220))):
-        state[arrays["explanation_state"] == code] = color
-    panels.append((state, "A stable / B box / C light change"))
+        state[arrays["receiver_observation_state"] == code] = color
+    change = arrays["receiver_boundary_formation"] | arrays["receiver_boundary_recovery"]
+    state[change] = (0, 220, 220)
+    panels.append((state, "ground / 3D entity / light boundary"))
     result = []
     for panel, label in panels:
         panel = cv2.resize(panel, (384, 384), interpolation=cv2.INTER_NEAREST)
@@ -60,6 +63,7 @@ def main():
     parser.add_argument("--light-threshold", type=float, default=6)
     parser.add_argument("--review-limit", type=int, default=20)
     parser.add_argument("--omit-receiver-features", action="store_true", help="Retain cosine/gates but do not duplicate sampled feature tensors")
+    parser.add_argument("--shadow-baseline-manifest", help="Optional per-frame external shadow probability maps")
     args = parser.parse_args()
     if args.feature_gate != "none" and not args.feature_root:
         parser.error("--feature-root is required unless --feature-gate none")
@@ -74,6 +78,10 @@ def main():
     cv2.setNumThreads(1)
     base, analysis = Path(args.pairs).resolve().parent, Path(args.analysis_root).resolve()
     pairs, stats, analysis_protocol = load_motion_analysis(args.pairs, analysis)
+    prior_rows = read_rows(args.shadow_baseline_manifest) if args.shadow_baseline_manifest else []
+    prior_lookup = {row["sample_data_token"]: row for row in prior_rows}
+    if len(prior_lookup) != len(prior_rows):
+        raise ValueError("Shadow baseline manifest has duplicate frames")
     motion_protocol = json.loads(analysis_protocol.read_text(encoding="utf-8"))
     lookup = {(p["scene_name"], p["official_split"], p["camera"], p["sample_token"]): p for p in pairs}
     if len(lookup) != len(pairs):
@@ -101,6 +109,10 @@ def main():
         grounds = [load_array(frame["ground_support"], base) > 0 for frame in frames]
         arrays, metadata = build_bev_flow(left, right, images, grounds, first, second,
                                          [ma["exposure"], mb["exposure"]], config)
+        if args.shadow_baseline_manifest:
+            arrays, prior_metadata = attach_appearance_prior(arrays, frames, prior_lookup,
+                Path(args.shadow_baseline_manifest).resolve().parent)
+            metadata["appearance_baseline"] = prior_metadata
         stem = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
         if args.feature_gate != "none":
             arrays, metadata = attach_cached_bev(arrays, metadata, args.feature_root)
@@ -121,6 +133,8 @@ def main():
     write_rows(output/"windows.jsonl", windows)
     write_rows(output/"window_audit.jsonl", audit)
     write_json(output/"bev_flow_protocol.json", {**vars(args), "config": asdict(config),
+        "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
+        "shadow_baseline_manifest_sha256": digest(args.shadow_baseline_manifest) if args.shadow_baseline_manifest else None,
         "protocol": "bev-flow-discrepancy-v1", "pair_manifest_sha256": digest(args.pairs),
         "analysis_protocol_sha256": digest(analysis_protocol),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"),

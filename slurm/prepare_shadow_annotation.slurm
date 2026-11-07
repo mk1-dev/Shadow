@@ -21,10 +21,14 @@ NUSC_ROOT="${SHADOW_NUSC_ROOT:-/public/home/eng_zhihongli/project/data/nuscenes-
 ANNOTATION_ENV="${SHADOW_CONDA_ENV:-shadow_annotator}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
 read -r -a CAMERAS <<< "${SHADOW_CAMERAS:-CAM_FRONT CAM_FRONT_LEFT CAM_FRONT_RIGHT}"
+BASELINE_ARGS=()
+if [[ -n "${SHADOW_BASELINE_MANIFEST:-}" ]]; then
+  BASELINE_ARGS+=(--shadow-baseline-manifest "$SHADOW_BASELINE_MANIFEST")
+fi
 
 conda activate "$ANNOTATION_ENV"
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
-  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py
+  python -m pytest -q tests/test_bev_flow.py tests/test_cached_bev.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py
 fi
 for SPLIT in train val; do
   echo "[1/5] Export $SPLIT raw geometry and dense flow"
@@ -61,12 +65,21 @@ for SPLIT in train val; do
   python -u scripts/analyze_bev_flow_discrepancy.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
     --feature-root "$ROOT_OUT/$SPLIT/mature_bev" --minimum-bev-cosine "${SHADOW_BEV_MIN_COSINE:-0.3}" \
-    --output-root "$ROOT_OUT/$SPLIT/bev_flow"
+    --output-root "$ROOT_OUT/$SPLIT/bev_flow" "${BASELINE_ARGS[@]}"
   python -u scripts/build_physics_shadow_labels.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --analysis-root "$ROOT_OUT/$SPLIT/flow" \
     --bev-flow-root "$ROOT_OUT/$SPLIT/bev_flow" --decision-policy factorized-v3 --existence-mode static-dynamic \
     --positive-fusion "${SHADOW_POSITIVE_FUSION:-consensus}" \
+    --receiver-competition "${SHADOW_RECEIVER_COMPETITION:-on}" \
+    --control-shift-m "${SHADOW_CONTROL_SHIFT_M:-3.0}" \
+    --minimum-projection-gain "${SHADOW_MIN_PROJECTION_GAIN:-0.05}" \
+    --minimum-explanation-margin "${SHADOW_MIN_EXPLANATION_MARGIN:-0.05}" \
+    --appearance-prior-weight "${SHADOW_APPEARANCE_PRIOR_WEIGHT:-0.2}" \
     --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels"
+  if [[ "${SHADOW_RECEIVER_COMPETITION:-on}" != off ]]; then
+    python -u scripts/analyze_receiver_competition.py \
+      --labels-root "$ROOT_OUT/$SPLIT/labels" --output-root "$ROOT_OUT/$SPLIT/competition"
+  fi
   echo "[4/5] Export observed shadows and lit endpoints for $SPLIT"
   python -u scripts/build_bev_flow_annotation_manifest.py \
     --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --labels-root "$ROOT_OUT/$SPLIT/labels" \

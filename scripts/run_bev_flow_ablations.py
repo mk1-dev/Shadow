@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--config", default=str(ROOT/"configs/bev_flow_ablations.json"))
-    parser.add_argument("--variants", nargs="+", default=["full", "geometry_only", "shuffled", "matched_random", "cosine_01", "cosine_05"])
+    parser.add_argument("--variants", nargs="+", default=["full", "projection_coverage", "geometry_only", "shuffled", "matched_random"])
     parser.add_argument("--current-cache-root", help="Contains train/ and val/ caches exported with --history-mode current-only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--labels-only", action="store_true", help="Skip segmenter/VLM dataset crop generation")
@@ -37,7 +37,7 @@ def main():
         ROOT/"scripts/reselect_bev_flow.py", ROOT/"scripts/build_physics_shadow_labels.py",
         ROOT/"scripts/build_bev_flow_annotation_manifest.py", ROOT/"shadow_occ/annotation/cached_bev.py",
         ROOT/"shadow_occ/annotation/physics_labels.py", ROOT/"shadow_occ/annotation/bev_teacher.py",
-        ROOT/"shadow_occ/annotation/physics_motion.py"]}
+        ROOT/"shadow_occ/annotation/physics_motion.py", ROOT/"shadow_occ/annotation/receiver_explanations.py"]}
 
     def run(script, *values, check=True):
         command = [sys.executable, str(ROOT/"scripts"/script), *map(str, values)]
@@ -50,7 +50,9 @@ def main():
             "decision_policy": "factorized-v3", "light_search": "bank", "fixed_light_id": 0,
             "trajectory_contrast": "on", "independent_light": "on", "positive_fusion": "consensus",
             "negative_policy": "endpoints+lit-receivers",
+            "appearance_prior_weight": 0.2,
             "consensus_fraction": 2/3, **config["variants"][name]}
+        recipe.setdefault("receiver_competition", "off" if recipe["decision_policy"] == "strict-v2" else "on")
         root = output/name
         root.mkdir()
         write_json(root/"ablation_protocol.json", {"variant": name, "recipe": recipe, "seed": args.seed,
@@ -76,24 +78,29 @@ def main():
                 features = replacement or (["--feature-root", origin/"mature_bev"] if recipe["feature_gate"] != "none" else [])
                 original_protocol = json.loads((origin/"bev_flow/bev_flow_protocol.json").read_text(encoding="utf-8"))
                 geometry = original_protocol["config"]
+                prior = original_protocol.get("shadow_baseline_manifest")
+                prior_args = ["--shadow-baseline-manifest", prior] if prior else []
                 run("analyze_bev_flow_discrepancy.py", "--pairs", origin/"pairs/pairs.jsonl",
                     "--analysis-root", analysis_root, "--output-root", target/"bev_flow", "--review-limit", 0, "--omit-receiver-features",
                     "--extent-m", geometry["extent_m"], "--resolution-m", geometry["resolution_m"],
                     "--light-threshold", geometry["light_threshold_L"],
                     "--feature-gate", recipe["feature_gate"], "--flow-gate", recipe["flow_gate"],
-                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *features)
+                    "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *features, *prior_args)
             else:
                 run("reselect_bev_flow.py", "--source-root", origin/"bev_flow", "--output-root", target/"bev_flow",
                     "--feature-gate", recipe["feature_gate"], "--flow-gate", recipe["flow_gate"],
                     "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *replacement)
             options = [value for key in ("decision_policy", "light_search", "fixed_light_id", "trajectory_contrast",
-                "independent_light", "positive_fusion", "consensus_fraction")
+                "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
             if "existence_mode" in recipe:
                 options += ["--existence-mode", recipe["existence_mode"]]
             run("build_physics_shadow_labels.py", "--pairs", origin/"pairs/pairs.jsonl", "--analysis-root", analysis_root,
                 "--bev-flow-root", target/"bev_flow", "--output-root", target/"labels", "--export-weak-labels", *options)
             summary = json.loads((target/"labels/summary.json").read_text(encoding="utf-8"))
+            if recipe["receiver_competition"] != "off":
+                run("analyze_receiver_competition.py", "--labels-root", target/"labels",
+                    "--output-root", target/"competition")
             if summary["stage_counts"]["accepted_shadow"] == 0:
                 teacher_ready = False
                 results.append({"variant": name, "split": split, "status": "zero_accepted_shadow"})

@@ -19,12 +19,19 @@ three camera frames / optical flow -> aligned brightness and observed flow
                                     |
             BEV components -> caster/light trajectory matching
                                     |
+       entity / material / shadow / unknown explanation competition
+                                    |
            observed image trimaps -> segmenter + unified VLM
 ```
 
 Use `scripts/export_mature_bev.py` in the existing OpenDriveVLA environment;
 Shadow does not copy or retrain that encoder. The CPU join and label builder run
 in the annotation environment. See [BEV redesign and HPC commands](docs/shadow_track_contrast_v2.md#bev-flow-redesign).
+
+The [receiver competition workflow](docs/receiver_competition.md) implements the
+2D-appearance versus 3D-entity comparison: ray-volume exclusion, separate ground
+flow and illumination-boundary evidence, and real/shifted caster explanations.
+Start with its CPU audit on existing caches before submitting another training run.
 
 ## Default HPC Pipeline
 
@@ -41,7 +48,7 @@ filter the photometric candidates before caster/light matching.
 The new `bev-flow-annotation-v2` teacher exports positive observed shadows and
 weak negative endpoints and compact persistently lit neighbouring receivers outside
 competing shadow footprints. Static dark receivers can support shadow existence
-through projection even without vehicle motion or reliable exposure compensation;
+through discriminative projection support even without vehicle motion or reliable exposure compensation;
 unique caster ownership still uses motion/time contrast. Other pixels remain IGNORE. Labels from the same physical frame are
 merged; contradictory pixels are ignored. Both classes use original camera
 images. VLM examples have the same five-view layout for both classes; boundary

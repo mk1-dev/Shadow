@@ -1,5 +1,9 @@
 # Static Shadow Existence and Cache Rebuild
 
+The active default now adds [receiver explanation competition](receiver_competition.md)
+after the projection baseline described below. Use its CPU audit before training.
+`--receiver-competition off` retains the coverage-only label decision for comparison.
+
 ## Structural Fix
 
 The previous factorized policy split existence and ownership only at the final

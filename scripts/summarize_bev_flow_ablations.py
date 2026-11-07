@@ -111,6 +111,7 @@ def main():
                 "windows": len(windows), "photometric_cells": counts, "selected_cells": selected,
                 "analysis_protocol_sha256": bev_protocol["analysis_protocol_sha256"],
                 "candidate_retention": ratio(selected, counts), "label_stages": labels.get("stage_counts"),
+                "receiver_competition": labels.get("receiver_competition"),
                 "teacher_counts": teacher.get("counts"), "reference_quality": None}
             if reference is not None:
                 official = [row for row in reference if row["official_split"] == split]

@@ -133,6 +133,7 @@ def test_static_window_survives_invalid_exposure_through_both_training_targets(t
     labels = tmp_path/"labels"
     monkeypatch.setattr(sys, "argv", ["physics", "--pairs", str(pairs_path), "--analysis-root", str(flow),
         "--bev-flow-root", str(bev), "--decision-policy", "factorized-v3", "--export-weak-labels",
+        "--receiver-competition", "off",
         "--review-limit", "0", "--output-root", str(labels)])
     script("build_physics_shadow_labels").main()
     summary = json.loads((labels/"summary.json").read_text())

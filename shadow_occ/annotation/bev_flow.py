@@ -8,6 +8,9 @@ import numpy as np
 
 from shadow_occ.annotation.physics_labels import validate_window, window_tracks
 from shadow_occ.annotation.physics_motion import decompose_object_motion, project_world, sample_at
+from shadow_occ.annotation.receiver_explanations import (
+    PROTOCOL as RECEIVER_PROTOCOL, OBSERVATION_STATES, box_ray_evidence, receiver_evidence,
+)
 from shadow_occ.geometry.bev import BEVGrid
 
 
@@ -119,7 +122,14 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         high.append(top)
     occupied = np.stack(occupied)
     visible = np.stack(visible)
-    receiver = visible.all(axis=0) & ~occupied.any(axis=0)
+    sampled_flows = [sample_at(np.asarray(value["flow_t_to_next"], np.float32), uv[index])
+                     for index, value in enumerate((first, second))]
+    sampled_flow_valid = [sample_at(np.asarray(value.get("flow_reliable",
+        np.zeros(images[index].shape[:2], bool)), np.float32), uv[index]) >= .999
+        for index, value in enumerate((first, second))]
+    volume_evidence = box_ray_evidence(world, frames, uv, sampled_flows, sampled_flow_valid)
+    receiver = (visible.all(axis=0) & ~occupied.any(axis=0)
+                & ~volume_evidence["physical_ray_volume_support"].any(axis=0))
     observed, expected, reliability, residual = [], [], [], []
     for index, evidence in enumerate((first, second)):
         flow = np.asarray(evidence["flow_t_to_next"], np.float32)
@@ -198,9 +208,14 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "physical_object_displacement_world_m": displacement.astype(np.float32),
         "physical_object_velocity_world_mps": (displacement/intervals[None, :, None]).astype(np.float32),
         "physical_object_displacement_anchor_m": (displacement @ anchor[:3, :3]).astype(np.float32)}
+    arrays.update(volume_evidence)
+    arrays.update(receiver_evidence(arrays, light_threshold=config.light_threshold_L,
+                                    darkness_ratio=config.darkness_ratio))
     for key, values in object_flows.items():
         arrays[f"box_landmark_{key}"] = np.asarray(values, np.float32).reshape(-1, 2, 9, 2)
-    metadata = {"protocol": "bev-flow-discrepancy-v1", "pair_ids": [left["id"], right["id"]],
+    metadata = {"protocol": "bev-flow-discrepancy-v1", "receiver_explanation_protocol": RECEIVER_PROTOCOL,
+        "receiver_observation_legend": OBSERVATION_STATES,
+        "pair_ids": [left["id"], right["id"]],
         "scene_name": left["scene_name"], "camera": left["camera"], "official_split": left["official_split"],
         "sample_tokens": [left["sample_token"], right["sample_token"], right["next_sample_token"]],
         "frame_tokens": [frame["sample_data_token"] for frame in frames],
@@ -209,6 +224,7 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "grid": {key: getattr(grid, key) for key in ("x_min", "x_max", "y_min", "y_max", "resolution")},
         "counts": {"visible_all": int(visible.all(axis=0).sum()), "receiver": int(receiver.sum()),
                    "physical_box_excluded": int(occupied.any(axis=0).sum()),
+                   "physical_ray_volume_excluded": int(volume_evidence["physical_ray_volume_support"].any(axis=0).sum()),
                    "illumination_events": int(changed.sum()), "shadow_candidates": int(candidate.sum()),
                    "persistent_dark_receivers": int(persistent_dark.sum()),
                    "flow_supported_receivers": int((flow_support & receiver).sum())},

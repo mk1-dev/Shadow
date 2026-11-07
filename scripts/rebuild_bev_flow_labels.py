@@ -25,6 +25,13 @@ def main():
     parser.add_argument("--reuse-analysis", action="store_true",
                         help="Reuse complete split analysis and retry only missing label stages")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--receiver-competition", choices=["on", "off", "score-only"], default="on")
+    parser.add_argument("--audit-only", action="store_true", help="Compare explanations without exporting training data")
+    parser.add_argument("--control-shift-m", type=float, default=3.0)
+    parser.add_argument("--minimum-projection-gain", type=float, default=0.05)
+    parser.add_argument("--minimum-explanation-margin", type=float, default=0.05)
+    parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
+    parser.add_argument("--shadow-baseline-manifest")
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     if source == output or output.exists() and any(output.iterdir()) and not args.reuse_analysis:
@@ -34,6 +41,8 @@ def main():
     if not shared_protocol_path.is_file():
         raise FileNotFoundError(shared_protocol_path)
     shared_protocol = json.loads(shared_protocol_path.read_text(encoding="utf-8"))
+    args.shadow_baseline_manifest = args.shadow_baseline_manifest or shared_protocol.get("shadow_baseline_manifest")
+    baseline_args = ["--shadow-baseline-manifest", args.shadow_baseline_manifest] if args.shadow_baseline_manifest else []
     config = shared_protocol["config"]
     provenance = {"shared_source_bev_protocol": {
         "path": str(shared_protocol_path), "sha256": digest(shared_protocol_path)}, "splits": {}}
@@ -101,7 +110,7 @@ def main():
                 "--minimum-bev-cosine", shared_protocol.get("minimum_bev_cosine", 0.3),
                 "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
                 "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
-                "--output-root", analysis, owner=split)
+                "--output-root", analysis, *baseline_args, owner=split)
         def complete_labels(path):
             return all((path/name).is_file()
                 for name in ("canonical.jsonl", "label_protocol.json", "summary.json"))
@@ -121,9 +130,25 @@ def main():
                 "--analysis-root", destination/"flow", "--bev-flow-root", analysis,
                 "--decision-policy", "factorized-v3", "--existence-mode", "static-dynamic",
                 "--positive-fusion", args.positive_fusion, "--export-weak-labels",
+                "--receiver-competition", args.receiver_competition,
+                "--control-shift-m", args.control_shift_m,
+                "--minimum-projection-gain", args.minimum_projection_gain,
+                "--minimum-explanation-margin", args.minimum_explanation_margin,
+                "--appearance-prior-weight", args.appearance_prior_weight,
                 "--output-root", labels, owner=split)
         else:
             print(f"REUSING labels split={split}", flush=True)
+        label_protocol = json.loads((labels/"label_protocol.json").read_text(encoding="utf-8"))
+        if label_protocol.get("receiver_competition", "off") != args.receiver_competition:
+            raise ValueError("Cached label competition mode differs; choose a new output root")
+        for key in ("control_shift_m", "minimum_projection_gain", "minimum_explanation_margin", "appearance_prior_weight"):
+            if args.receiver_competition != "off" and label_protocol.get(key) != getattr(args, key):
+                raise ValueError(f"Cached label setting differs: {key}; choose a new output root")
+        if args.receiver_competition != "off" and not (destination/"competition/summary.json").exists():
+            run("analyze_receiver_competition.py", "--labels-root", labels,
+                "--output-root", destination/"competition", owner=split)
+        if args.audit_only:
+            return labels/"canonical.jsonl"
         teacher = destination/"teacher"
         if not complete_teacher(teacher) and args.reuse_analysis and complete_teacher(destination/"teacher_retry"):
             teacher = destination/"teacher_retry"
@@ -151,13 +176,14 @@ def main():
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     executor.shutdown(wait=True)
-    run("build_shadow_annotation_dataset.py", "--manifest", teachers["train"], teachers["val"],
-        "--output-root", output/"data", "--seed", args.seed)
-    run("check_shadow_annotation_data.py", "--data-root", output/"data")
-    run("build_joint_shadow_annotation_dataset.py", "--region-data-root", output/"data", "--output-root", output/"joint")
-    run("check_joint_shadow_annotation_data.py", "--data-root", output/"joint", "--require-both-classes")
+    if not args.audit_only:
+        run("build_shadow_annotation_dataset.py", "--manifest", teachers["train"], teachers["val"],
+            "--output-root", output/"data", "--seed", args.seed)
+        run("check_shadow_annotation_data.py", "--data-root", output/"data")
+        run("build_joint_shadow_annotation_dataset.py", "--region-data-root", output/"data", "--output-root", output/"joint")
+        run("check_joint_shadow_annotation_data.py", "--data-root", output/"joint", "--require-both-classes")
     write_json(output/"rebuild_protocol.json", {**vars(args), "sources": provenance,
-        "policy": "static/dynamic existence separate from motion-based ownership; no encoder or flow recomputation"})
+        "policy": "receiver explanations separate from caster ownership; no encoder or flow recomputation"})
 
 
 if __name__ == "__main__":

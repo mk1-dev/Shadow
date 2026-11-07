@@ -23,6 +23,9 @@ from shadow_occ.annotation.physics_labels import (
     select_shadow_and_caster, factorized_shadow_decision, window_tracks, fuse_shadow_support,
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
+from shadow_occ.annotation.receiver_explanations import (
+    PROTOCOL as RECEIVER_PROTOCOL, CompetitionConfig, apply_competition, explain_component,
+)
 from shadow_occ.utils.io import write_json
 
 
@@ -79,7 +82,22 @@ def main():
     parser.add_argument("--positive-fusion", choices=["best", "intersection", "consensus"],
                         help="Default: consensus for factorized-v3, intersection for strict-v2")
     parser.add_argument("--consensus-fraction", type=float, default=2/3)
+    parser.add_argument("--receiver-competition", choices=["on", "off", "score-only"],
+                        help="Default: on for factorized BEV labels; off for legacy/image-only labels")
+    parser.add_argument("--control-shift-m", type=float, default=3.0)
+    parser.add_argument("--minimum-projection-gain", type=float, default=0.05)
+    parser.add_argument("--minimum-explanation-margin", type=float, default=0.05)
+    parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
     args = parser.parse_args()
+    args.receiver_competition = args.receiver_competition or (
+        "on" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "off")
+    if args.receiver_competition != "off" and not args.bev_flow_root:
+        parser.error("Receiver competition requires --bev-flow-root")
+    competition_config = CompetitionConfig(control_shift_m=args.control_shift_m,
+        minimum_projection_gain=args.minimum_projection_gain,
+        minimum_winner_margin=args.minimum_explanation_margin,
+        appearance_prior_weight=args.appearance_prior_weight)
+    competition_config.validate()
     args.positive_fusion = args.positive_fusion or ("consensus" if args.decision_policy == "factorized-v3" else "intersection")
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
@@ -163,6 +181,8 @@ def main():
                 raise ValueError("BEV-flow evidence changed")
             with np.load(evidence_path, allow_pickle=False) as archive:
                 bev_arrays = {key: archive[key].copy() for key in archive.files}
+            if args.receiver_competition != "off" and bev_ref.get("receiver_explanation_protocol") != RECEIVER_PROTOCOL:
+                raise ValueError("Rebuild BEV analysis from cached pairs/flow/features for receiver competition")
             grid = BEVGrid(**bev_ref["grid"])
             rank_projection = bev_arrays["bev_world_to_grid"]
             rank_maps = {"visible": bev_arrays["receiver_valid"], "dark": bev_arrays["shadow_candidate"],
@@ -208,6 +228,10 @@ def main():
             rank_mask = labels == component
             hypotheses, report = rank_hypotheses(rank_mask, rank_maps, tracks, plane, basis, rank_projection,
                                                   directions, rank_config, polygon_cache=polygon_cache)
+            competition = None
+            if args.receiver_competition != "off":
+                competition = explain_component(rank_mask, bev_arrays, hypotheses, polygon_cache,
+                                                grid.resolution, competition_config)
             mask = rank_mask
             if grid is not None:
                 mask = bev_mask_to_image(rank_mask, projection, basis, grid, maps["visible"].shape) & maps["visible"]
@@ -257,7 +281,7 @@ def main():
                 "timestamp": frame["camera_timestamp"], "mask": str(path), "mask_sha256": digest(path),
                 "ground_points": str(ground_path), "hypotheses": hypotheses,
                 "evidence": report, "casters": caster_metadata, "physics_context": context,
-                "bev_flow": bev_component})
+                "bev_flow": bev_component, "receiver_competition": competition})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
             counts.update(f"temporal_evidence_reason:{reason}" for reason in report.get("temporal_reasons", []))
         counts["windows_processed"] += 1
@@ -273,6 +297,16 @@ def main():
         selector = factorized_shadow_decision if args.decision_policy == "factorized-v3" else select_shadow_and_caster
         decision = selector(item, pools[item["scene_name"], item["official_split"]],
                             directions, config, support_index=support_index)
+        counts["baseline_projection_accepted"] += int(decision["shadow_accepted"])
+        if item["receiver_competition"] is not None:
+            competition = item["receiver_competition"]
+            decision = {**decision, "baseline_projection_decision": {
+                key: decision[key] for key in ("shadow_accepted", "reason", "existence_score") if key in decision}}
+            counts[f"explanation:{competition['winner']}"] += 1
+            if args.receiver_competition == "on":
+                decision = apply_competition(decision, competition, item["hypotheses"])
+            else:
+                decision = {**decision, "receiver_competition": competition}
         selection, association, reason = decision["selected"], decision["association"], decision["reason"]
         mask = cv2.imread(item["mask"], cv2.IMREAD_GRAYSCALE) > 0
         positive = np.zeros_like(mask)
@@ -385,6 +419,7 @@ def main():
                 for h in item["hypotheses"]) for item in candidates),
             "configured_trajectory_gate_fits": sum(any(h.get("shadow_passes") for h in item["hypotheses"]) for item in candidates),
             "accepted_shadow": counts["weak_gate_passed"],
+            "baseline_projection_accepted": counts["baseline_projection_accepted"],
             "accepted_static_projection": counts["accepted:static_projection"],
             "accepted_moving_projection": counts["accepted:moving_projection"],
             "accepted_fraction_of_observed_components": counts["weak_gate_passed"]/max(len(candidates), 1),
@@ -401,9 +436,14 @@ def main():
         "shadow_precision": None, "shadow_recall": None, "shadow_iou": None, "caster_accuracy": None,
         "training_readiness": "positive_only_requires_independent_negative_supervision_and_disjoint_dev",
         "static_dark_policy": "projection_supported_yes_else_ignore" if config.allow_static_existence else "retain_unknown_not_negative",
+        "receiver_competition": {"mode": args.receiver_competition, "config": asdict(competition_config),
+            "winner_counts": {key: counts[f"explanation:{key}"] for key in
+                              ("unknown", "physical_entity", "ground_material", "cast_shadow")},
+            "negative_policy": "material/entity explanations do not automatically create NO labels"},
         "probability_calibrated": False}
     write_json(output/"summary.json", summary)
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
+        "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),
         "coordinate_frame": "BEV caster matching; observed middle-camera trimaps" if args.bev_flow_root else "middle camera pixels; metric receiver points in world ground plane",

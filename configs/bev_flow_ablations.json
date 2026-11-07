@@ -2,6 +2,9 @@
   "protocol": "bev-flow-ablation-v1",
   "variants": {
     "full": {},
+    "projection_coverage": {"receiver_competition": "off"},
+    "competition_score_only": {"receiver_competition": "score-only"},
+    "without_shadow_baseline": {"appearance_prior_weight": 0.0},
     "without_static": {"existence_mode": "motion"},
     "legacy_motion": {"existence_mode": "motion", "positive_fusion": "intersection", "negative_policy": "endpoints"},
     "geometry_only": {"feature_gate": "none"},

@@ -11,6 +11,10 @@ export SHADOW_VLM_ADAPTER="$SHADOW_VLM_ROOT/adapter"
 export SHADOW_DIAG_ROOT="$SHADOW_ANNOTATION_ROOT/diagnostics"
 export SHADOW_EVAL_ROOT="$SHADOW_ANNOTATION_ROOT/evaluation"
 unset SHADOW_INIT_ADAPTER SHADOW_SEG_INIT_CHECKPOINT
+if [[ "${SHADOW_RECEIVER_AUDIT_ONLY:-0}" == 1 ]]; then
+  echo "Audit-only does not create training data; submit slurm/rebuild_bev_flow_labels.slurm directly." >&2
+  exit 1
+fi
 if [[ -z "${SHADOW_REBUILD_SOURCE:-}" ]]; then
   : "${UNIAD_ROOT:?Set the mature OpenDriveVLA repository}"
   : "${UNIAD_CONDA_ENV:?Set the working mature encoder environment}"
