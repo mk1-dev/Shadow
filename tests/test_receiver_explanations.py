@@ -124,6 +124,28 @@ def test_bad_exposure_in_one_interval_does_not_erase_the_other_interval():
     assert not result["receiver_boundary_recovery"].any()
 
 
+def test_old_cache_reconstructs_missing_illumination_delta():
+    arrays, mask, _, _ = receiver_case(dynamic=True)
+    expected = arrays["temporal_illumination_change_L"].copy()
+    del arrays["temporal_illumination_change_L"]
+    arrays["appearance_L_compensated"] = arrays["appearance_L_raw"].copy()
+    result = receiver_evidence(arrays)
+    np.testing.assert_allclose(result["temporal_illumination_change_L"], expected)
+    assert result["receiver_boundary_formation"][mask].all()
+    assert result["receiver_boundary_recovery"][mask].all()
+
+
+def test_missing_illumination_inputs_do_not_create_transition_evidence():
+    arrays, mask, _, _ = receiver_case(dynamic=True)
+    del arrays["temporal_illumination_change_L"]
+    arrays.pop("appearance_L_compensated", None)
+    arrays["appearance_L_raw"] = np.full_like(arrays["appearance_L_raw"], np.nan)
+    result = receiver_evidence(arrays)
+    assert not result["receiver_boundary_formation"].any()
+    assert not result["receiver_boundary_recovery"].any()
+    assert np.isnan(result["temporal_illumination_change_L"]).all()
+
+
 def test_shifted_controls_do_not_wrap_and_have_equal_light_search():
     arrays, mask, hypotheses, polygons = receiver_case()
     second = {**hypotheses[0], "light_id": 1}

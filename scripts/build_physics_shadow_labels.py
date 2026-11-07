@@ -190,7 +190,7 @@ def main():
                 np.array([bool(value["exposure"]["valid"]) for value in (first_metric, second_metric)])[:, None, None],
                 (2, *bev_arrays["receiver_valid"].shape)).copy()
             bev_arrays.update(receiver_evidence(bev_arrays,
-                light_threshold=bev_protocol["config"]["light_threshold_L"]))
+                light_threshold=bev_protocol.get("config", {}).get("light_threshold_L", 6.0)))
             if args.receiver_competition != "off" and bev_ref.get("receiver_explanation_protocol") != RECEIVER_PROTOCOL:
                 raise ValueError("Rebuild BEV analysis from cached pairs/flow/features for receiver competition")
             grid = BEVGrid(**bev_ref["grid"])

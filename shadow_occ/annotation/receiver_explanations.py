@@ -156,6 +156,24 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
             "box_surface_expected_flow_px": expected, "box_surface_flow_residual_px": residual}
 
 
+def illumination_change(arrays, receiver_shape):
+    """Read a cached signed delta or reconstruct it without inventing evidence."""
+    cached = arrays.get("temporal_illumination_change_L")
+    if cached is not None:
+        delta = np.asarray(cached, np.float32)
+        if delta.shape == (2, *receiver_shape):
+            return delta
+        raise ValueError("Temporal illumination change and receiver grid differ")
+    for name in ("appearance_L_compensated", "appearance_L_raw"):
+        lightness = arrays.get(name)
+        if lightness is not None:
+            lightness = np.asarray(lightness, np.float32)
+            if lightness.shape == (3, *receiver_shape):
+                return np.diff(lightness, axis=0)
+            raise ValueError(f"{name} and receiver grid differ")
+    return np.full((2, *receiver_shape), np.nan, np.float32)
+
+
 def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
     """Ground-registered appearance boundaries are separate from material flow."""
     receiver = arrays["receiver_valid"]
@@ -163,7 +181,7 @@ def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
     raw = arrays["appearance_L_raw"]
     comparable = np.broadcast_to(arrays.get("temporal_exposure_valid_by_interval",
         arrays.get("temporal_exposure_valid", False)), (2, *receiver.shape))
-    delta = arrays["temporal_illumination_change_L"]
+    delta = illumination_change(arrays, receiver.shape)
     dark = (ratio < darkness_ratio) & receiver[None]
     boundaries = np.stack([value & ~cv2.erode(value.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
                            for value in dark])
@@ -185,7 +203,14 @@ def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
         cosine = (first*second).sum(axis=-1)/np.maximum(norms, 1e-6)
         texture.append(np.where(valid, np.clip(cosine, -1, 1), np.nan))
         texture_valid.append(valid)
-    entity = arrays["physical_box_footprint"].any(axis=0) | arrays["physical_ray_volume_support"].any(axis=0)
+    entity = np.zeros(receiver.shape, bool)
+    for name in ("physical_box_footprint", "physical_ray_volume_support"):
+        support = arrays.get(name)
+        if support is not None:
+            support = np.asarray(support, bool)
+            if support.shape != (3, *receiver.shape):
+                raise ValueError(f"{name} and receiver grid differ")
+            entity |= support.any(axis=0)
     observation = np.zeros(receiver.shape, np.uint8)
     observation[receiver] = 1
     observation[entity] = 2
@@ -194,7 +219,8 @@ def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
             "receiver_boundary_formation": formed, "receiver_boundary_recovery": recovered,
             "receiver_material_persistence": np.where(finite_ratio, persistence, np.nan).astype(np.float32),
             "receiver_texture_cosine": np.stack(texture).astype(np.float32),
-            "receiver_texture_valid": np.stack(texture_valid)}
+            "receiver_texture_valid": np.stack(texture_valid),
+            "temporal_illumination_change_L": delta}
 
 
 def projection_score(mask, footprint, domain, dark, lit):
@@ -224,7 +250,7 @@ def projection_transitions(mask, footprints, arrays, section):
                 ("receiver_boundary_formation", "receiver_boundary_recovery"))]
     predicted = [middle & ~previous, middle & ~following]
     valid = arrays["receiver_valid"][section] & mask
-    delta = arrays["temporal_illumination_change_L"][:, section[0], section[1]]
+    delta = illumination_change(arrays, arrays["receiver_valid"].shape)[:, section[0], section[1]]
     fits, expected_pixels, nonresponse_pixels = [], 0, 0
     details = []
     for slot, (event, change) in enumerate(zip(observed, predicted)):

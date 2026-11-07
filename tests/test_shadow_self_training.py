@@ -246,8 +246,9 @@ def test_unknown_pseudo_association_teaches_only_shadow_tokens(monkeypatch):
 
     monkeypatch.setattr(vlm, "encode_example", encode)
     target = annotation("YES")
-    row = {"task": "shadow_annotation", "annotation_target": target, "answer": json.dumps(target), "label_source": "model_pseudo",
+    row = {"id": "pseudo-positive", "task": "shadow_annotation", "annotation_target": target, "answer": json.dumps(target), "label_source": "model_pseudo",
            "self_training": {"round": 1}, "association_supervision_enabled": False}
     sample = vlm.SFTDataset([row], None, 100, 0.25, loss_mode="component")[0]
     assert sample["labels"].tolist() == [[-100, -100, 12, -100]]
     assert not sample["association_active"]
+    assert sample["example_id"] == "pseudo-positive"
