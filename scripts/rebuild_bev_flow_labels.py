@@ -102,14 +102,21 @@ def main():
                 "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
                 "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
                 "--output-root", analysis, owner=split)
+        def complete_labels(path):
+            return all((path/name).is_file()
+                for name in ("canonical.jsonl", "label_protocol.json", "summary.json"))
+
+        def complete_teacher(path):
+            return all((path/name).is_file() for name in ("canonical.jsonl", "protocol.json"))
+
         labels = destination/"labels"
-        labels_complete = all((labels/name).is_file()
-            for name in ("canonical.jsonl", "label_protocol.json", "summary.json"))
-        if not labels_complete:
+        if not complete_labels(labels) and args.reuse_analysis and complete_labels(destination/"labels_retry"):
+            labels = destination/"labels_retry"
+        if not complete_labels(labels):
             if args.reuse_analysis:
                 labels = destination/"labels_retry"
                 if labels.exists() and any(labels.iterdir()):
-                    raise FileExistsError(f"Retry output is not empty: {labels}")
+                    raise FileExistsError(f"Retry output is incomplete and not empty: {labels}")
             run("build_physics_shadow_labels.py", "--pairs", destination/"pairs/pairs.jsonl",
                 "--analysis-root", destination/"flow", "--bev-flow-root", analysis,
                 "--decision-policy", "factorized-v3", "--existence-mode", "static-dynamic",
@@ -118,12 +125,13 @@ def main():
         else:
             print(f"REUSING labels split={split}", flush=True)
         teacher = destination/"teacher"
-        teacher_complete = all((teacher/name).is_file() for name in ("canonical.jsonl", "protocol.json"))
-        if not teacher_complete:
+        if not complete_teacher(teacher) and args.reuse_analysis and complete_teacher(destination/"teacher_retry"):
+            teacher = destination/"teacher_retry"
+        if not complete_teacher(teacher):
             if args.reuse_analysis:
                 teacher = destination/"teacher_retry"
                 if teacher.exists() and any(teacher.iterdir()):
-                    raise FileExistsError(f"Retry output is not empty: {teacher}")
+                    raise FileExistsError(f"Retry output is incomplete and not empty: {teacher}")
             run("build_bev_flow_annotation_manifest.py", "--pairs", destination/"pairs/pairs.jsonl",
                 "--labels-root", labels, "--negative-policy", args.negative_policy,
                 "--output-root", teacher, owner=split)
