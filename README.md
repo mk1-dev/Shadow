@@ -39,6 +39,12 @@ one mature-model inference export first; then audit on CPU before training.
 
 ## Default HPC Pipeline
 
+The [transition-evidence update](docs/shadow_transition_v2.md) addresses the
+2/0-positive audit: persistence is no longer automatic material evidence,
+single-sided signed changes can support caster matching, and identical-candidate
+3D counterfactuals separate scoring effects from entity-motion effects. Its CPU
+replay reuses the completed 3D audit without another GPU export.
+
 Internal experiments are available in [BEV-flow ablations](docs/bev_flow_ablations.md):
 shared-input feature/flow gates, genuine no-DIS geometry registration, current-only
 encoder export, physical-explanation controls, and training-label controls. Reuse

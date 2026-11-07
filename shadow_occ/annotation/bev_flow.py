@@ -203,6 +203,8 @@ def build_bev_flow(left, right, images, grounds, first, second, exposures, confi
         "shadow_boundary_onset": onset & candidate, "shadow_boundary_recovery": recovery & candidate,
         "shadow_candidate": candidate, "shadow_flow_supported": flow_support,
         "shadow_persistent_dark": persistent_dark, "temporal_exposure_valid": np.full(grid.shape, comparable, bool),
+        "temporal_exposure_valid_by_interval": np.broadcast_to(
+            np.array([bool(item.get("valid")) for item in exposures])[:, None, None], (2, *grid.shape)).copy(),
         "shadow_same_patch_cycle": onset & recovery & candidate,
         "track_landmarks_world": landmarks.astype(np.float32),
         "physical_object_displacement_world_m": displacement.astype(np.float32),

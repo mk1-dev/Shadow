@@ -1,5 +1,8 @@
 # GT Caster Motion, Image Flow and Mature 3D Predictions
 
+For the completed export's next CPU-only step, use [transition evidence v2](shadow_transition_v2.md).
+It reuses the existing 3D audit and does not require exporting this cache again.
+
 ## Information Flow
 
 The BEV-feature/image-flow comparison is retained, not replaced by 3D boxes.

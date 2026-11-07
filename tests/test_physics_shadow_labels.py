@@ -164,6 +164,29 @@ def test_real_order_must_beat_frozen_and_wrong_time_explanations():
     assert frozen["temporal_gain"] == 0
 
 
+def test_single_observed_boundary_can_support_partial_temporal_matching():
+    mask, maps, tracks, directions = moving_case()
+    maps["recovery"][:] = False
+    maps["same_patch_cycle"][:] = False
+    args = (mask, maps, tracks, [0, 0, 1, 0], plane_basis([0, 0, 1, 0]), projection(), directions)
+    complete, _ = rank_hypotheses(*args, LabelConfig(allow_static_existence=True))
+    partial, _ = rank_hypotheses(*args, LabelConfig(allow_static_existence=True, allow_partial_temporal=True))
+    assert not complete[0]["shadow_passes"]
+    assert partial[0]["observed_transition_types"] == 1
+    assert partial[0]["available_edge_fit"] == pytest.approx(1)
+    assert partial[0]["temporal_gain"] > 0 and partial[0]["shadow_passes"]
+
+
+def test_partial_temporal_matching_does_not_turn_static_darkness_into_motion():
+    mask, maps, tracks, directions = moving_case()
+    maps["onset"][:] = False
+    maps["recovery"][:] = False
+    ranks, _ = rank_hypotheses(mask, maps, tracks, [0, 0, 1, 0], plane_basis([0, 0, 1, 0]),
+        projection(), directions, LabelConfig(allow_static_existence=True, allow_partial_temporal=True))
+    assert ranks[0]["observed_transition_types"] == 0
+    assert ranks[0]["temporal_gain"] == 0 and not ranks[0]["shadow_passes"]
+
+
 def test_ambiguous_caster_does_not_erase_independently_supported_shadow():
     mask, maps, tracks, directions = moving_case()
     tracks.append({**tracks[0], "instance_token": "second_car"})
@@ -207,6 +230,18 @@ def test_factorized_existence_does_not_require_other_track_light_votes():
 def test_factorized_policy_needs_a_projection_explanation_not_just_darkness():
     candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["f"], "hypotheses": []}
     assert not factorized_shadow_decision(candidate, [], light_bank(), LabelConfig())["shadow_accepted"]
+
+
+def test_temporally_unique_owner_is_not_vetoed_by_static_projection_ambiguity():
+    alternative = {"instance_token": "static_car", "light_id": 0, "score": .4,
+        "shadow_passes": False, "shadow_fit_passes": True, "existence_score": 1.}
+    hypothesis = {"instance_token": "moving_car", "light_id": 0, "score": 1., "passes": True,
+        "shadow_passes": True, "shadow_fit_passes": True, "existence_score": 1., "alternatives": [alternative]}
+    candidate = {"scene_name": "scene", "official_split": "train", "frame_tokens": ["f"],
+                 "hypotheses": [hypothesis]}
+    decision = factorized_shadow_decision(candidate, [], light_bank(), LabelConfig(require_independent_light=False))
+    assert decision["association"]["instance_token"] == "moving_car"
+    assert len(decision["plausible_hypotheses"]) == 2
 
 
 def test_polygon_cache_matches_uncached_roi_results():

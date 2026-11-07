@@ -12,12 +12,16 @@ from shadow_occ.annotation.physics_motion import project_world, sample_at
 
 
 PROTOCOL = "receiver-explanations-v1"
+SCORE_PROTOCOL = "receiver-competition-v2-transition-evidence"
 OBSERVATION_STATES = {0: "unknown", 1: "observed_ground_receiver", 2: "annotated_volume_support"}
 SCORE_CONTRACT = {
     "projection": {"coverage": .65, "boundary": .2, "dark_fraction": .15, "lit_conflict_penalty": .35},
     "shadow": {"projection_strength": .65, "boundary_transition": .35},
     "projection_gain_scale": .12, "transition_fraction_scale": .1,
     "material_ratio_range_scale": .1, "near_projection_margin": .12,
+    "nonresponse_lightness_L": 6.0,
+    "material": "persistent appearance AND nonresponse to observable predicted illumination change",
+    "persistence_only": "shared static appearance evidence; not a material decision",
 }
 
 
@@ -157,13 +161,14 @@ def receiver_evidence(arrays, *, light_threshold=6.0, darkness_ratio=0.88):
     receiver = arrays["receiver_valid"]
     ratio = arrays["appearance_local_ratio"]
     raw = arrays["appearance_L_raw"]
-    comparable = np.broadcast_to(arrays.get("temporal_exposure_valid", False), receiver.shape)
+    comparable = np.broadcast_to(arrays.get("temporal_exposure_valid_by_interval",
+        arrays.get("temporal_exposure_valid", False)), (2, *receiver.shape))
     delta = arrays["temporal_illumination_change_L"]
     dark = (ratio < darkness_ratio) & receiver[None]
     boundaries = np.stack([value & ~cv2.erode(value.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
                            for value in dark])
-    formed = dark[1] & ~dark[0] & comparable & (delta[0] <= -light_threshold)
-    recovered = dark[1] & ~dark[2] & comparable & (delta[1] >= light_threshold)
+    formed = dark[1] & ~dark[0] & comparable[0] & (delta[0] <= -light_threshold)
+    recovered = dark[1] & ~dark[2] & comparable[1] & (delta[1] >= light_threshold)
     finite_ratio = np.isfinite(ratio).all(axis=0) & receiver
     persistence = np.exp(-np.ptp(np.nan_to_num(ratio, nan=0), axis=0)/SCORE_CONTRACT["material_ratio_range_scale"])
     texture, texture_valid = [], []
@@ -210,6 +215,38 @@ def projection_score(mask, footprint, domain, dark, lit):
             "observed_dark_fraction": precision, "observed_lit_conflict": conflict}
 
 
+def projection_transitions(mask, footprints, arrays, section):
+    """Match signed ground changes to a caster's swept projection, not object flow."""
+    previous, middle, following = footprints
+    comparable = np.broadcast_to(arrays.get("temporal_exposure_valid_by_interval",
+        arrays.get("temporal_exposure_valid", False)), (2, *arrays["receiver_valid"].shape))[:, section[0], section[1]]
+    observed = [arrays[name][section] & mask & comparable[slot] for slot, name in enumerate(
+                ("receiver_boundary_formation", "receiver_boundary_recovery"))]
+    predicted = [middle & ~previous, middle & ~following]
+    valid = arrays["receiver_valid"][section] & mask
+    delta = arrays["temporal_illumination_change_L"][:, section[0], section[1]]
+    fits, expected_pixels, nonresponse_pixels = [], 0, 0
+    details = []
+    for slot, (event, change) in enumerate(zip(observed, predicted)):
+        expected = change & valid & comparable[slot]
+        # One BEV cell accounts for box/raster boundary approximation, not new positives.
+        near = cv2.dilate(expected.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        fit = float((event & near).sum()/event.sum()) if event.any() else None
+        if fit is not None:
+            fits.append(fit)
+        finite = expected & np.isfinite(delta[slot])
+        nonresponse = finite & (np.abs(delta[slot]) < SCORE_CONTRACT["nonresponse_lightness_L"])
+        expected_pixels += int(finite.sum())
+        nonresponse_pixels += int(nonresponse.sum())
+        details.append({"kind": "formation" if slot == 0 else "recovery",
+            "observed_pixels": int(event.sum()), "expected_pixels": int(finite.sum()),
+            "boundary_fit": fit, "nonresponse_pixels": int(nonresponse.sum())})
+    return {"observed_transition_types": len(fits), "boundary_fit": float(np.mean(fits)) if fits else 0.0,
+            "expected_change_pixels": expected_pixels,
+            "nonresponse_fraction": float(nonresponse_pixels/max(2*int(mask.sum()), 1)),
+            "events": details}
+
+
 def explain_component(mask, arrays, hypotheses, polygons, resolution, config=None):
     """Compare real and shifted casters with the SAME track/light search budget."""
     config = config or CompetitionConfig()
@@ -241,37 +278,53 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
     explanations = [value for parent in hypotheses for value in [parent, *parent.get("alternatives", [])]]
     for item in explanations:
         key = (item["instance_token"], item["light_id"])
-        footprint = np.zeros(local_mask.shape, np.uint8)
+        footprints = []
+        for polygon in polygons[key]:
+            footprint = np.zeros(local_mask.shape, np.uint8)
+            cv2.fillConvexPoly(footprint, polygon-np.array([[[x0, y0]]], np.int32), 1)
+            footprints.append(footprint > 0)
+        footprint = footprints[1]
         polygon = polygons[key][1]-np.array([[[x0, y0]]], np.int32)
-        cv2.fillConvexPoly(footprint, polygon, 1)
-        values = projection_score(local_mask, footprint > 0, local_domain, local_dark, local_lit)
+        values = projection_score(local_mask, footprint, local_domain, local_dark, local_lit)
+        transitions = projection_transitions(local_mask, footprints, arrays, section)
+        time_gain = float(item.get("temporal_gain", 0)) if item.get("motion_supported") else 0.0
+        matched_motion = transitions["boundary_fit"]*float(np.clip(
+            time_gain/SCORE_CONTRACT["projection_gain_scale"], 0, 1))
+        selection_score = (SCORE_CONTRACT["shadow"]["projection_strength"]*values["score"]
+                           +SCORE_CONTRACT["shadow"]["boundary_transition"]*matched_motion)
         evaluations.append({"instance_token": key[0], "light_id": key[1],
-                            "projection_fit_passes": bool(item.get("shadow_fit_passes")), **values})
+                            "projection_fit_passes": bool(item.get("shadow_fit_passes")),
+                            "transitions": transitions, "selection_score": float(selection_score), **values})
         for dx, dy in offsets:
             control = np.zeros(local_mask.shape, np.uint8)
             cv2.fillConvexPoly(control, polygon+np.array([[[dx, dy]]], np.int32), 1)
             controls.append({"instance_token": key[0], "light_id": key[1], "offset_cells": [dx, dy],
                              **projection_score(local_mask, control > 0, local_domain, local_dark, local_lit)})
     fits = [value for value in evaluations if value["projection_fit_passes"]]
-    best = max(fits, key=lambda value: value["score"]) if fits else None
+    best = max(fits, key=lambda value: value["selection_score"]) if fits else None
     # Each displacement arm searches every real track/light; compare its best to the real best.
     best_control = max(controls, key=lambda value: value["score"]) if controls else None
     gain = best["score"]-best_control["score"] if best is not None and best_control is not None else 0.0
     motion_gain = max((float(value.get("temporal_gain", 0)) for value in explanations
                        if best and value["instance_token"] == best["instance_token"]
-                       and value["light_id"] == best["light_id"] and value.get("shadow_passes")), default=0.0)
+                       and value["light_id"] == best["light_id"] and value.get("motion_supported")), default=0.0)
     projection_strength = (best["score"]*float(np.clip(
         max(gain, motion_gain)/SCORE_CONTRACT["projection_gain_scale"], 0, 1))) if best else 0.0
     events = arrays["receiver_boundary_formation"] | arrays["receiver_boundary_recovery"]
     transition = float(np.clip((events & mask).sum()/area/SCORE_CONTRACT["transition_fraction_scale"], 0, 1))
+    transition *= (best["transitions"]["boundary_fit"]*float(np.clip(
+        motion_gain/SCORE_CONTRACT["projection_gain_scale"], 0, 1))) if best else 0.0
     persistence_values = arrays["receiver_material_persistence"][mask & ground]
     persistence_values = persistence_values[np.isfinite(persistence_values)]
     persistence = float(persistence_values.mean()) if len(persistence_values) else 0.0
+    # Stable darkness fits BOTH static shadows and reflectance; it is not a negative label.
+    nonresponse = min((value["transitions"]["nonresponse_fraction"] for value in fits), default=0.0)
     scores = {"physical_entity": entity_fraction,
-              "ground_material": ground_fraction*persistence*(1-projection_strength),
+              "unknown": max(unknown_fraction,
+                  ground_fraction*(1-max(projection_strength, transition, nonresponse))),
+              "ground_material": ground_fraction*persistence*nonresponse*(1-projection_strength),
               "cast_shadow": ground_fraction*(SCORE_CONTRACT["shadow"]["projection_strength"]*projection_strength
-                  +SCORE_CONTRACT["shadow"]["boundary_transition"]*transition) if best else 0.0,
-              "unknown": unknown_fraction}
+                  +SCORE_CONTRACT["shadow"]["boundary_transition"]*transition) if best else 0.0}
     mature_evidence = None
     mature_unexplained_score = None
     if "mature_entity_probability" in arrays:
@@ -307,12 +360,16 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
             prior_contrast = prior_mean-context_mean
             scores["cast_shadow"] = float(np.clip(scores["cast_shadow"]
                 +config.appearance_prior_weight*prior_contrast*ground_fraction*projection_strength, 0, 1))
+    without_mature = {**scores, "physical_entity": entity_fraction}
+    without_order = sorted(without_mature, key=without_mature.get, reverse=True)
     ordered = sorted(scores, key=scores.get, reverse=True)
     winner = ordered[0]
     margin = scores[winner]-scores[ordered[1]]
     discriminative = max(gain, motion_gain) >= config.minimum_projection_gain
     accepted = bool(best and winner == "cast_shadow" and discriminative
                     and margin >= config.minimum_winner_margin)
+    without_supported = bool(best and without_order[0] == "cast_shadow" and discriminative
+        and without_mature[without_order[0]]-without_mature[without_order[1]] >= config.minimum_winner_margin)
     texture = arrays["receiver_texture_cosine"][:, mask]
     texture = texture[np.isfinite(texture)]
     ratio_values = ratio[1][mask & ground]
@@ -326,10 +383,15 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
         values = arrays[name][1][mask] if name in arrays else np.empty(0)
         values = values[np.isfinite(values)]
         motion_diagnostics[name+"_median"] = float(np.median(values)) if len(values) else None
-    return {"protocol": PROTOCOL, "winner": winner, "winner_margin": float(margin), "scores": scores,
+    return {"protocol": PROTOCOL, "score_protocol": SCORE_PROTOCOL,
+            "winner": winner, "winner_margin": float(margin), "scores": scores,
             "shadow_supported": accepted, "ground_fraction": ground_fraction,
             "entity_fraction": entity_fraction, "unknown_fraction": unknown_fraction,
             "transition_fraction": float((events & mask).sum()/area), "material_persistence": persistence,
+            "matched_transition_strength": float(transition), "material_nonresponse_fraction": float(nonresponse),
+            "static_appearance_is_shared_evidence": True,
+            "without_mature_3d": {"winner": without_order[0], "shadow_supported": without_supported,
+                                  "scores": without_mature},
             "texture_cosine_mean": float(texture.mean()) if len(texture) else None,
             "texture_observed_fraction": float(arrays["receiver_texture_valid"][:, mask].mean()),
             "best_projection": best, "best_shifted_control": best_control,
@@ -363,11 +425,11 @@ def apply_competition(decision, evidence, hypotheses):
                     and value["light_id"] == best["light_id"])
     near = {(value["instance_token"], value["light_id"]) for value in evidence["hypothesis_scores"]
             if value["projection_fit_passes"]
-            and best["score"]-value["score"] < SCORE_CONTRACT["near_projection_margin"]}
+            and best.get("selection_score", best["score"])-value.get("selection_score", value["score"])
+                < SCORE_CONTRACT["near_projection_margin"]}
     plausible = [value for value in explanations if (value["instance_token"], value["light_id"]) in near]
     association = result["association"]
-    if association is not None and (association["instance_token"] != selected["instance_token"]
-                                   or len({token for token, _ in near}) != 1):
+    if association is not None and association["instance_token"] != selected["instance_token"]:
         association = None
     return {**result, "selected": selected, "association": association, "plausible_hypotheses": plausible,
             "reason": "receiver_competition_shadow_support", "existence_score": best["score"],

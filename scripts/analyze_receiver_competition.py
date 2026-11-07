@@ -108,6 +108,11 @@ def main():
                "baseline_scores": evidence["baseline_scores"],
                "mature_3d": evidence.get("mature_3d"),
                "motion_diagnostics": evidence.get("motion_diagnostics"),
+               "score_protocol": evidence.get("score_protocol", "receiver-competition-v1"),
+               "without_mature_3d": evidence.get("without_mature_3d"),
+               "matched_transition_strength": evidence.get("matched_transition_strength", 0),
+               "material_nonresponse_fraction": evidence.get("material_nonresponse_fraction", 0),
+               "best_projection_transitions": (evidence.get("best_projection") or {}).get("transitions"),
                "mature_image_motion": (item.get("bev_flow") or {}).get("mature_image_motion"),
                "projection_control_gain": evidence["projection_control_gain"],
                "trajectory_control_gain": evidence["trajectory_control_gain"],
@@ -160,6 +165,19 @@ def main():
         checked_write_image(output/"contact_sheet.jpg", np.vstack([
             np.hstack(panels[index:index+per_row]) for index in range(0, len(panels), per_row)]))
     write_json(output/"summary.json", {"components": len(rows), "winner_counts": dict(winners),
+        "score_protocols": dict(Counter(row["score_protocol"] for row in rows)),
+        "matched_transition_components": sum(row["matched_transition_strength"] > 0 for row in rows),
+        "observed_transition_components": sum((row["best_projection_transitions"] or {}).get(
+            "observed_transition_types", 0) > 0 for row in rows),
+        "material_nonresponse_components": sum(row["material_nonresponse_fraction"] > 0 for row in rows),
+        "mature_3d_counterfactual": {
+            "available": sum(row["without_mature_3d"] is not None for row in rows),
+            "without_mature_supported": sum(bool((row["without_mature_3d"] or {}).get("shadow_supported")) for row in rows),
+            "winner_changed": sum(row["without_mature_3d"] is not None
+                and row["without_mature_3d"]["winner"] != row["winner"] for row in rows),
+            "shadow_rejected_by_mature": sum(bool((row["without_mature_3d"] or {}).get("shadow_supported"))
+                and not row["competition_supported"] for row in rows),
+            "scope": "same candidates and scores; remove only the mature entity-motion contribution"},
         "mature_3d_components": sum(row["mature_3d"] is not None for row in rows),
         "mature_motion_components": sum((row["mature_3d"] or {}).get("motion_observed_fraction", 0) > 0 for row in rows),
         "baseline_accepted": sum(row["baseline_accepted"] for row in rows),

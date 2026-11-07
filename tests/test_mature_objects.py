@@ -175,6 +175,8 @@ def test_real_3d_entity_motion_changes_shadow_competition():
     result_value = explain_component(mask, arrays, hypotheses, polygons, .5)
     assert result_value["winner"] == "physical_entity" and not result_value["shadow_supported"]
     assert result_value["mature_3d"]["entity_motion_score"] > .9
+    assert result_value["without_mature_3d"]["winner"] == "cast_shadow"
+    assert result_value["without_mature_3d"]["shadow_supported"]
     arrays["mature_entity_probability"][:] = 0
     arrays["mature_entity_motion_fit"][:] = np.nan
     assert explain_component(mask, arrays, [], {}, .5)["shadow_supported"] is False

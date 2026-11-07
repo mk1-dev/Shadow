@@ -15,11 +15,14 @@ conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
-  python -m pytest -q tests/test_bev_flow.py tests/test_physics_shadow_labels.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py tests/test_mature_objects.py
+  python -m pytest -q tests/test_bev_flow.py tests/test_physics_shadow_labels.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py tests/test_mature_objects.py tests/test_rebuild_shadow_analysis.py
 fi
 REUSE_ARGS=()
 if [[ "${SHADOW_REUSE_ANALYSIS:-0}" == 1 ]]; then
   REUSE_ARGS+=(--reuse-analysis)
+fi
+if [[ "${SHADOW_REUSE_SOURCE_ANALYSIS:-0}" == 1 ]]; then
+  REUSE_ARGS+=(--reuse-source-analysis)
 fi
 if [[ "${SHADOW_RECEIVER_AUDIT_ONLY:-0}" == 1 ]]; then
   REUSE_ARGS+=(--audit-only)

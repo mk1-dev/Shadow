@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--split-workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--reuse-analysis", action="store_true",
                         help="Reuse complete split analysis and retry only missing label stages")
+    parser.add_argument("--reuse-source-analysis", action="store_true",
+                        help="New labels on exactly the source's existing BEV windows; no BEV/flow/3D re-export")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--receiver-competition", choices=["on", "off", "score-only"], default="on")
     parser.add_argument("--audit-only", action="store_true", help="Compare explanations without exporting training data")
@@ -35,6 +37,8 @@ def main():
     parser.add_argument("--mature-object-root", help="Parent containing train/ and val/ decoded prediction caches")
     parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
     args = parser.parse_args()
+    if args.reuse_analysis and args.reuse_source_analysis:
+        parser.error("Choose retrying this output or reusing source windows, not both")
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     if source == output or output.exists() and any(output.iterdir()) and not args.reuse_analysis:
         raise FileExistsError("Use a new output root, distinct from the source cache")
@@ -103,7 +107,15 @@ def main():
         analysis = destination/"bev_flow"
         object_root = (Path(args.mature_object_root).resolve()/split if args.mature_object_root
                        else destination/"mature_bev")
-        if args.reuse_analysis:
+        if args.reuse_source_analysis:
+            original_analysis = origin/"bev_flow"
+            previous = json.loads((original_analysis/"bev_flow_protocol.json").read_text(encoding="utf-8"))
+            if previous.get("mature_object_mode", "off") != args.mature_object_mode:
+                raise ValueError("Source analysis uses a different 3D mode")
+            analysis.symlink_to(original_analysis, target_is_directory=True)
+            provenance["splits"][split]["shared_bev_windows_sha256"] = digest(analysis/"windows.jsonl")
+            print(f"SHARING frozen analysis split={split}", flush=True)
+        elif args.reuse_analysis:
             for name in ("bev_flow_protocol.json", "windows.jsonl", "summary.json"):
                 if not (analysis/name).is_file():
                     raise FileNotFoundError(analysis/name)

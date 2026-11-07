@@ -24,7 +24,8 @@ from shadow_occ.annotation.physics_labels import (
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
 from shadow_occ.annotation.receiver_explanations import (
-    PROTOCOL as RECEIVER_PROTOCOL, CompetitionConfig, apply_competition, explain_component,
+    PROTOCOL as RECEIVER_PROTOCOL, SCORE_PROTOCOL, CompetitionConfig, apply_competition, explain_component,
+    receiver_evidence,
 )
 from shadow_occ.utils.io import write_json
 
@@ -88,6 +89,8 @@ def main():
     parser.add_argument("--minimum-projection-gain", type=float, default=0.05)
     parser.add_argument("--minimum-explanation-margin", type=float, default=0.05)
     parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
+    parser.add_argument("--temporal-evidence", choices=["available", "complete"],
+                        help="Use observed signed boundary events; default available for factorized-v3, complete for strict-v2")
     args = parser.parse_args()
     args.receiver_competition = args.receiver_competition or (
         "on" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "off")
@@ -99,11 +102,13 @@ def main():
         appearance_prior_weight=args.appearance_prior_weight)
     competition_config.validate()
     args.positive_fusion = args.positive_fusion or ("consensus" if args.decision_policy == "factorized-v3" else "intersection")
+    args.temporal_evidence = args.temporal_evidence or ("available" if args.decision_policy == "factorized-v3" else "complete")
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
     if not 0 <= args.fixed_light_id < len(light_bank()) or not 0 < args.consensus_fraction <= 1:
         parser.error("Invalid fixed light ID or consensus fraction")
     config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain,
+        allow_partial_temporal=args.temporal_evidence == "available",
         require_temporal_contrast=args.trajectory_contrast == "on",
         require_independent_light=args.independent_light == "on",
         allow_static_existence=(args.existence_mode or ("static-dynamic" if args.decision_policy == "factorized-v3" else "motion")) == "static-dynamic",
@@ -181,6 +186,11 @@ def main():
                 raise ValueError("BEV-flow evidence changed")
             with np.load(evidence_path, allow_pickle=False) as archive:
                 bev_arrays = {key: archive[key].copy() for key in archive.files}
+            bev_arrays["temporal_exposure_valid_by_interval"] = np.broadcast_to(
+                np.array([bool(value["exposure"]["valid"]) for value in (first_metric, second_metric)])[:, None, None],
+                (2, *bev_arrays["receiver_valid"].shape)).copy()
+            bev_arrays.update(receiver_evidence(bev_arrays,
+                light_threshold=bev_protocol["config"]["light_threshold_L"]))
             if args.receiver_competition != "off" and bev_ref.get("receiver_explanation_protocol") != RECEIVER_PROTOCOL:
                 raise ValueError("Rebuild BEV analysis from cached pairs/flow/features for receiver competition")
             grid = BEVGrid(**bev_ref["grid"])
@@ -189,6 +199,10 @@ def main():
                 "onset": bev_arrays["shadow_boundary_onset"], "recovery": bev_arrays["shadow_boundary_recovery"],
                 "flow_supported": bev_arrays["shadow_flow_supported"],
                 "same_patch_cycle": bev_arrays["shadow_same_patch_cycle"]}
+            if config.allow_partial_temporal:
+                rank_maps["onset"] = bev_arrays["receiver_boundary_formation"] & rank_maps["dark"]
+                rank_maps["recovery"] = bev_arrays["receiver_boundary_recovery"] & rank_maps["dark"]
+                rank_maps["same_patch_cycle"] = rank_maps["onset"] & rank_maps["recovery"]
             if bev_ref.get("learned_bev_selection", {}).get("flow_gate") is False:
                 maps["flow_supported"] = maps["visible"].copy()
             rank_config = replace(config, minimum_area=max(1, int(np.ceil(args.minimum_bev_area_m2/grid.resolution**2))),
@@ -438,13 +452,15 @@ def main():
         "shadow_precision": None, "shadow_recall": None, "shadow_iou": None, "caster_accuracy": None,
         "training_readiness": "positive_only_requires_independent_negative_supervision_and_disjoint_dev",
         "static_dark_policy": "projection_supported_yes_else_ignore" if config.allow_static_existence else "retain_unknown_not_negative",
-        "receiver_competition": {"mode": args.receiver_competition, "config": asdict(competition_config),
+        "receiver_competition": {"mode": args.receiver_competition, "score_protocol": SCORE_PROTOCOL,
+            "config": asdict(competition_config),
             "winner_counts": {key: counts[f"explanation:{key}"] for key in
                               ("unknown", "physical_entity", "ground_material", "cast_shadow")},
             "negative_policy": "material/entity explanations do not automatically create NO labels"},
         "probability_calibrated": False}
     write_json(output/"summary.json", summary)
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
+        "receiver_score_protocol": SCORE_PROTOCOL,
         "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),

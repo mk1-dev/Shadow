@@ -55,6 +55,7 @@ def main():
             "mature_object_mode": "required",
             "consensus_fraction": 2/3, **config["variants"][name]}
         recipe.setdefault("receiver_competition", "off" if recipe["decision_policy"] == "strict-v2" else "on")
+        recipe.setdefault("temporal_evidence", "complete" if recipe["decision_policy"] == "strict-v2" else "available")
         root = output/name
         root.mkdir()
         write_json(root/"ablation_protocol.json", {"variant": name, "recipe": recipe, "seed": args.seed,
@@ -96,7 +97,8 @@ def main():
                     "--mature-object-mode", recipe["mature_object_mode"],
                     "--minimum-bev-cosine", recipe["minimum_bev_cosine"], "--seed", args.seed, *replacement)
             options = [value for key in ("decision_policy", "light_search", "fixed_light_id", "trajectory_contrast",
-                "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight")
+                "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight",
+                "temporal_evidence")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
             if "existence_mode" in recipe:
                 options += ["--existence-mode", recipe["existence_mode"]]

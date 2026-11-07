@@ -1,5 +1,10 @@
 # 2D Appearance versus 3D Entity Explanations
 
+Scoring has been updated after the HPC audit. See [transition evidence v2](shadow_transition_v2.md)
+for the active rules and fixed-population CPU replay. The original scoring
+description below documents the v1 motivation; persistent darkness alone is no
+longer material evidence in the executable v2 scorer.
+
 ## Active path
 
 The active path now requires decoded mature-model 3D predictions in addition to

@@ -10,7 +10,7 @@ import pytest
 from shadow_occ.annotation.physics_motion import project_world
 from shadow_occ.annotation.receiver_explanations import (
     CompetitionConfig, apply_competition, attach_appearance_prior, box_ray_evidence, explain_component,
-    receiver_evidence,
+    receiver_evidence, projection_transitions,
 )
 from tests.test_bev_flow import build, example
 
@@ -61,7 +61,67 @@ def test_oversized_projection_no_longer_wins_by_cover_alone():
     evidence = explain_component(mask, arrays, hypotheses, polygons, .5)
     assert evidence["baseline_scores"]["projection_coverage"] == 1
     assert evidence["best_projection"]["observed_lit_conflict"] > .5
-    assert not evidence["shadow_supported"] and evidence["winner"] == "ground_material"
+    assert not evidence["shadow_supported"] and evidence["winner"] == "unknown"
+    assert evidence["scores"]["ground_material"] == 0
+
+
+def test_persistent_darkness_without_discriminating_physics_is_unknown_not_material():
+    arrays, mask, _, _ = receiver_case()
+    evidence = explain_component(mask, arrays, [], {}, .5)
+    assert evidence["material_persistence"] == pytest.approx(1)
+    assert evidence["winner"] == "unknown" and not evidence["shadow_supported"]
+    assert evidence["scores"]["ground_material"] == 0
+
+
+def test_material_nonresponse_requires_observable_predicted_change():
+    arrays, mask, _, _ = receiver_case()
+    middle = mask.copy()
+    previous = np.roll(mask, -2, axis=1)
+    following = np.roll(mask, 2, axis=1)
+    section = np.s_[:, :]
+    missing = projection_transitions(mask, [previous, middle, following], arrays, section)
+    assert missing["expected_change_pixels"] == 0 and missing["nonresponse_fraction"] == 0
+    arrays["temporal_exposure_valid"][:] = True
+    observed = projection_transitions(mask, [previous, middle, following], arrays, section)
+    assert observed["expected_change_pixels"] > 0 and observed["nonresponse_fraction"] > 0
+    static = projection_transitions(mask, [middle]*3, arrays, section)
+    assert static["nonresponse_fraction"] == 0
+
+
+def test_signed_boundary_evidence_distinguishes_reversed_projection_motion():
+    arrays, mask, _, _ = receiver_case()
+    previous = np.roll(mask, -2, axis=1)
+    following = np.roll(mask, 2, axis=1)
+    arrays["temporal_exposure_valid"][:] = True
+    arrays["receiver_boundary_formation"] = mask & ~previous
+    arrays["receiver_boundary_recovery"] = mask & ~following
+    actual = projection_transitions(mask, [previous, mask, following], arrays, np.s_[:, :])
+    reversed_time = projection_transitions(mask, [following, mask, previous], arrays, np.s_[:, :])
+    assert actual["observed_transition_types"] == 2 and actual["boundary_fit"] == pytest.approx(1)
+    assert actual["boundary_fit"] > reversed_time["boundary_fit"]
+
+
+def test_continuous_motion_is_not_hidden_behind_complete_acceptance():
+    arrays, mask, hypotheses, polygons = receiver_case(dynamic=True)
+    arrays["receiver_boundary_recovery"][:] = False
+    previous = polygons["car", 0][0]-np.array([[[5, 0]]], np.int32)
+    middle = polygons["car", 0][1]
+    polygons["car", 0] = [previous, middle, middle]
+    hypotheses[0].update(motion_supported=True, shadow_passes=False, temporal_gain=.2)
+    evidence = explain_component(mask, arrays, hypotheses, polygons, .5)
+    assert evidence["trajectory_control_gain"] == pytest.approx(.2)
+    assert evidence["matched_transition_strength"] > 0
+    assert evidence["best_projection"]["transitions"]["observed_transition_types"] == 1
+
+
+def test_bad_exposure_in_one_interval_does_not_erase_the_other_interval():
+    arrays, mask, _, _ = receiver_case(dynamic=True)
+    arrays["temporal_exposure_valid"][:] = False
+    arrays["temporal_exposure_valid_by_interval"] = np.zeros((2, *mask.shape), bool)
+    arrays["temporal_exposure_valid_by_interval"][0] = True
+    result = receiver_evidence(arrays)
+    assert result["receiver_boundary_formation"][mask].all()
+    assert not result["receiver_boundary_recovery"].any()
 
 
 def test_shifted_controls_do_not_wrap_and_have_equal_light_search():

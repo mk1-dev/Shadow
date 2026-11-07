@@ -29,6 +29,7 @@ class LabelConfig:
     require_independent_light: bool = True
     light_ids: tuple[int, ...] | None = None
     allow_static_existence: bool = False
+    allow_partial_temporal: bool = False
 
     def validate(self):
         for name in ("minimum_change_fraction", "minimum_flow_fraction", "minimum_cover",
@@ -220,8 +221,12 @@ def trajectory_fit(footprints, mask, onset, recovery):
     cover = float(np.count_nonzero(mask & middle)/max(mask.sum(), 1))
     onset_fit = float(np.count_nonzero(onset & middle & ~previous)/max(onset.sum(), 1))
     recovery_fit = float(np.count_nonzero(recovery & middle & ~following)/max(recovery.sum(), 1))
+    observed = [value for event, value in ((onset, onset_fit), (recovery, recovery_fit)) if event.any()]
+    edge_fit = float(np.mean(observed)) if observed else 0.0
     return {"score": 0.4*cover+0.3*onset_fit+0.3*recovery_fit,
-            "cover": cover, "onset_fit": onset_fit, "recovery_fit": recovery_fit}
+            "cover": cover, "onset_fit": onset_fit, "recovery_fit": recovery_fit,
+            "observed_transition_types": len(observed), "available_edge_fit": edge_fit,
+            "available_score": 0.4*cover+0.6*edge_fit}
 
 
 def trajectory_contrast(footprints, mask, onset, recovery):
@@ -235,7 +240,10 @@ def trajectory_contrast(footprints, mask, onset, recovery):
     controls.append({"kind": "frozen_middle", "order": [1, 1, 1],
                      **trajectory_fit([footprints[1]]*3, mask, onset, recovery)})
     hardest = max(controls, key=lambda item: item["score"])
-    return {**real, "control": hardest, "temporal_gain": real["score"]-hardest["score"]}
+    available_control = max(controls, key=lambda item: item["available_score"])
+    return {**real, "control": hardest, "temporal_gain": real["score"]-hardest["score"],
+            "available_control": available_control,
+            "available_temporal_gain": real["available_score"]-available_control["available_score"]}
 
 
 def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, config, *, polygon_cache=None):
@@ -281,10 +289,18 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             except ValueError:
                 continue
             fit = trajectory_contrast(footprints, local_mask, onset, recovery)
+            fit["complete_score"], fit["complete_temporal_gain"] = fit["score"], fit["temporal_gain"]
+            if config.allow_partial_temporal:
+                fit["score"], fit["temporal_gain"] = fit["available_score"], fit["available_temporal_gain"]
+                fit["control"] = fit["available_control"]
             existence_score = fit["cover"] if config.allow_static_existence else fit["score"]
             shadow_fit_passes = fit["cover"] >= config.minimum_cover and existence_score >= config.minimum_score
-            shadow_passes = (moving and not report["temporal_reasons"] and fit["cover"] >= config.minimum_cover
-                and min(fit["onset_fit"], fit["recovery_fit"]) >= config.minimum_edge_fit
+            required_pixels = max(config.minimum_change_pixels, config.minimum_change_fraction*local_mask.sum())
+            observed_sides = [key for key in ("onset", "recovery") if report[key] >= required_pixels]
+            temporal_observed = bool(observed_sides) if config.allow_partial_temporal else not report["temporal_reasons"]
+            edge_fit = fit["available_edge_fit"] if config.allow_partial_temporal else min(fit["onset_fit"], fit["recovery_fit"])
+            shadow_passes = (moving and temporal_observed and fit["cover"] >= config.minimum_cover
+                and edge_fit >= config.minimum_edge_fit
                 and fit["score"] >= config.minimum_score
                 and (not config.require_temporal_contrast or fit["temporal_gain"] + 1e-12 >= config.minimum_temporal_gain))
             ranked.append({"instance_token": track["instance_token"], "light_id": light_id,
@@ -403,7 +419,7 @@ def factorized_shadow_decision(candidate, pool, directions, config, *, support_i
     strict = select_shadow_and_caster(candidate, pool, directions, config, support_index=support_index)
     association = strict["association"]
     owners = {item["instance_token"] for item in plausible}
-    if (len(owners) != 1 or association is None or association["instance_token"] not in owners
+    if (association is None or association["instance_token"] not in owners
             or existence_score(best)-existence_score(association) >= config.caster_margin):
         association = None
     association_reason = "unique_contrast_and_shared_light_support"
