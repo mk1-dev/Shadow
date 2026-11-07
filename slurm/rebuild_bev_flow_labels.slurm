@@ -1,9 +1,8 @@
 #!/bin/bash
 #SBATCH -J shadow_static_labels
-#SBATCH -p NV_RTX4090
+#SBATCH -p AMD
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:0
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --time=2-00:00:00
