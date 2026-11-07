@@ -1,7 +1,8 @@
 import numpy as np
 
 from shadow_occ.annotation.caster_window import (
-    caster_proposals, extend_pairs, extended_trajectory_fit, summarize_track_states,
+    caster_proposals, component_transition_diagnostics, extend_pairs, extended_trajectory_fit,
+    long_transition_evidence, summarize_track_states,
 )
 from shadow_occ.annotation.physics_labels import footprint_mask
 from tests.test_physics_shadow_labels import boxes, projection
@@ -79,4 +80,66 @@ def test_remote_observations_recover_events_missing_from_central_triplet():
     fit = extended_trajectory_fit(context, "car", 0, direction, [0, 0, 1, 0], projection(), mask)
     assert fit["frames"] == 5 and fit["observed_transition_types"] == 2
     assert fit["edge_fit"] == 1 and fit["temporal_gain"] > 0
+    assert all(item["reason"] == "matched" for item in fit["event_alignment"])
     assert extended_trajectory_fit(context, "missing_track", 0, direction, [0, 0, 1, 0], projection(), mask) is None
+
+
+def transition_case():
+    observations = np.full((5, 20, 20), 60., np.float32)
+    mask = np.zeros((20, 20), bool)
+    mask[8:12, 8:12] = True
+    observations[1:4, mask] = 30
+    visible = np.ones_like(observations, bool)
+    return observations, visible, np.ones((4, 20, 20), bool), mask
+
+
+def test_long_diagnostics_preserve_event_rule_and_separate_reference():
+    observations, visible, flow, mask = transition_case()
+    result = long_transition_evidence(observations, visible, flow, 2, mask)
+    for index, fit in enumerate(result["exposures"]):
+        expected = np.zeros_like(mask)
+        if index != 2 and fit["valid"]:
+            expected = visible[index] & visible[2]
+            for step in range(min(index, 2), max(index, 2)):
+                expected &= flow[step]
+            expected &= observations[2]-(fit["scale"]*observations[index]+fit["offset_L"]) <= -6
+        np.testing.assert_array_equal(result["onset"][index] | result["recovery"][index], expected)
+    assert result["frame_diagnostics"][2]["stage"] == "reference_frame"
+    assert result["frame_diagnostics"][2]["normalized_darkening_pixels"] is None
+    component = component_transition_diagnostics(result, mask)
+    assert component["event_pixels"] == mask.sum()
+    assert component["frames"][0]["onset_pixels"] == mask.sum()
+    assert component["frames"][4]["recovery_pixels"] == mask.sum()
+
+
+def test_diagnostics_distinguish_roi_exposure_failure_from_no_event():
+    observations, visible, flow, mask = transition_case()
+    result = long_transition_evidence(observations, visible, flow, 2, np.ones_like(mask))
+    frame = result["frame_diagnostics"][0]
+    assert frame["stage"] == "roi_excluded_background"
+    assert frame["raw_darkening_pixels"] == mask.sum()
+    assert frame["normalized_darkening_pixels"] is None and frame["event_pixels"] == 0
+    assert frame["exposure"]["reason"] == "insufficient_background"
+    assert not result["onset"].any() and not result["recovery"].any()
+
+
+def test_diagnostics_locate_flow_chain_support_loss():
+    observations, visible, flow, mask = transition_case()
+    flow[1] = False
+    result = long_transition_evidence(observations, visible, flow, 2, mask)
+    frame = result["frame_diagnostics"][0]
+    assert frame["stage"] == "flow_chain_removed_support"
+    assert frame["flow_chain"] == [{"pair_index": 0, "before_pixels": 400, "after_pixels": 400},
+                                    {"pair_index": 1, "before_pixels": 400, "after_pixels": 0}]
+
+
+def test_static_footprint_events_report_no_predicted_change():
+    points = np.stack([boxes()[1]]*5)
+    direction = np.array([1, 0, -1])/np.sqrt(2)
+    mask = footprint_mask(points[2, 1:], [0, 0, 1, 0], direction, projection(), (64, 96))
+    onset = np.zeros((5, *mask.shape), bool)
+    onset[0] = mask
+    context = {"frames": [{}]*5, "middle": 2, "tracks": {"car": points},
+        "polygon_cache": {}, "onset": onset, "recovery": np.zeros_like(onset)}
+    fit = extended_trajectory_fit(context, "car", 0, direction, [0, 0, 1, 0], projection(), mask)
+    assert fit["edge_fit"] == 0 and fit["event_alignment"][0]["reason"] == "no_predicted_change"

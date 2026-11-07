@@ -79,6 +79,51 @@ def rank_metrics(rows, reference, bootstrap=1000, seed=0):
             "positive_prevalence": float(labels.mean()), "scores": result}
 
 
+def projection_transition_diagnostics(hypotheses):
+    explanations = [item for parent in hypotheses for item in [parent, *parent.get("alternatives", [])]]
+    long_fits = [item["long_window"] for item in explanations if item.get("long_window") is not None]
+    alignment = [event for fit in long_fits for event in fit.get("event_alignment", [])]
+    return {"tested_hypotheses": len(explanations), "long_fits": len(long_fits),
+        "long_fits_with_events": sum(fit["observed_transition_types"] > 0 for fit in long_fits),
+        "long_fits_with_matches": sum(fit["edge_fit"] > 0 for fit in long_fits),
+        "maximum_edge_fit": max((fit["edge_fit"] for fit in long_fits), default=None),
+        "event_alignment_available": any("event_alignment" in fit for fit in long_fits),
+        "event_alignment_reasons": dict(Counter(event["reason"] for event in alignment)),
+        "scope": "all tested caster/light hypotheses, including those failing projection acceptance; not independent events"}
+
+
+def transition_stage_summary(rows, windows):
+    components = [row["transition_diagnostics"] for row in rows if row.get("transition_diagnostics") is not None]
+    long_components = [item["long_window"] for item in components if item.get("long_window") is not None]
+    # Window records are unique even when many components share the same exposure fit.
+    frames = [frame for window in windows for frame in window["frames"] if not frame["is_reference"]]
+    long_frames = [frame for item in long_components for frame in item["frames"] if not frame.get("is_reference", False)]
+    alignments = Counter()
+    for row in rows:
+        alignments.update(row["projection_transition_diagnostics"]["event_alignment_reasons"])
+    return {"windows_with_diagnostics": len(windows),
+        "windows_with_long_observations": sum(window["long_window_available"] for window in windows),
+        "nonreference_frame_comparisons": len(frames),
+        "frame_stage_counts": dict(Counter(frame["stage"] for frame in frames)),
+        "exposure_reason_counts": dict(Counter(frame["exposure"]["reason"] for frame in frames)),
+        "components_with_diagnostics": len(components), "components_with_long_observations": len(long_components),
+        "central_event_components": sum(item["central_onset_pixels"]+item["central_recovery_pixels"] > 0 for item in components),
+        "raw_long_darkening_components": sum(any(frame["raw_darkening_pixels"] > 0 for frame in item["frames"])
+                                              for item in long_components),
+        "normalized_long_darkening_components": sum(any((frame["normalized_darkening_pixels"] or 0) > 0
+                                                        for frame in item["frames"]) for item in long_components),
+        "observed_long_event_components": sum(item["event_pixels"] > 0 for item in long_components),
+        "component_frame_exposure_unavailable": sum(frame["normalized_darkening_pixels"] is None for frame in long_frames),
+        "any_hypothesis_long_match_components": sum(row["projection_transition_diagnostics"]["long_fits_with_matches"] > 0
+                                                     for row in rows),
+        "components_without_tested_hypotheses": sum(row["projection_transition_diagnostics"]["tested_hypotheses"] == 0
+                                                     for row in rows),
+        "components_with_alignment_diagnostics": sum(row["projection_transition_diagnostics"]["event_alignment_available"]
+                                                       for row in rows),
+        "hypothesis_event_alignment_reasons": dict(alignments),
+        "scope": "observations before best_projection selection; raw differences are uncorrected, not accepted events; missing diagnostics are not zero events"}
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--labels-root", required=True)
@@ -132,6 +177,8 @@ def main():
                "light_prior": {"confidence": item["light_prior"]["confidence"],
                    "model_source": item["light_prior"].get("model_source")} if item.get("light_prior") else None,
                "temporal_window": item.get("temporal_window"), "caster_proposals": item.get("caster_proposals"),
+               "transition_diagnostics": item.get("transition_diagnostics"),
+               "projection_transition_diagnostics": projection_transition_diagnostics(item.get("hypotheses", [])),
                "mature_image_motion": (item.get("bev_flow") or {}).get("mature_image_motion"),
                "projection_control_gain": evidence["projection_control_gain"],
                "trajectory_control_gain": evidence["trajectory_control_gain"],
@@ -180,6 +227,10 @@ def main():
             raise ValueError("Reference needs unique IDs and explicit YES/NO labels")
         reference_metrics = rank_metrics(rows, {row["id"]: row for row in references}, args.bootstrap, args.seed)
     write_rows(output/"components.jsonl", rows)
+    transition_path = root/"transition_diagnostics.jsonl"
+    transition_windows = read_rows(transition_path) if transition_path.exists() else []
+    transition_summary = transition_stage_summary(rows, transition_windows)
+    write_json(output/"transition_stages.json", transition_summary)
     if panels:
         per_row = 2
         panels += [np.zeros_like(panels[0]) for _ in range((-len(panels)) % per_row)]
@@ -201,6 +252,8 @@ def main():
     track_totals = {key: sum(int(value.get(key, 0)) for value in track_windows.values())
                     for key in ("seen", "complete", "partial", "inconsistent", "missing_samples")}
     write_json(output/"summary.json", {"components": len(rows), "winner_counts": dict(winners),
+        "transition_stages": transition_summary,
+        "transition_counter_scope": "observed_transition_components and long_event_components below are conditional on best_projection",
         "score_protocols": dict(Counter(row["score_protocol"] for row in rows)),
         "caster_proposals": caster_summary,
         "raw_event_components": sum(value.get("observed_transition_types", 0) > 0 for value in raw_events),
