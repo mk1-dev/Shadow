@@ -250,6 +250,31 @@ def script(name):
     return module
 
 
+def test_unprojectable_footprint_is_skipped_without_aborting_window(monkeypatch):
+    builder = script("build_physics_shadow_labels")
+    mask = np.ones((12, 16), bool)
+    track_map = {"good": {"points": np.zeros((3, 9, 3))}, "bad": {"points": np.zeros((3, 9, 3))}}
+    directions = np.array([[1, 0, -1], [0, 1, -1]], np.float64)
+
+    def footprint(corners, plane, direction, projection, shape):
+        if np.array_equal(direction, directions[1]):
+            raise ValueError("Shadow volume crosses camera near plane")
+        return mask.copy()
+
+    monkeypatch.setattr(builder, "footprint_mask", footprint)
+    explanations = [{"instance_token": "bad", "light_id": 1},
+                    {"instance_token": "good", "light_id": 0}]
+    positive, rejected = builder.projectable_shadow_support(mask, explanations, track_map,
+        [0, 0, 1, 0], directions, np.eye(3), "consensus", 2/3)
+    assert positive is not None and positive.all()
+    assert rejected == [{"instance_token": "bad", "light_id": 1,
+                         "reason": "Shadow volume crosses camera near plane"}]
+
+    positive, rejected = builder.projectable_shadow_support(mask, explanations[:1], track_map,
+        [0, 0, 1, 0], directions, np.eye(3), "consensus", 2/3)
+    assert positive is None and rejected[0]["instance_token"] == "bad"
+
+
 def test_audit_only_manifest_is_blocked_by_training_builder(tmp_path, monkeypatch):
     builder = script("build_shadow_annotation_dataset")
     manifest = tmp_path/"audit.jsonl"

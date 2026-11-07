@@ -17,9 +17,14 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFER
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
   python -m pytest -q tests/test_bev_flow.py tests/test_physics_shadow_labels.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py
 fi
+REUSE_ARGS=()
+if [[ "${SHADOW_REUSE_ANALYSIS:-0}" == 1 ]]; then
+  REUSE_ARGS+=(--reuse-analysis)
+fi
 python -u scripts/rebuild_bev_flow_labels.py \
   --source-root "${SHADOW_REBUILD_SOURCE:?Set the existing cached preparation root}" \
   --output-root "${SHADOW_ANNOTATION_ROOT:?Set a new output directory}" \
   --split-workers "${SHADOW_REBUILD_SPLIT_WORKERS:-2}" \
   --positive-fusion "${SHADOW_POSITIVE_FUSION:-consensus}" \
-  --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}"
+  --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}" \
+  "${REUSE_ARGS[@]}"

@@ -22,10 +22,12 @@ def main():
     parser.add_argument("--positive-fusion", choices=["best", "consensus", "intersection"], default="consensus")
     parser.add_argument("--negative-policy", choices=["endpoints", "endpoints+lit-receivers"], default="endpoints+lit-receivers")
     parser.add_argument("--split-workers", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--reuse-analysis", action="store_true",
+                        help="Reuse complete split analysis and retry only missing label stages")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
-    if source == output or output.exists() and any(output.iterdir()):
+    if source == output or output.exists() and any(output.iterdir()) and not args.reuse_analysis:
         raise FileExistsError("Use a new output root, distinct from the source cache")
     output.mkdir(parents=True, exist_ok=True)
     shared_protocol_path = source/"train/bev_flow/bev_flow_protocol.json"
@@ -75,44 +77,74 @@ def main():
 
     def rebuild_split(split):
         origin, destination = source/split, output/split
-        destination.mkdir()
+        destination.mkdir(exist_ok=args.reuse_analysis)
         # Shared read-only inputs keep the rebuilt root compatible with the ablation runner.
         for name in ("pairs", "flow", "mature_bev"):
             path = origin/name
             if not path.is_dir():
                 raise FileNotFoundError(path)
-            (destination/name).symlink_to(path, target_is_directory=True)
+            linked = destination/name
+            if not linked.exists():
+                linked.symlink_to(path, target_is_directory=True)
         provenance["splits"][split] = {
             "pair_manifest_sha256": digest(origin/"pairs/pairs.jsonl"),
             "motion_protocol_sha256": digest(origin/"flow/analysis_protocol.json")}
-        run("analyze_bev_flow_discrepancy.py", "--pairs", destination/"pairs/pairs.jsonl",
-            "--analysis-root", destination/"flow", "--feature-root", destination/"mature_bev",
-            "--minimum-bev-cosine", shared_protocol.get("minimum_bev_cosine", 0.3),
-            "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
-            "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
-            "--output-root", destination/"bev_flow", owner=split)
-        run("build_physics_shadow_labels.py", "--pairs", destination/"pairs/pairs.jsonl",
-            "--analysis-root", destination/"flow", "--bev-flow-root", destination/"bev_flow",
-            "--decision-policy", "factorized-v3", "--existence-mode", "static-dynamic",
-            "--positive-fusion", args.positive_fusion, "--export-weak-labels",
-            "--output-root", destination/"labels", owner=split)
-        run("build_bev_flow_annotation_manifest.py", "--pairs", destination/"pairs/pairs.jsonl",
-            "--labels-root", destination/"labels", "--negative-policy", args.negative_policy,
-            "--output-root", destination/"teacher", owner=split)
+        analysis = destination/"bev_flow"
+        if args.reuse_analysis:
+            for name in ("bev_flow_protocol.json", "windows.jsonl", "summary.json"):
+                if not (analysis/name).is_file():
+                    raise FileNotFoundError(analysis/name)
+            print(f"REUSING analysis split={split}", flush=True)
+        else:
+            run("analyze_bev_flow_discrepancy.py", "--pairs", destination/"pairs/pairs.jsonl",
+                "--analysis-root", destination/"flow", "--feature-root", destination/"mature_bev",
+                "--minimum-bev-cosine", shared_protocol.get("minimum_bev_cosine", 0.3),
+                "--extent-m", config["extent_m"], "--resolution-m", config["resolution_m"],
+                "--light-threshold", config["light_threshold_L"], "--omit-receiver-features",
+                "--output-root", analysis, owner=split)
+        labels = destination/"labels"
+        labels_complete = all((labels/name).is_file()
+            for name in ("canonical.jsonl", "label_protocol.json", "summary.json"))
+        if not labels_complete:
+            if args.reuse_analysis:
+                labels = destination/"labels_retry"
+                if labels.exists() and any(labels.iterdir()):
+                    raise FileExistsError(f"Retry output is not empty: {labels}")
+            run("build_physics_shadow_labels.py", "--pairs", destination/"pairs/pairs.jsonl",
+                "--analysis-root", destination/"flow", "--bev-flow-root", analysis,
+                "--decision-policy", "factorized-v3", "--existence-mode", "static-dynamic",
+                "--positive-fusion", args.positive_fusion, "--export-weak-labels",
+                "--output-root", labels, owner=split)
+        else:
+            print(f"REUSING labels split={split}", flush=True)
+        teacher = destination/"teacher"
+        teacher_complete = all((teacher/name).is_file() for name in ("canonical.jsonl", "protocol.json"))
+        if not teacher_complete:
+            if args.reuse_analysis:
+                teacher = destination/"teacher_retry"
+                if teacher.exists() and any(teacher.iterdir()):
+                    raise FileExistsError(f"Retry output is not empty: {teacher}")
+            run("build_bev_flow_annotation_manifest.py", "--pairs", destination/"pairs/pairs.jsonl",
+                "--labels-root", labels, "--negative-policy", args.negative_policy,
+                "--output-root", teacher, owner=split)
+        else:
+            print(f"REUSING teacher split={split}", flush=True)
+        return teacher/"canonical.jsonl"
     executor = ThreadPoolExecutor(max_workers=args.split_workers, thread_name_prefix="shadow-split")
     try:
         futures = {executor.submit(rebuild_split, split): split for split in ("train", "val")}
+        teachers = {}
         for future in as_completed(futures):
             split = futures[future]
-            future.result()
+            teachers[split] = future.result()
             print(f"COMPLETED split={split}", flush=True)
     except BaseException:
         terminate_active_processes()
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     executor.shutdown(wait=True)
-    run("build_shadow_annotation_dataset.py", "--manifest", output/"train/teacher/canonical.jsonl",
-        output/"val/teacher/canonical.jsonl", "--output-root", output/"data", "--seed", args.seed)
+    run("build_shadow_annotation_dataset.py", "--manifest", teachers["train"], teachers["val"],
+        "--output-root", output/"data", "--seed", args.seed)
     run("check_shadow_annotation_data.py", "--data-root", output/"data")
     run("build_joint_shadow_annotation_dataset.py", "--region-data-root", output/"data", "--output-root", output/"joint")
     run("check_joint_shadow_annotation_data.py", "--data-root", output/"joint", "--require-both-classes")

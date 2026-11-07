@@ -38,6 +38,24 @@ def visible_box(track, projection, shape):
     return np.r_[lower, upper].tolist()
 
 
+def projectable_shadow_support(mask, explanations, track_map, plane, directions, projection,
+                               policy, consensus_fraction):
+    """Fuse only explanations whose shadow volume projects into the camera."""
+    footprints, rejected = [], []
+    for explanation in explanations:
+        try:
+            footprint = footprint_mask(track_map[explanation["instance_token"]]["points"][1, 1:],
+                plane, directions[explanation["light_id"]], projection, mask.shape)
+        except ValueError as exc:
+            rejected.append({"instance_token": explanation["instance_token"],
+                             "light_id": explanation["light_id"], "reason": str(exc)})
+            continue
+        footprints.append(footprint)
+    if not footprints:
+        return None, rejected
+    return fuse_shadow_support(mask, footprints, policy, consensus_fraction), rejected
+
+
 def main():
     parser = argparse.ArgumentParser("Joint 3D/2D weak-label gate; audit-only unless explicitly enabled.")
     parser.add_argument("--pairs", required=True)
@@ -264,12 +282,18 @@ def main():
             track_map = {track["instance_token"]: track for track in tracks}
             projection = np.asarray(right["frames"][0]["projection_world_to_image"])
             explanations = ([selection] if args.positive_fusion == "best" else decision["plausible_hypotheses"])
-            footprints = (footprint_mask(track_map[explanation["instance_token"]]["points"][1, 1:],
-                left["plane_world"], directions[explanation["light_id"]], projection, mask.shape)
-                for explanation in explanations)
-            positive = fuse_shadow_support(mask, footprints, args.positive_fusion, args.consensus_fraction)
-            if positive.sum() < config.minimum_area:
-                selection, association, reason = None, None, "insufficient_supported_positive_area"
+            positive, rejected = projectable_shadow_support(mask, explanations, track_map,
+                left["plane_world"], directions, projection, args.positive_fusion, args.consensus_fraction)
+            counts.update(f"footprint_rejection:{item['reason']}" for item in rejected)
+            if positive is None:
+                reason = "no_projectable_positive_footprint"
+                positive = np.zeros_like(mask)
+            elif positive.sum() < config.minimum_area:
+                reason = "insufficient_supported_positive_area"
+            else:
+                reason = None
+            if reason is not None:
+                selection, association = None, None
                 decision = {**decision, "shadow_accepted": False, "selected": None,
                             "association": None, "reason": reason}
                 positive[:] = False
