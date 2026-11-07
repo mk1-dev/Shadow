@@ -19,6 +19,12 @@ PROJECT="$PWD"
 SOURCE="${SHADOW_REBUILD_SOURCE:?Set existing pairs/flow/feature preparation root}"
 OUTPUT="${SHADOW_MATURE_OBJECT_ROOT:?Set a new decoded-objects cache root}"
 for SPLIT in train val; do
+  [[ -f "$SOURCE/$SPLIT/pairs/pairs.jsonl" ]] || {
+    echo "Missing pair manifest: $SOURCE/$SPLIT/pairs/pairs.jsonl" >&2
+    exit 2
+  }
+done
+for SPLIT in train val; do
   if [[ "$SPLIT" == train ]]; then
     INFOS="${UNIAD_TRAIN_ANN_FILE:?Set train temporal infos}"
   else

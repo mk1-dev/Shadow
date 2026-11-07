@@ -90,7 +90,7 @@ in pyproject.toml); the Slurm job executes the new regression tests before proce
 cd /public/home/eng_zhihongli/project/Shadow_update
 export SHADOW_PROJECT_ROOT="$PWD"
 export SHADOW_CONDA_ENV=shadow_annotator
-export SHADOW_REBUILD_SOURCE="$PWD/outputs/shadow_bev_flow_static_v2_parallel2_20261107_101103"
+export SHADOW_REBUILD_SOURCE="$PWD/outputs/shadow_bev_flow_20261107_0715"
 export SHADOW_ANNOTATION_ROOT="$PWD/outputs/shadow_receiver_audit_$(date +%Y%m%d_%H%M%S)"
 export SHADOW_RECEIVER_COMPETITION=on
 export SHADOW_RECEIVER_AUDIT_ONLY=1
