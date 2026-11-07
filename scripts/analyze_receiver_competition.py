@@ -106,6 +106,12 @@ def main():
         decision = item["shadow_decision"]
         baseline = decision.get("baseline_projection_decision", decision)
         best = evidence.get("best_projection") or {}
+        selected_explanation = next((value for parent in item.get("hypotheses", [])
+            for value in [parent, *parent.get("alternatives", [])]
+            if best and value["instance_token"] == best["instance_token"]
+            and value["light_id"] == best["light_id"]), {})
+        selected_track_state = best.get("long_window_track_state", selected_explanation.get("long_window_track_state"))
+        selected_missing = best.get("long_window_missing_samples", selected_explanation.get("long_window_missing_samples"))
         row = {"id": item["id"], "scene_name": item["scene_name"], "camera": item["camera"],
                "window_id": (item.get("bev_flow") or {}).get("window_id"),
                "image": item["image"], "mask": item["mask"], "winner": evidence["winner"],
@@ -121,8 +127,8 @@ def main():
                "best_projection_transitions": best.get("transitions"),
                "best_projection_instance_token": best.get("instance_token"),
                "best_projection_light_id": best.get("light_id"),
-               "long_window_track_state": best.get("long_window_track_state"),
-               "long_window_missing_samples": best.get("long_window_missing_samples"),
+               "long_window_track_state": selected_track_state,
+               "long_window_missing_samples": selected_missing,
                "light_prior": {"confidence": item["light_prior"]["confidence"],
                    "model_source": item["light_prior"].get("model_source")} if item.get("light_prior") else None,
                "temporal_window": item.get("temporal_window"), "caster_proposals": item.get("caster_proposals"),

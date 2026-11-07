@@ -323,6 +323,9 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
                            +item.get("light_prior_bonus", 0))
         evaluations.append({"instance_token": key[0], "light_id": key[1],
                             "projection_fit_passes": bool(item.get("shadow_fit_passes")),
+                            "long_window_track_state": item.get("long_window_track_state"),
+                            "long_window_missing_samples": item.get("long_window_missing_samples"),
+                            "long_window_observed_samples": item.get("long_window_observed_samples"),
                             "transitions": transitions, "selection_score": float(selection_score),
                             "light_prior_bonus": item.get("light_prior_bonus", 0),
                             "control_comparison_score": values["score"]+item.get("light_prior_bonus", 0), **values})

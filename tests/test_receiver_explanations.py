@@ -114,6 +114,15 @@ def test_continuous_motion_is_not_hidden_behind_complete_acceptance():
     assert evidence["best_projection"]["transitions"]["observed_transition_types"] == 1
 
 
+def test_best_projection_preserves_long_window_track_state():
+    arrays, mask, hypotheses, polygons = receiver_case()
+    hypotheses[0].update(long_window_track_state="complete", long_window_missing_samples=0,
+                         long_window_observed_samples=5)
+    evidence = explain_component(mask, arrays, hypotheses, polygons, .5)
+    assert evidence["best_projection"]["long_window_track_state"] == "complete"
+    assert evidence["best_projection"]["long_window_missing_samples"] == 0
+
+
 def test_bad_exposure_in_one_interval_does_not_erase_the_other_interval():
     arrays, mask, _, _ = receiver_case(dynamic=True)
     arrays["temporal_exposure_valid"][:] = False
