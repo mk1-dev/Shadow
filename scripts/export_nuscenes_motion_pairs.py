@@ -306,6 +306,7 @@ def main():
                                             **{key: value.tolist() if value.dtype == bool else finite_list(value) for key, value in motion.items()}})
                         homography = ground_homography(frames[0]["projection_world_to_image"], frames[1]["projection_world_to_image"], basis_world)
                         row = {"id": pair_id, "scene_name": previous.scene_name, "camera": name,
+                               "location": adapter.nusc.get("log", adapter.nusc.get("scene", previous.scene_token)["log_token"])["location"],
                                "official_split": args.split, "split": group_split(previous.scene_name, args.split, 0.1, args.seed),
                                "sample_token": previous.token, "next_sample_token": following.token,
                                "dt_seconds": seconds, "frames": frames, "objects": motions,

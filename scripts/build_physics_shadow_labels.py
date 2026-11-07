@@ -23,6 +23,8 @@ from shadow_occ.annotation.physics_labels import (
     select_shadow_and_caster, factorized_shadow_decision, window_tracks, fuse_shadow_support,
 )
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
+from shadow_occ.annotation.illumination import PROTOCOL as LIGHT_PROTOCOL, validate_prior
+from shadow_occ.annotation.caster_window import caster_proposals, extend_pairs, long_observations
 from shadow_occ.annotation.receiver_explanations import (
     PROTOCOL as RECEIVER_PROTOCOL, SCORE_PROTOCOL, CompetitionConfig, apply_competition, explain_component,
     receiver_evidence,
@@ -91,6 +93,11 @@ def main():
     parser.add_argument("--appearance-prior-weight", type=float, default=0.2)
     parser.add_argument("--temporal-evidence", choices=["available", "complete"],
                         help="Use observed signed boundary events; default available for factorized-v3, complete for strict-v2")
+    parser.add_argument("--light-prior-manifest", help="Frozen learned or astronomical per-window light distributions")
+    parser.add_argument("--light-prior-weight", type=float, default=.15)
+    parser.add_argument("--candidate-source", choices=["photometric", "caster"],
+                        help="Default caster for factorized BEV labels; GT projection expands search, never creates positive pixels")
+    parser.add_argument("--temporal-radius", type=int, default=3, help="1=3 frames, 2=5, 3=7, 4=9 when consecutive cached pairs exist")
     args = parser.parse_args()
     args.receiver_competition = args.receiver_competition or (
         "on" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "off")
@@ -103,12 +110,16 @@ def main():
     competition_config.validate()
     args.positive_fusion = args.positive_fusion or ("consensus" if args.decision_policy == "factorized-v3" else "intersection")
     args.temporal_evidence = args.temporal_evidence or ("available" if args.decision_policy == "factorized-v3" else "complete")
+    args.candidate_source = args.candidate_source or ("caster" if args.bev_flow_root and args.decision_policy == "factorized-v3" else "photometric")
+    if not 1 <= args.temporal_radius <= 4:
+        parser.error("Temporal radius must be between 1 and 4")
     if args.max_components_per_window < 1 or args.review_limit < 0:
         raise ValueError("Invalid processing limits")
     if not 0 <= args.fixed_light_id < len(light_bank()) or not 0 < args.consensus_fraction <= 1:
         parser.error("Invalid fixed light ID or consensus fraction")
     config = LabelConfig(minimum_area=args.minimum_area, minimum_temporal_gain=args.minimum_temporal_gain,
         allow_partial_temporal=args.temporal_evidence == "available",
+        light_prior_weight=args.light_prior_weight,
         require_temporal_contrast=args.trajectory_contrast == "on",
         require_independent_light=args.independent_light == "on",
         allow_static_existence=(args.existence_mode or ("static-dynamic" if args.decision_policy == "factorized-v3" else "motion")) == "static-dynamic",
@@ -122,6 +133,10 @@ def main():
     base = Path(args.pairs).resolve().parent
     analysis = Path(args.analysis_root).resolve()
     pairs, stats, protocol_path = load_motion_analysis(args.pairs, analysis)
+    light_rows = read_rows(args.light_prior_manifest) if args.light_prior_manifest else []
+    light_priors = {row["window_id"]: row for row in light_rows}
+    if len(light_priors) != len(light_rows):
+        raise ValueError("Duplicate light-prior windows")
     bev_windows = {}
     if args.bev_flow_root:
         bev_root = Path(args.bev_flow_root).resolve()
@@ -136,12 +151,13 @@ def main():
             raise ValueError("BEV windows must be nonempty and unique")
         if not np.isfinite(args.minimum_bev_area_m2) or args.minimum_bev_area_m2 <= 0:
             raise ValueError("BEV component area must be positive square metres")
-    successor = {}
+    successor, predecessor = {}, {}
     for pair in pairs:
         key = (pair["scene_name"], pair["official_split"], pair["camera"], pair["sample_token"])
         if key in successor:
             raise ValueError("Duplicate camera/sample pair")
         successor[key] = pair
+        predecessor[(*key[:3], pair["next_sample_token"])] = pair
     counts, candidates, audit = Counter(), [], []
     directions = light_bank()
     checked = set()
@@ -178,6 +194,15 @@ def main():
         basis = np.asarray(left["plane_basis_world"])
         plane = np.asarray(left["plane_world"])
         rank_maps, rank_projection, rank_config = maps, projection, config
+        window_id = hashlib.sha256(f"{left['id']}:{right['id']}".encode()).hexdigest()[:24]
+        light_prior = light_priors.get(window_id)
+        if light_prior is not None:
+            validate_prior(light_prior, directions)
+            if (light_prior["protocol"] != LIGHT_PROTOCOL or light_prior["scene_name"] != left["scene_name"]
+                    or light_prior["sample_tokens"] != [left["sample_token"], right["sample_token"], right["next_sample_token"]]
+                    or not np.allclose(light_prior["directions_world"], directions)):
+                raise ValueError("Light prior does not match the window/direction bank")
+            counts["windows_with_light_prior"] += 1
         bev_ref, bev_arrays, grid = None, None, None
         if args.bev_flow_root:
             bev_ref = bev_windows[left["id"], right["id"]]
@@ -207,6 +232,20 @@ def main():
                 maps["flow_supported"] = maps["visible"].copy()
             rank_config = replace(config, minimum_area=max(1, int(np.ceil(args.minimum_bev_area_m2/grid.resolution**2))),
                                   minimum_change_pixels=1)
+        polygon_cache, extended_context, expanded = {}, None, None
+        if grid is not None:
+            roi, expanded = caster_proposals(bev_arrays, tracks, directions, plane, rank_projection,
+                polygon_cache, light_prior, expand=args.candidate_source == "caster")
+            rank_maps["dark"] = bev_arrays["shadow_candidate"]
+            if config.allow_partial_temporal:
+                rank_maps["onset"] = bev_arrays["receiver_boundary_formation"] & rank_maps["dark"]
+                rank_maps["recovery"] = bev_arrays["receiver_boundary_recovery"] & rank_maps["dark"]
+                rank_maps["same_patch_cycle"] = rank_maps["onset"] & rank_maps["recovery"]
+            counts["caster_added_observed_pixels"] += expanded["added_observed_pixels"]
+            chain = extend_pairs(left, right, successor, predecessor, args.temporal_radius)
+            if len(chain) > 2:
+                extended_context = long_observations(chain, frame["sample_data_token"], bev_arrays, roi, base, stats, analysis)
+            counts[f"temporal_frames:{len(chain)+1}"] += 1
         # Never bridge gaps across unsupported receivers by dilation or closing.
         number, labels, areas, _ = cv2.connectedComponentsWithStats(rank_maps["dark"].astype(np.uint8), connectivity=8)
         components = [index for index in range(1, number) if areas[index, cv2.CC_STAT_AREA] >= rank_config.minimum_area]
@@ -237,11 +276,11 @@ def main():
             checked_write_image(path, aligned)
             context["views"].append({"slot": slot, "image": str(path), "sha256": digest(path),
                                      "timestamp": adjacent["camera_timestamp"]})
-        polygon_cache = {}
         for component in components:
             rank_mask = labels == component
             hypotheses, report = rank_hypotheses(rank_mask, rank_maps, tracks, plane, basis, rank_projection,
-                                                  directions, rank_config, polygon_cache=polygon_cache)
+                                                  directions, rank_config, polygon_cache=polygon_cache, light_prior=light_prior,
+                                                  temporal_context=extended_context)
             competition = None
             if args.receiver_competition != "off":
                 competition = explain_component(rank_mask, bev_arrays, hypotheses, polygon_cache,
@@ -296,6 +335,15 @@ def main():
                 "ground_support": str(resolve_path(frame["ground_support"], base)),
                 "timestamp": frame["camera_timestamp"], "mask": str(path), "mask_sha256": digest(path),
                 "ground_points": str(ground_path), "hypotheses": hypotheses,
+                "light_prior": light_prior,
+                "caster_proposals": expanded,
+                "association_frame_tokens": [value["sample_data_token"] for value in extended_context["frames"]] if extended_context else [],
+                "association_sample_tokens": extended_context["sample_tokens"] if extended_context else [],
+                "temporal_window": {"frames": len(extended_context["frames"]) if extended_context else 3,
+                    "timestamps": extended_context["timestamps"] if extended_context else [value["camera_timestamp"] for value in
+                        (left["frames"][0], frame, right["frames"][1])],
+                    "exposures": extended_context["exposures"] if extended_context else None,
+                    "tracks_with_complete_states": len(extended_context["tracks"]) if extended_context else len(tracks)},
                 "evidence": report, "casters": caster_metadata, "physics_context": context,
                 "bev_flow": bev_component, "receiver_competition": competition})
             counts.update(f"evidence_reason:{reason}" for reason in report["reasons"])
@@ -461,6 +509,7 @@ def main():
     write_json(output/"summary.json", summary)
     write_json(output/"label_protocol.json", {**vars(args), "config": asdict(config),
         "receiver_score_protocol": SCORE_PROTOCOL,
+        "light_prior_sha256": digest(args.light_prior_manifest) if args.light_prior_manifest else None,
         "receiver_explanation_code_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_explanations.py"),
         "pair_manifest_sha256": digest(args.pairs), "analysis_protocol_sha256": digest(protocol_path),
         "pair_metrics_sha256": digest(analysis/"pair_metrics.jsonl"), "light_directions_world": directions.tolist(),

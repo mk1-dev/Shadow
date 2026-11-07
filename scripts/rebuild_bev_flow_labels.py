@@ -36,6 +36,10 @@ def main():
     parser.add_argument("--shadow-baseline-manifest")
     parser.add_argument("--mature-object-root", help="Parent containing train/ and val/ decoded prediction caches")
     parser.add_argument("--mature-object-mode", choices=["required", "off"], default="required")
+    parser.add_argument("--light-prior-manifest")
+    parser.add_argument("--light-prior-weight", type=float, default=.15)
+    parser.add_argument("--candidate-source", choices=["photometric", "caster"], default="caster")
+    parser.add_argument("--temporal-radius", type=int, choices=(1, 2, 3, 4), default=3)
     args = parser.parse_args()
     if args.reuse_analysis and args.reuse_source_analysis:
         parser.error("Choose retrying this output or reusing source windows, not both")
@@ -49,6 +53,7 @@ def main():
     shared_protocol = json.loads(shared_protocol_path.read_text(encoding="utf-8"))
     args.shadow_baseline_manifest = args.shadow_baseline_manifest or shared_protocol.get("shadow_baseline_manifest")
     baseline_args = ["--shadow-baseline-manifest", args.shadow_baseline_manifest] if args.shadow_baseline_manifest else []
+    light_args = ["--light-prior-manifest", args.light_prior_manifest] if args.light_prior_manifest else []
     config = shared_protocol["config"]
     provenance = {"shared_source_bev_protocol": {
         "path": str(shared_protocol_path), "sha256": digest(shared_protocol_path)}, "splits": {}}
@@ -157,12 +162,21 @@ def main():
                 "--minimum-projection-gain", args.minimum_projection_gain,
                 "--minimum-explanation-margin", args.minimum_explanation_margin,
                 "--appearance-prior-weight", args.appearance_prior_weight,
-                "--output-root", labels, owner=split)
+                "--light-prior-weight", args.light_prior_weight,
+                "--candidate-source", args.candidate_source, "--temporal-radius", args.temporal_radius,
+                "--output-root", labels, *light_args, owner=split)
         else:
             print(f"REUSING labels split={split}", flush=True)
         label_protocol = json.loads((labels/"label_protocol.json").read_text(encoding="utf-8"))
         if label_protocol.get("receiver_competition", "off") != args.receiver_competition:
             raise ValueError("Cached label competition mode differs; choose a new output root")
+        if args.reuse_analysis:
+            for key in ("candidate_source", "temporal_radius", "light_prior_weight"):
+                if label_protocol.get(key) != getattr(args, key):
+                    raise ValueError(f"Cached label setting differs: {key}; use a new output root")
+            expected_light = digest(args.light_prior_manifest) if args.light_prior_manifest else None
+            if label_protocol.get("light_prior_sha256") != expected_light:
+                raise ValueError("Cached labels use another light prior; use a new output root")
         for key in ("control_shift_m", "minimum_projection_gain", "minimum_explanation_margin", "appearance_prior_weight"):
             if args.receiver_competition != "off" and label_protocol.get(key) != getattr(args, key):
                 raise ValueError(f"Cached label setting differs: {key}; choose a new output root")

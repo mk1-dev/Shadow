@@ -22,8 +22,12 @@ ANNOTATION_ENV="${SHADOW_CONDA_ENV:-shadow_annotator}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
 read -r -a CAMERAS <<< "${SHADOW_CAMERAS:-CAM_FRONT CAM_FRONT_LEFT CAM_FRONT_RIGHT}"
 BASELINE_ARGS=()
+LIGHT_ARGS=()
 if [[ -n "${SHADOW_BASELINE_MANIFEST:-}" ]]; then
   BASELINE_ARGS+=(--shadow-baseline-manifest "$SHADOW_BASELINE_MANIFEST")
+fi
+if [[ -n "${SHADOW_LIGHT_PRIOR_MANIFEST:-}" ]]; then
+  LIGHT_ARGS+=(--light-prior-manifest "$SHADOW_LIGHT_PRIOR_MANIFEST")
 fi
 
 conda activate "$ANNOTATION_ENV"
@@ -77,16 +81,24 @@ for SPLIT in train val; do
     --minimum-projection-gain "${SHADOW_MIN_PROJECTION_GAIN:-0.05}" \
     --minimum-explanation-margin "${SHADOW_MIN_EXPLANATION_MARGIN:-0.05}" \
     --appearance-prior-weight "${SHADOW_APPEARANCE_PRIOR_WEIGHT:-0.2}" \
-    --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels"
+    --candidate-source "${SHADOW_CANDIDATE_SOURCE:-caster}" --temporal-radius "${SHADOW_TEMPORAL_RADIUS:-3}" \
+    --export-weak-labels --output-root "$ROOT_OUT/$SPLIT/labels" "${LIGHT_ARGS[@]}"
   if [[ "${SHADOW_RECEIVER_COMPETITION:-on}" != off ]]; then
     python -u scripts/analyze_receiver_competition.py \
       --labels-root "$ROOT_OUT/$SPLIT/labels" --output-root "$ROOT_OUT/$SPLIT/competition"
   fi
   echo "[4/5] Export observed shadows and lit endpoints for $SPLIT"
-  python -u scripts/build_bev_flow_annotation_manifest.py \
-    --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --labels-root "$ROOT_OUT/$SPLIT/labels" \
-    --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}" --output-root "$ROOT_OUT/$SPLIT/teacher"
+  if [[ "${SHADOW_LIGHT_BOOTSTRAP_ONLY:-0}" != 1 ]]; then
+    python -u scripts/build_bev_flow_annotation_manifest.py \
+      --pairs "$ROOT_OUT/$SPLIT/pairs/pairs.jsonl" --labels-root "$ROOT_OUT/$SPLIT/labels" \
+      --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}" --output-root "$ROOT_OUT/$SPLIT/teacher"
+  fi
 done
+
+if [[ "${SHADOW_LIGHT_BOOTSTRAP_ONLY:-0}" == 1 ]]; then
+  echo "Light bootstrap caches ready; no segmentation/VLM teacher or training was started."
+  exit 0
+fi
 
 echo "[5/5] Build shared segmentation and unified VLM datasets"
 python -u scripts/build_shadow_annotation_dataset.py \

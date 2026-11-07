@@ -86,6 +86,8 @@ export SHADOW_REUSE_ANALYSIS=0
 export SHADOW_MATURE_OBJECT_MODE=required
 export SHADOW_RECEIVER_COMPETITION=on
 export SHADOW_RECEIVER_AUDIT_ONLY=1
+export SHADOW_CANDIDATE_SOURCE=photometric
+export SHADOW_TEMPORAL_RADIUS=1
 mkdir -p logs
 sbatch slurm/rebuild_bev_flow_labels.slurm
 ```
@@ -112,8 +114,9 @@ Per-component `best_projection_transitions` includes observed/expected pixel
 counts, match fractions and nonresponse. `without_mature_3d` and
 `complete_temporal` are separate ablation arms in `configs/bev_flow_ablations.json`.
 
-This replay does not expand the source's mostly static candidate pool. Longer
-track-centered windows or new candidates require separate preparation and
-evaluation; they are not silently introduced into this fixed-population test.
+With the explicit photometric/three-frame settings above, this replay does not
+expand the source candidate pool. The newer [geo-temporal light workflow](geo_temporal_light.md)
+adds explicit caster-driven candidate expansion and longer observations; evaluate
+those as separate arms, not as an identical-population comparison.
 No improved precision or training readiness is claimed before HPC results.
 Local execution of model/tests was not performed for this update.

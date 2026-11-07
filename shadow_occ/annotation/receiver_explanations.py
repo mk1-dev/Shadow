@@ -313,32 +313,40 @@ def explain_component(mask, arrays, hypotheses, polygons, resolution, config=Non
         polygon = polygons[key][1]-np.array([[[x0, y0]]], np.int32)
         values = projection_score(local_mask, footprint, local_domain, local_dark, local_lit)
         transitions = projection_transitions(local_mask, footprints, arrays, section)
+        extended = item.get("long_window") or {}
+        transitions["long_window"] = extended
         time_gain = float(item.get("temporal_gain", 0)) if item.get("motion_supported") else 0.0
-        matched_motion = transitions["boundary_fit"]*float(np.clip(
+        matched_motion = max(transitions["boundary_fit"], extended.get("edge_fit", 0))*float(np.clip(
             time_gain/SCORE_CONTRACT["projection_gain_scale"], 0, 1))
         selection_score = (SCORE_CONTRACT["shadow"]["projection_strength"]*values["score"]
-                           +SCORE_CONTRACT["shadow"]["boundary_transition"]*matched_motion)
+                           +SCORE_CONTRACT["shadow"]["boundary_transition"]*matched_motion
+                           +item.get("light_prior_bonus", 0))
         evaluations.append({"instance_token": key[0], "light_id": key[1],
                             "projection_fit_passes": bool(item.get("shadow_fit_passes")),
-                            "transitions": transitions, "selection_score": float(selection_score), **values})
+                            "transitions": transitions, "selection_score": float(selection_score),
+                            "light_prior_bonus": item.get("light_prior_bonus", 0),
+                            "control_comparison_score": values["score"]+item.get("light_prior_bonus", 0), **values})
         for dx, dy in offsets:
             control = np.zeros(local_mask.shape, np.uint8)
             cv2.fillConvexPoly(control, polygon+np.array([[[dx, dy]]], np.int32), 1)
+            values = projection_score(local_mask, control > 0, local_domain, local_dark, local_lit)
             controls.append({"instance_token": key[0], "light_id": key[1], "offset_cells": [dx, dy],
-                             **projection_score(local_mask, control > 0, local_domain, local_dark, local_lit)})
+                "control_comparison_score": values["score"]+item.get("light_prior_bonus", 0), **values})
     fits = [value for value in evaluations if value["projection_fit_passes"]]
     best = max(fits, key=lambda value: value["selection_score"]) if fits else None
     # Each displacement arm searches every real track/light; compare its best to the real best.
-    best_control = max(controls, key=lambda value: value["score"]) if controls else None
-    gain = best["score"]-best_control["score"] if best is not None and best_control is not None else 0.0
+    best_control = max(controls, key=lambda value: value["control_comparison_score"]) if controls else None
+    gain = best["control_comparison_score"]-best_control["control_comparison_score"] if best is not None and best_control is not None else 0.0
     motion_gain = max((float(value.get("temporal_gain", 0)) for value in explanations
                        if best and value["instance_token"] == best["instance_token"]
                        and value["light_id"] == best["light_id"] and value.get("motion_supported")), default=0.0)
     projection_strength = (best["score"]*float(np.clip(
         max(gain, motion_gain)/SCORE_CONTRACT["projection_gain_scale"], 0, 1))) if best else 0.0
     events = arrays["receiver_boundary_formation"] | arrays["receiver_boundary_recovery"]
-    transition = float(np.clip((events & mask).sum()/area/SCORE_CONTRACT["transition_fraction_scale"], 0, 1))
-    transition *= (best["transitions"]["boundary_fit"]*float(np.clip(
+    extended = (best["transitions"].get("long_window") or {}) if best else {}
+    observed_fraction = max((events & mask).sum()/area, extended.get("transition_fraction", 0))
+    transition = float(np.clip(observed_fraction/SCORE_CONTRACT["transition_fraction_scale"], 0, 1))
+    transition *= (max(best["transitions"]["boundary_fit"], extended.get("edge_fit", 0))*float(np.clip(
         motion_gain/SCORE_CONTRACT["projection_gain_scale"], 0, 1))) if best else 0.0
     persistence_values = arrays["receiver_material_persistence"][mask & ground]
     persistence_values = persistence_values[np.isfinite(persistence_values)]

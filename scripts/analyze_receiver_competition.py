@@ -113,6 +113,9 @@ def main():
                "matched_transition_strength": evidence.get("matched_transition_strength", 0),
                "material_nonresponse_fraction": evidence.get("material_nonresponse_fraction", 0),
                "best_projection_transitions": (evidence.get("best_projection") or {}).get("transitions"),
+               "light_prior": {"confidence": item["light_prior"]["confidence"],
+                   "model_source": item["light_prior"].get("model_source")} if item.get("light_prior") else None,
+               "temporal_window": item.get("temporal_window"), "caster_proposals": item.get("caster_proposals"),
                "mature_image_motion": (item.get("bev_flow") or {}).get("mature_image_motion"),
                "projection_control_gain": evidence["projection_control_gain"],
                "trajectory_control_gain": evidence["trajectory_control_gain"],
@@ -170,6 +173,12 @@ def main():
         "observed_transition_components": sum((row["best_projection_transitions"] or {}).get(
             "observed_transition_types", 0) > 0 for row in rows),
         "material_nonresponse_components": sum(row["material_nonresponse_fraction"] > 0 for row in rows),
+        "light_prior_components": sum(row["light_prior"] is not None for row in rows),
+        "long_event_components": sum(((row["best_projection_transitions"] or {}).get("long_window") or {}).get(
+            "observed_transition_types", 0) > 0 for row in rows),
+        "long_matched_components": sum(((row["best_projection_transitions"] or {}).get("long_window") or {}).get(
+            "edge_fit", 0) > 0 for row in rows),
+        "temporal_frame_counts": dict(Counter((row["temporal_window"] or {}).get("frames", 3) for row in rows)),
         "mature_3d_counterfactual": {
             "available": sum(row["without_mature_3d"] is not None for row in rows),
             "without_mature_supported": sum(bool((row["without_mature_3d"] or {}).get("shadow_supported")) for row in rows),

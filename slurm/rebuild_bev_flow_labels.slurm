@@ -15,7 +15,7 @@ conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
 if [[ "${SHADOW_RUN_TESTS:-1}" == 1 ]]; then
-  python -m pytest -q tests/test_bev_flow.py tests/test_physics_shadow_labels.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py tests/test_mature_objects.py tests/test_rebuild_shadow_analysis.py
+  python -m pytest -q tests/test_bev_flow.py tests/test_physics_shadow_labels.py tests/test_bev_teacher.py tests/test_static_shadow_teacher.py tests/test_receiver_explanations.py tests/test_mature_objects.py tests/test_rebuild_shadow_analysis.py tests/test_light_direction.py tests/test_caster_window.py
 fi
 REUSE_ARGS=()
 if [[ "${SHADOW_REUSE_ANALYSIS:-0}" == 1 ]]; then
@@ -33,6 +33,9 @@ fi
 if [[ -n "${SHADOW_MATURE_OBJECT_ROOT:-}" ]]; then
   REUSE_ARGS+=(--mature-object-root "$SHADOW_MATURE_OBJECT_ROOT")
 fi
+if [[ -n "${SHADOW_LIGHT_PRIOR_MANIFEST:-}" ]]; then
+  REUSE_ARGS+=(--light-prior-manifest "$SHADOW_LIGHT_PRIOR_MANIFEST")
+fi
 python -u scripts/rebuild_bev_flow_labels.py \
   --source-root "${SHADOW_REBUILD_SOURCE:?Set the existing cached preparation root}" \
   --output-root "${SHADOW_ANNOTATION_ROOT:?Set a new output directory}" \
@@ -45,4 +48,6 @@ python -u scripts/rebuild_bev_flow_labels.py \
   --minimum-explanation-margin "${SHADOW_MIN_EXPLANATION_MARGIN:-0.05}" \
   --appearance-prior-weight "${SHADOW_APPEARANCE_PRIOR_WEIGHT:-0.2}" \
   --mature-object-mode "${SHADOW_MATURE_OBJECT_MODE:-required}" \
+  --candidate-source "${SHADOW_CANDIDATE_SOURCE:-caster}" \
+  --temporal-radius "${SHADOW_TEMPORAL_RADIUS:-3}" \
   "${REUSE_ARGS[@]}"

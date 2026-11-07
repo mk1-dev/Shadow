@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 
 from shadow_occ.annotation.physics_motion import ground_homography, project_world
+from shadow_occ.annotation.illumination import light_prior_bonus
+from shadow_occ.annotation.caster_window import extended_trajectory_fit
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class LabelConfig:
     light_ids: tuple[int, ...] | None = None
     allow_static_existence: bool = False
     allow_partial_temporal: bool = False
+    light_prior_weight: float = 0.15
 
     def validate(self):
         for name in ("minimum_change_fraction", "minimum_flow_fraction", "minimum_cover",
@@ -38,6 +41,8 @@ class LabelConfig:
                 raise ValueError(f"Invalid fraction: {name}")
         if not np.isfinite(self.minimum_temporal_gain) or not 0 <= self.minimum_temporal_gain <= 1:
             raise ValueError("Invalid temporal contrast margin")
+        if not np.isfinite(self.light_prior_weight) or not 0 <= self.light_prior_weight <= 1:
+            raise ValueError("Invalid light prior weight")
         if (self.minimum_area < 1 or self.minimum_change_pixels < 1 or self.minimum_other_tracks < 2
                 or not np.isfinite([self.minimum_motion_m, self.maximum_caster_distance_m,
                                    self.light_tolerance_degrees]).all()
@@ -246,7 +251,8 @@ def trajectory_contrast(footprints, mask, onset, recovery):
             "available_temporal_gain": real["available_score"]-available_control["available_score"]}
 
 
-def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, config, *, polygon_cache=None):
+def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, config, *,
+                    polygon_cache=None, light_prior=None, temporal_context=None):
     """Score the SAME light at all three GT states; never equate flow and box velocity."""
     report = candidate_evidence(mask, maps, config)
     if report["reasons"]:
@@ -280,7 +286,8 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
             try:
                 key = (track["instance_token"], light_id)
                 if key not in cache:
-                    cache[key] = [footprint_polygon(p[1:], plane, direction, projection) for p in points]
+                    rays = np.asarray(light_prior["directions_by_frame_world"])[:, light_id] if light_prior else [direction]*3
+                    cache[key] = [footprint_polygon(p[1:], plane, ray, projection) for p, ray in zip(points, rays)]
                 footprints = []
                 for polygon in cache[key]:
                     footprint = np.zeros(local_mask.shape, np.uint8)
@@ -290,13 +297,23 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
                 continue
             fit = trajectory_contrast(footprints, local_mask, onset, recovery)
             fit["complete_score"], fit["complete_temporal_gain"] = fit["score"], fit["temporal_gain"]
+            extended = extended_trajectory_fit(temporal_context, track["instance_token"], light_id,
+                direction, plane, projection, mask) if temporal_context is not None else None
             if config.allow_partial_temporal:
                 fit["score"], fit["temporal_gain"] = fit["available_score"], fit["available_temporal_gain"]
                 fit["control"] = fit["available_control"]
+                if extended and extended["observed_transition_types"]:
+                    fit["score"], fit["temporal_gain"] = extended["score"], extended["temporal_gain"]
+                    fit["available_edge_fit"] = extended["edge_fit"]
+                    fit["available_temporal_gain"] = extended["temporal_gain"]
+                    moving = extended["movement_m"] >= config.minimum_motion_m
+            fit["long_window"] = extended
             existence_score = fit["cover"] if config.allow_static_existence else fit["score"]
             shadow_fit_passes = fit["cover"] >= config.minimum_cover and existence_score >= config.minimum_score
             required_pixels = max(config.minimum_change_pixels, config.minimum_change_fraction*local_mask.sum())
             observed_sides = [key for key in ("onset", "recovery") if report[key] >= required_pixels]
+            if config.allow_partial_temporal and extended and extended["observed_transition_types"]:
+                observed_sides = [key for key in ("onset", "recovery") if extended[key+"_pixels"] >= required_pixels]
             temporal_observed = bool(observed_sides) if config.allow_partial_temporal else not report["temporal_reasons"]
             edge_fit = fit["available_edge_fit"] if config.allow_partial_temporal else min(fit["onset_fit"], fit["recovery_fit"])
             shadow_passes = (moving and temporal_observed and fit["cover"] >= config.minimum_cover
@@ -307,6 +324,9 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
                            **fit, "existence_score": existence_score, "motion_supported": bool(moving),
                            "minimum_step_motion_m": float(motion), "shadow_passes": bool(shadow_passes)})
             ranked[-1]["shadow_fit_passes"] = bool(shadow_fit_passes)
+            ranked[-1]["light_prior_bonus"] = light_prior_bonus(light_prior, light_id, config.light_prior_weight)
+            ranked[-1]["physical_score"] = ranked[-1]["score"]
+            ranked[-1]["score"] += ranked[-1]["light_prior_bonus"]
         ranked.sort(key=lambda item: (-item["score"], item["instance_token"]))
         if ranked:
             # Include runner-up even when it fails its own absolute acceptance gate.
@@ -332,8 +352,8 @@ def rank_hypotheses(mask, maps, tracks, plane, basis, projection, directions, co
 
 def frame_identity(candidate):
     """All cameras of a nuScenes sample share physical time; never count as independent."""
-    return {f"camera:{token}" for token in candidate["frame_tokens"]} | {
-        f"sample:{token}" for token in candidate.get("sample_tokens", [])}
+    return {f"camera:{token}" for token in [*candidate["frame_tokens"], *candidate.get("association_frame_tokens", [])]} | {
+        f"sample:{token}" for token in [*candidate.get("sample_tokens", []), *candidate.get("association_sample_tokens", [])]}
 
 
 def light_support_index(pool):

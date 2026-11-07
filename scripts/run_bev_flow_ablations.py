@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--current-cache-root", help="Contains train/ and val/ caches exported with --history-mode current-only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--labels-only", action="store_true", help="Skip segmenter/VLM dataset crop generation")
+    parser.add_argument("--light-prior-manifest")
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -53,9 +54,11 @@ def main():
             "negative_policy": "endpoints+lit-receivers",
             "appearance_prior_weight": 0.2,
             "mature_object_mode": "required",
+            "candidate_source": "caster", "temporal_radius": 3,
             "consensus_fraction": 2/3, **config["variants"][name]}
         recipe.setdefault("receiver_competition", "off" if recipe["decision_policy"] == "strict-v2" else "on")
         recipe.setdefault("temporal_evidence", "complete" if recipe["decision_policy"] == "strict-v2" else "available")
+        recipe.setdefault("light_prior_mode", "on" if args.light_prior_manifest else "off")
         root = output/name
         root.mkdir()
         write_json(root/"ablation_protocol.json", {"variant": name, "recipe": recipe, "seed": args.seed,
@@ -100,6 +103,11 @@ def main():
                 "independent_light", "positive_fusion", "consensus_fraction", "receiver_competition", "appearance_prior_weight",
                 "temporal_evidence")
                 for value in ("--"+key.replace("_", "-"), recipe[key])]
+            options += ["--candidate-source", recipe["candidate_source"], "--temporal-radius", recipe["temporal_radius"]]
+            if recipe["light_prior_mode"] == "on":
+                if not args.light_prior_manifest:
+                    parser.error("This light-prior arm requires --light-prior-manifest")
+                options += ["--light-prior-manifest", args.light_prior_manifest]
             if "existence_mode" in recipe:
                 options += ["--existence-mode", recipe["existence_mode"]]
             run("build_physics_shadow_labels.py", "--pairs", origin/"pairs/pairs.jsonl", "--analysis-root", analysis_root,

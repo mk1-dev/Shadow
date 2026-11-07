@@ -39,6 +39,13 @@ one mature-model inference export first; then audit on CPU before training.
 
 ## Default HPC Pipeline
 
+The [geo-temporal light workflow](docs/geo_temporal_light.md) adds a trainable
+RGB/ground-change light estimator with geographic UTC sunlight priors,
+GT-centered candidate search and up to nine cached temporal observations.
+`scripts/submit_light_annotation_pipeline.sh` reuses the completed audit, trains
+the light head on one GPU, then performs CPU label refinement without starting
+segmenter/VLM training. Model weights still need HPC training and validation.
+
 The [transition-evidence update](docs/shadow_transition_v2.md) addresses the
 2/0-positive audit: persistence is no longer automatic material evidence,
 single-sided signed changes can support caster matching, and identical-candidate
