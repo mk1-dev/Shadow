@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +20,7 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--positive-fusion", choices=["best", "consensus", "intersection"], default="consensus")
     parser.add_argument("--negative-policy", choices=["endpoints", "endpoints+lit-receivers"], default="endpoints+lit-receivers")
+    parser.add_argument("--split-workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     source, output = Path(args.source_root).resolve(), Path(args.output_root).resolve()
@@ -32,7 +34,7 @@ def main():
         print("RUN " + " ".join(command), flush=True)
         subprocess.run(command, check=True, cwd=ROOT)
 
-    for split in ("train", "val"):
+    def rebuild_split(split):
         origin, destination = source/split, output/split
         destination.mkdir()
         # Shared read-only inputs keep the rebuilt root compatible with the ablation runner.
@@ -60,6 +62,11 @@ def main():
         run("build_bev_flow_annotation_manifest.py", "--pairs", destination/"pairs/pairs.jsonl",
             "--labels-root", destination/"labels", "--negative-policy", args.negative_policy,
             "--output-root", destination/"teacher")
+    with ThreadPoolExecutor(max_workers=args.split_workers, thread_name_prefix="shadow-split") as executor:
+        futures = {executor.submit(rebuild_split, split): split for split in ("train", "val")}
+        for future, split in futures.items():
+            future.result()
+            print(f"COMPLETED split={split}", flush=True)
     run("build_shadow_annotation_dataset.py", "--manifest", output/"train/teacher/canonical.jsonl",
         output/"val/teacher/canonical.jsonl", "--output-root", output/"data", "--seed", args.seed)
     run("check_shadow_annotation_data.py", "--data-root", output/"data")

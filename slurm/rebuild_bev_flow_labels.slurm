@@ -4,7 +4,7 @@
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --mem=64G
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH -o logs/shadow_rebuild_%j.out
 #SBATCH -e logs/shadow_rebuild_%j.err
@@ -20,5 +20,6 @@ fi
 python -u scripts/rebuild_bev_flow_labels.py \
   --source-root "${SHADOW_REBUILD_SOURCE:?Set the existing cached preparation root}" \
   --output-root "${SHADOW_ANNOTATION_ROOT:?Set a new output directory}" \
+  --split-workers "${SHADOW_REBUILD_SPLIT_WORKERS:-2}" \
   --positive-fusion "${SHADOW_POSITIVE_FUSION:-consensus}" \
   --negative-policy "${SHADOW_NEGATIVE_POLICY:-endpoints+lit-receivers}"
