@@ -27,6 +27,26 @@ class CorrespondenceConfig:
             raise ValueError("Invalid metric BEV correspondence settings")
 
 
+@dataclass(frozen=True)
+class CrossSpaceGrowthConfig:
+    radius_m: float = 2.0
+    light_tolerance_L: float = 6.0
+    chroma_tolerance: float = 12.0
+    maximum_boundary: float = .75
+    spatial_decay: float = .9
+    temporal_decay: float = .9
+
+    def validate(self):
+        if (not np.isfinite(list(self.__dict__.values())).all()
+                or min(self.radius_m, self.light_tolerance_L, self.chroma_tolerance) <= 0
+                or not 0 < self.maximum_boundary <= 1
+                or not 0 < self.spatial_decay < 1 or not 0 < self.temporal_decay < 1):
+            raise ValueError("Invalid cross-space region growth settings")
+
+
+SPATIAL_MATCH_STATES = {0: "missing", 1: "low_confidence", 2: "reliable"}
+
+
 def lift_flow_to_bev(world, frames, pixels, flow, flow_valid, receiver, basis, projection, resolution):
     """Intersect observed NEXT-image endpoints with the receiver plane.
 
@@ -66,6 +86,7 @@ def _local_match(first, second, first_valid, second_valid, config):
     best = np.full((height, width), -np.inf, np.float32)
     runner_up = best.copy()
     displacement = np.zeros((height, width, 2), np.float32)
+    count = np.zeros((height, width), np.uint16)
     offsets = sorted(((dy, dx) for dy in range(-config.radius_cells, config.radius_cells+1)
                        for dx in range(-config.radius_cells, config.radius_cells+1)),
                      key=lambda d: (d[0]**2+d[1]**2, d))
@@ -77,6 +98,7 @@ def _local_match(first, second, first_valid, second_valid, config):
         source, target = np.s_[ya:yb, xa:xb], np.s_[ya+dy:yb+dy, xa+dx:xb+dx]
         cosine = np.einsum("hwc,hwc->hw", first[source], second[target])
         cosine = np.where(first_valid[source] & second_valid[target], np.clip(cosine, -1, 1), -np.inf)
+        count[source] += np.isfinite(cosine)
         previous = best[source].copy()
         better = cosine > previous
         runner_up[source] = np.where(better, previous, np.maximum(runner_up[source], cosine))
@@ -87,13 +109,19 @@ def _local_match(first, second, first_valid, second_valid, config):
     finite = np.isfinite(best) & np.isfinite(runner_up)
     np.subtract(best, runner_up, out=margin, where=finite)
     supported = first_valid & finite & (best >= config.minimum_cosine) & (margin >= config.minimum_margin)
-    return displacement, best, margin, supported
+    return displacement, best, margin, supported, count
 
 
 def match_spatial_bev(features, valid, resolution, config=None):
-    """Local cosine matching + reverse-cycle check on CURRENT-ONLY features."""
+    """Separate reliable, low-confidence and missing current-only matches.
+
+    Low-confidence vectors are proposals weighted by uniqueness and cycle error;
+    they do not become reliable geometry. Tied descriptors carry no motion vote.
+    """
     config = config or CorrespondenceConfig()
     config.validate()
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError("Resolution must be positive")
     features = np.asarray(features, np.float32)
     norms = np.linalg.norm(features, axis=-1)
     valid = np.asarray(valid, bool) & np.isfinite(features).all(axis=-1) & (norms > 1e-6)
@@ -104,24 +132,51 @@ def match_spatial_bev(features, valid, resolution, config=None):
     vectors = np.full((length-1, height, width, 2), np.nan, np.float32)
     good = np.zeros(vectors.shape[:-1], bool)
     confidence = np.zeros(good.shape, np.float32)
+    state = np.zeros(good.shape, np.uint8)
+    candidate_count = np.zeros(good.shape, np.uint16)
+    cycle_error = np.full(good.shape, np.nan, np.float32)
+    match_cosine = np.full(good.shape, np.nan, np.float32)
+    match_margin = np.full(good.shape, np.nan, np.float32)
     change = np.full(good.shape, np.nan, np.float32)
     for slot in range(length-1):
         if not valid[slot].any() or not valid[slot+1].any():
             continue
-        forward, _, margin, supported = _local_match(normalized[slot], normalized[slot+1], valid[slot], valid[slot+1], config)
-        backward, _, _, reverse_valid = _local_match(normalized[slot+1], normalized[slot], valid[slot+1], valid[slot], config)
+        forward, best, margin, supported, count = _local_match(normalized[slot], normalized[slot+1], valid[slot], valid[slot+1], config)
+        backward, reverse_best, reverse_margin, reverse_valid, reverse_count = _local_match(
+            normalized[slot+1], normalized[slot], valid[slot+1], valid[slot], config)
         endpoints = (start+forward).astype(np.float32)
         reverse = sample_at(backward, endpoints, nearest=True)
+        reverse_best = sample_at(reverse_best, endpoints, nearest=True)
+        reverse_margin = sample_at(reverse_margin, endpoints, nearest=True)
+        reverse_count = sample_at(reverse_count, endpoints, nearest=True)
+        cycle = np.linalg.norm(forward+reverse, axis=-1)
+        available = valid[slot] & (count > 0) & np.isfinite(best) & (best >= config.minimum_cosine)
+        reversible = available & (reverse_count > 0) & np.isfinite(reverse_best) & (reverse_best >= config.minimum_cosine)
         supported &= sample_at(reverse_valid.astype(np.uint8), endpoints, nearest=True) > 0
-        supported &= np.linalg.norm(forward+reverse, axis=-1) <= config.cycle_tolerance_cells
-        vectors[slot] = np.where(supported[..., None], forward*resolution, np.nan)
+        supported &= cycle <= config.cycle_tolerance_cells
+        # A single visible alternative is weak support, not proof of uniqueness.
+        uniqueness = np.where(count == 1, .1, np.clip(margin/.1, 0, 1))
+        reverse_uniqueness = np.where(reverse_count == 1, .1, np.clip(reverse_margin/.1, 0, 1))
+        quality = np.minimum(uniqueness, reverse_uniqueness)
+        quality *= np.where(supported, 1, np.exp(-cycle/config.cycle_tolerance_cells))
+        quality = np.where(reversible, quality, 0)
+        usable = reversible & (quality > 0)
+        vectors[slot] = np.where(usable[..., None], forward*resolution, np.nan)
         good[slot] = supported
-        confidence[slot] = np.where(supported, np.clip(margin/.1, 0, 1), 0)
+        confidence[slot] = quality
+        state[slot] = np.where(supported, 2, np.where(available, 1, 0))
+        candidate_count[slot] = count
+        cycle_error[slot] = np.where(reversible, cycle, np.nan)
+        match_cosine[slot] = np.where(available, best, np.nan)
+        match_margin[slot] = np.where(available & (count > 1), margin, np.nan)
         same_cell = valid[slot] & valid[slot+1]
         cosine = np.einsum("hwc,hwc->hw", normalized[slot], normalized[slot+1])
         change[slot] = np.where(same_cell, np.clip(1-cosine, 0, 2), np.nan)
     return {"spatial_bev_displacement_m": vectors, "spatial_bev_match_valid": good,
-        "spatial_bev_match_confidence": confidence, "spatial_bev_feature_change": change}
+        "spatial_bev_match_confidence": confidence, "spatial_bev_feature_change": change,
+        "spatial_bev_match_state": state, "spatial_bev_match_usable": confidence > 0,
+        "spatial_bev_candidate_count": candidate_count, "spatial_bev_cycle_error_cells": cycle_error,
+        "spatial_bev_match_cosine": match_cosine, "spatial_bev_match_margin": match_margin}
 
 
 def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_valid,
@@ -137,7 +192,8 @@ def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_
     entity_factor = np.where(known_entity, 1-maps["entity_explanation_map"], np.nan)
     paired = maps["exposure_valid"]
     flow_quality = signals["spatial_bev_match_confidence"]*maps["flow_confidence_map"]
-    matched = flow_valid & signals["spatial_bev_match_valid"] & paired
+    matched = flow_valid & signals["spatial_bev_match_usable"] & paired
+    reliable = matched & signals["spatial_bev_match_valid"]
     difference = np.linalg.norm(flow_bev-signals["spatial_bev_displacement_m"], axis=-1)
     flow_score = np.where(matched, np.nan_to_num(difference/config.displacement_scale_m), 0)
     feature_change = signals["spatial_bev_feature_change"]
@@ -160,9 +216,96 @@ def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_
     maps.update(signals)
     maps.update(flow_bev_displacement_m=flow_bev, flow_bev_valid=flow_valid,
         flow_bev_discrepancy_m=np.where(matched, difference, np.nan),
-        flow_bev_discrepancy_valid=matched, cross_space_discovery_score=score,
+        flow_bev_discrepancy_valid=reliable, flow_bev_discrepancy_supported=matched,
+        cross_space_discovery_score=score,
         cross_space_complete_score=np.where(complete_valid, complete_score, np.nan),
         cross_space_partial_score=partial_score, cross_space_complete_valid=complete_valid,
         cross_space_entity_factor=entity_factor,
         cross_space_entity_factor_known=known_entity)
+    return maps
+
+
+def grow_cross_space_regions(maps, lab, resolution, video_config, *, timestamps=None, config=None):
+    """Grow observed regions from M2 seeds, not from rendered footprints.
+
+    Temporal seeds use independently valid adjacent pairs at the same world
+    receiver cell. They are never recursively propagated or advected as shadow
+    motion by material flow. Every destination needs its own appearance support.
+    """
+    config = config or CrossSpaceGrowthConfig()
+    config.validate()
+    video_config.validate()
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError("Resolution must be positive")
+    lab = np.asarray(lab, np.float32)
+    score = maps["cross_space_discovery_score"]
+    receiver = maps["receiver_valid_by_frame"]
+    if lab.shape != (*score.shape, 3):
+        raise ValueError("Region growth requires frame-aligned Lab observations")
+    allowed = receiver & maps["search_valid_by_frame"] & np.isfinite(lab).all(axis=-1)
+    appearance = maps["appearance_score_map"]
+    observed_appearance = appearance >= video_config.minimum_observed_appearance
+    seeds = allowed & observed_appearance & (score >= video_config.seed_score)
+    temporal_score = np.zeros_like(score)
+    temporal_source = np.full(score.shape, -1, np.int32)
+    if timestamps is not None:
+        timestamps = np.asarray(timestamps, np.float64)
+        if timestamps.shape != (len(score),) or not np.isfinite(timestamps).all() or (np.diff(timestamps) <= 0).any():
+            raise ValueError("Growth timestamps must be strictly increasing camera microseconds")
+    for slot in range(len(score)-1):
+        if timestamps is not None and (timestamps[slot+1]-timestamps[slot])/1e6 > video_config.maximum_gap_seconds:
+            continue
+        pair = (maps["pair_correspondence_valid"][slot] & maps["exposure_valid"][slot]
+                & np.isfinite(maps["spatial_bev_feature_change"][slot]))
+        color = np.linalg.norm(lab[slot+1, ..., 1:]-lab[slot, ..., 1:], axis=-1)
+        pair &= color <= config.chroma_tolerance
+        for source, target in ((slot, slot+1), (slot+1, slot)):
+            supported = (seeds[source] & allowed[target] & observed_appearance[target] & pair
+                         & (lab[target, ..., 0] <= lab[source, ..., 0]+config.light_tolerance_L)
+                         & (maps["boundary_confidence"][target] <= config.maximum_boundary))
+            value = np.where(supported, score[source]*config.temporal_decay, 0)
+            better = value > temporal_score[target]
+            temporal_score[target] = np.maximum(temporal_score[target], value)
+            temporal_source[target][better] = source
+    temporal_seed = (temporal_score >= video_config.grow_score) & ~seeds
+    region_score = np.where(seeds, score, 0)
+    region_score = np.maximum(region_score, np.where(temporal_seed, temporal_score, 0))
+    anchors = lab.copy()
+    anchor_appearance = appearance.copy()
+    region_appearance = np.where(seeds | temporal_seed, appearance, 0)
+    # Anchor colors travel with the seed: local gradients cannot accumulate
+    # across a different material or into a bright road region.
+    height, width = receiver.shape[1:]
+    for _ in range(int(np.floor(config.radius_m/resolution))):
+        previous, previous_anchors = region_score.copy(), anchors.copy()
+        previous_appearance = anchor_appearance.copy()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ya, yb = max(0, -dy), min(height, height-dy)
+            xa, xb = max(0, -dx), min(width, width-dx)
+            source = np.s_[:, ya:yb, xa:xb]
+            target = np.s_[:, ya+dy:yb+dy, xa+dx:xb+dx]
+            value = previous[source]*config.spatial_decay
+            light_distance = np.abs(lab[target][..., 0]-previous_anchors[source][..., 0])
+            color_distance = np.linalg.norm(lab[target][..., 1:]-previous_anchors[source][..., 1:], axis=-1)
+            compatible = (light_distance <= config.light_tolerance_L) & (color_distance <= config.chroma_tolerance)
+            # Uniform shadow interiors may have zero local darkness score. Use
+            # their observed color agreement with the seed, not that old gate.
+            observed = previous_appearance[source]*np.exp(
+                -light_distance/config.light_tolerance_L-color_distance/config.chroma_tolerance)
+            better = (allowed[target] & compatible & (value >= video_config.grow_score)
+                      & (observed >= video_config.minimum_observed_appearance)
+                      & (maps["boundary_confidence"][target] <= config.maximum_boundary)
+                      & (value > region_score[target]))
+            region_score[target] = np.where(better, value, region_score[target])
+            anchors[target] = np.where(better[..., None], previous_anchors[source], anchors[target])
+            anchor_appearance[target] = np.where(better, previous_appearance[source], anchor_appearance[target])
+            region_appearance[target] = np.where(better, observed, region_appearance[target])
+        if np.array_equal(previous, region_score):
+            break
+    support = region_score >= video_config.grow_score
+    maps.update(cross_space_region_score=region_score, cross_space_region_support=support,
+        cross_space_region_appearance_support=region_appearance,
+        cross_space_direct_seed=seeds, cross_space_temporal_seed=temporal_seed,
+        cross_space_temporal_source_frame=temporal_source,
+        cross_space_spatial_growth=support & ~seeds & ~temporal_seed)
     return maps

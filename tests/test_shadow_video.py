@@ -351,15 +351,22 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
             assert not archive["receiver_valid_by_frame"].any()
             assert archive["search_valid_by_frame"].any()
         assert "bev_feature_change" not in archive.files  # interval maps live in pair_evidence
+        assert "cross_space_region_score" in archive.files
+        assert "cross_space_region_appearance_support" in archive.files
+        assert "cross_space_temporal_source_frame" in archive.files
     with np.load(tmp_path/"clip/pair_evidence.npz", allow_pickle=False) as archive:
         assert "bev_feature_change" in archive.files
         assert "spatial_bev_displacement_m" in archive.files
+        assert "spatial_bev_match_state" in archive.files
+        assert "flow_bev_discrepancy_supported" in archive.files
     with np.load(tmp_path/"clip/001_image.npz", allow_pickle=False) as archive:
         assert archive["shadow_proposal_image"].shape == (64, 64)
         assert set(np.unique(archive["shadow_target_image"])) <= {1, 255}
     assert len((tmp_path/"clip/region_memory.jsonl").read_text().splitlines()) == 3
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
+    assert protocol["protocol"] == "entity-shadow-disentangled-video-v8"
+    assert protocol["spatial_match_states"] == {"0": "missing", "1": "low_confidence", "2": "reliable"}
     assert protocol["stage"] == stage and protocol["bev_role"] == "context"
     assert len(protocol["modules"]) == 4
     review = json.loads((tmp_path/"clip/reviewed_signals.jsonl").read_text().strip())

@@ -29,7 +29,8 @@ from shadow_occ.annotation.physics_motion import pair_evidence, project_world, s
 from shadow_occ.annotation.receiver_explanations import box_ray_evidence
 from shadow_occ.annotation.shadow_video import ENTITY_STATES, PHYSICAL_REFERENCE_SOURCES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
 from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage, summarize_signals
-from shadow_occ.annotation.video_correspondence import CorrespondenceConfig, cross_space_proposals, lift_flow_to_bev
+from shadow_occ.annotation.video_correspondence import (CorrespondenceConfig, CrossSpaceGrowthConfig,
+    SPATIAL_MATCH_STATES, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
 from shadow_occ.annotation.shadow_representation import describe_regions, memory_state, paste_region_image, project_region_memory, refine_image_region
 from shadow_occ.utils.io import write_json
 
@@ -294,13 +295,18 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     tick = perf_counter()
     maps = video_proposals(**inputs, caster_prior=prior, config=config, bev_role=bev_role)
     correspondence_config = CorrespondenceConfig()
+    growth_config = CrossSpaceGrowthConfig()
     if discovery_mode == "cross-space" and "spatial_features" in context:
         original = maps["proposal_score_map"].copy()
         maps = cross_space_proposals(maps, context["spatial_features"], context["spatial_feature_valid"],
             context["metric_flow"], context["metric_flow_valid"], context["grid"].resolution, correspondence_config)
-        maps["proposal_score_map"] = np.maximum(original, maps["cross_space_discovery_score"])
+        maps = grow_cross_space_regions(maps, inputs["lab"], context["grid"].resolution, config,
+            timestamps=[frame["camera_timestamp"] for frame in context["frames"]], config=growth_config)
+        maps["proposal_score_map"] = np.maximum(original,
+            np.maximum(maps["cross_space_discovery_score"], maps["cross_space_region_score"]))
         maps["cross_space_new_seed"] = (maps["cross_space_discovery_score"] >= config.seed_score) & (original < config.seed_score)
-        maps["proposal_source_bits"][maps["cross_space_discovery_score"] >= config.seed_score] |= 8
+        maps["proposal_source_bits"][(maps["cross_space_discovery_score"] >= config.seed_score)
+                                     | maps["cross_space_region_support"]] |= 8
     timing["proposal_seconds"] = perf_counter()-tick
     maps.update(context.get("entity_maps", {}))
     context["delta_L"] = inputs["delta_L"]
@@ -320,6 +326,8 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 if identity in projection_masks:
                     remembered |= projection_masks[identity]
         tick = perf_counter()
+        if "cross_space_temporal_seed" in maps:
+            remembered |= maps["cross_space_temporal_seed"][slot]
         regions = refine_regions(maps["proposal_score_map"][slot], maps["boundary_confidence"][slot],
             maps["search_valid_by_frame"][slot], inputs["features"][slot],
             maps["bev_feature_valid"][slot] & (bev_role != "off"), config, remembered)
@@ -340,7 +348,10 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             region["frame_slot"] = slot
             region["receiver_mask"] = region["mask"] & maps["receiver_valid_by_frame"][slot]
             if discovery_mode == "cross-space":
-                region["receiver_mask"] &= maps["appearance_score_map"][slot] >= config.minimum_observed_appearance
+                appearance_support = maps["appearance_score_map"][slot]
+                if "cross_space_region_appearance_support" in maps:
+                    appearance_support = np.maximum(appearance_support, maps["cross_space_region_appearance_support"][slot])
+                region["receiver_mask"] &= appearance_support >= config.minimum_observed_appearance
             seed = bev_mask_to_image(region["receiver_mask"], frame["projection_world_to_image"],
                 context["basis"], context["grid"], image_domain.shape, cell_indices=cell_indices)
             region.update(refine_image_region(context["images"][slot], seed, image_domain))
@@ -556,10 +567,13 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     write_rows(output/"region_memory.jsonl", region_memory_rows)
     write_rows(output/"reviewed_signals.jsonl", reviewed_rows)
     timing["total_seconds"] = perf_counter()-started
-    write_json(output/"protocol.json", {"protocol": "entity-shadow-disentangled-video-v7", "clip": clip,
+    write_json(output/"protocol.json", {"protocol": "entity-shadow-disentangled-video-v8", "clip": clip,
         "stage": stage, "bev_role": bev_role,
         "modules": ["M1_entity_decomposition", "M2_metric_BEV_flow_discovery", "M3_caster_light_reasoning", "M4_temporal_shadow_representation"],
         "discovery_mode": discovery_mode, "correspondence_config": asdict(correspondence_config),
+        "cross_space_growth_config": asdict(growth_config), "spatial_match_states": SPATIAL_MATCH_STATES,
+        "spatial_match_contract": "reliable retains cosine/uniqueness/cycle gates; low confidence contributes a weighted proposal, not reliable geometry; repeated features have zero motion weight",
+        "cross_space_growth_contract": "bounded Lab-anchor and boundary constrained growth on currently observed ground; uniform interiors use measured seed-color agreement as appearance support; one-hop same-world temporal seeds require independent valid pairs and current appearance; no flow-as-shadow-speed or masks in missing frames",
         "spatial_feature_sources": context.get("spatial_feature_sources", []),
         "feature_roles": "current-only spatial features for BEV correspondence; temporal/context features for region identity; absent spatial cache is missing evidence",
         "flow_BEV_units": "horizontal anchor-grid x/y meters per actual camera interval; ground-ray lift in destination camera",

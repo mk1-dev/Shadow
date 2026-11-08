@@ -25,6 +25,12 @@ No new model training or RGB/DIS/GT dataset rebuild is needed. The pipeline
 retains caster/light history, RGB-refined image masks, short-gap region memory
 and a separate Shadow-BEV instead of merging shadows into entity occupancy.
 
+M2 v8 keeps reliable, low-confidence and missing BEV correspondences distinct.
+Cross-space seeds grow within currently observed Lab/boundary-compatible ground
+and can seed an independently valid adjacent frame, without treating material
+flow as shadow speed. Proposal growth does not change physical label acceptance.
+Existing feature/flow caches can be reused with a new output directory.
+
 The existing three-frame A/B/C/D pipeline remains a frozen baseline. Existing
 3D object GT supplies caster tracks; decoded mature-model 3D predictions provide
 a separate entity/motion explanation, not shadow ground truth.

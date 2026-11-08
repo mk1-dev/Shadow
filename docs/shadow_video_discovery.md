@@ -52,8 +52,15 @@ Current-only BEV descriptors are locally cosine-matched with uniqueness and
 reverse-cycle checks. `flow_bev_displacement_m` and `spatial_bev_displacement_m`
 therefore share units and axes. Their difference is never computed between
 image pixels and feature vectors. `spatial_bev_feature_change` retains raw
-`1-cosine`; ranking normalizes it to [0,1]. Missing/ambiguous matches remain NaN
-with false validity, not an anomalous displacement.
+`1-cosine`; ranking normalizes it to [0,1]. In v8, correspondence is explicitly
+`0=missing`, `1=low_confidence`, or `2=reliable`. The existing cosine, uniqueness
+and reverse-cycle thresholds still define reliable matches. Sparse singleton
+matches have at most 0.1 motion weight; small margins and cycle errors reduce
+the weight rather than discarding every vector. Repeated/tied features have
+zero motion weight and NaN vectors, not confident zero motion. Missing features
+remain missing. `spatial_bev_match_valid` and `flow_bev_discrepancy_valid` retain
+their reliable-only meaning; `*_match_usable` and
+`flow_bev_discrepancy_supported` include weighted low-confidence evidence.
 
 The proposal channel combines existing observed appearance with confidence-
 weighted metric disagreement (weight 0.35) and normalized BEV change (0.25).
@@ -62,6 +69,39 @@ reported as NaN and retained as partial evidence, not silently asserted absent.
 For physical acceptance, a proposed ground cell still needs observed appearance
 support (`minimum_observed_appearance=0.05`) and caster/light fit. Static
 appearance retains its own path, including when no temporal event is visible.
+
+### M2 Seed-to-Region Continuation (v8)
+
+Cross-space seeds now grow into weakly observed current regions before the
+existing watershed/RGB refinement and unchanged caster/light acceptance:
+
+- Growth stays within 2 horizontal meters (four grid steps at 0.5 m) and visible
+  unsuppressed ground. A seed needs current appearance support of at least 0.05.
+  Interior pixels can instead use observed Lab agreement with that seed, so a
+  uniform shadow is not cropped away by the old local-darkness detector.
+- Each grown pixel is compared with its originating seed's Lab color, not just
+  the previous frontier. Light tolerance is 6 L units, chroma tolerance 12,
+  boundary limit 0.75, and evidence decays by 0.9 per grid step.
+  Seed appearance support is attenuated by the measured Lab distance; its 0.05
+  floor is also checked before the grown region enters physical verification.
+- Original seeds can support the immediately preceding/following frame at the
+  same world receiver location, using an independently valid exposure/geometric
+  pair, available current-only BEV observations, compatible color and current
+  appearance. Camera gaps above the existing 1.5 s limit do not propagate.
+- Temporal seeds are not recursively propagated. A missing frame does not clear
+  other valid pairs, and neither material flow nor BEV correspondence is assumed
+  to be shadow speed. M4's existing caster/light motion alternatives remain.
+- This only expands proposals. Unobserved, bright or physically unsupported
+  pixels do not become positive labels by growth or memory alone.
+
+Per-frame NPZ separates `cross_space_direct_seed`, `cross_space_temporal_seed`,
+`cross_space_temporal_source_frame`, `cross_space_spatial_growth`,
+`cross_space_region_support`, `cross_space_region_appearance_support` and
+`cross_space_region_score`. Source bit 8 covers
+their cross-space provenance; it does not imply an independent seed at every
+pixel. Pair NPZ additionally retains candidate counts, match cosine/margins,
+cycle error, states and confidence. M1/M3/M4 and physical label thresholds are
+unchanged. Existing evidence caches are reusable; use a new output directory.
 
 M3 retains projection/light and signed-transition fits in each caster token's
 `shadow_projection_history`. Local owner scoring combines projection coverage,
@@ -104,7 +144,7 @@ python -u scripts/discover_shadow_video.py \
   --clips "$SHADOW_VIDEO_CLIPS" \
   --stage full --discovery-mode cross-space \
   --owner-scoring geometry+appearance+bev \
-  --output-root outputs/shadow_mainline_v7
+  --output-root outputs/shadow_mainline_v8
 ```
 
 For Slurm, set `SHADOW_VIDEO_SPATIAL_FEATURES` in addition to the existing input
