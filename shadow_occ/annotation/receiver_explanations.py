@@ -83,10 +83,13 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
     """
     shape = world.shape[:2]
     receivers = world.reshape(-1, 3)
-    support = np.zeros((3, *shape), bool)
-    flow_valid = np.zeros((2, *shape), bool)
-    expected = np.full((2, *shape, 2), np.nan, np.float32)
-    residual = np.full((2, *shape), np.nan, np.float32)
+    length = len(frames)
+    if length < 2 or len(observed_flows) != length-1 or len(pixels) != length:
+        raise ValueError("Box-surface motion needs consecutive frame/flow observations")
+    support = np.zeros((length, *shape), bool)
+    flow_valid = np.zeros((length-1, *shape), bool)
+    expected = np.full((length-1, *shape, 2), np.nan, np.float32)
+    residual = np.full((length-1, *shape), np.nan, np.float32)
     for slot, frame in enumerate(frames):
         projection = np.asarray(frame["projection_world_to_image"], np.float64)
         camera = np.linalg.solve(projection[:, :3], -projection[:, 3])
@@ -97,7 +100,7 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
         in_front &= ((uv >= 0).all(axis=1) & (uv[:, 0] <= width-1) & (uv[:, 1] <= height-1))
         nearest = np.full(len(receivers), np.inf)
         next_volumes = ({value["instance_token"]: value for value in frames[slot+1]["object_volumes_world"]
-                         if value.get("instance_token")} if slot < 2 else {})
+                         if value.get("instance_token")} if slot < length-1 else {})
         for volume in frame["object_volumes_world"]:
             corners = np.asarray(volume["corners_world"], np.float64)
             corner_uv, corner_depth, valid = project_world(corners, projection)
@@ -125,7 +128,7 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
                 continue
             nearest[indices] = fraction
             support[slot].flat[indices] = True
-            if slot == 2:
+            if slot == length-1:
                 continue
             # A nearer fallback/non-track box must clear any farther motion proxy.
             flow_valid[slot].flat[indices] = False

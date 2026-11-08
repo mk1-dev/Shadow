@@ -138,6 +138,8 @@ def select_bev_flow_receivers(arrays, metadata, minimum_cosine=0.3, *,
             features = arrays["learned_bev_receiver_features"].astype(np.float32).copy()
             for slot in range(3):
                 support = arrays["learned_bev_valid"][slot]
+                if "receiver_valid" in arrays:
+                    support = support & arrays["receiver_valid"]
                 values = features[slot][support]
                 features[slot][support] = values[rng.permutation(len(values))]
             norms = np.linalg.norm(features, axis=-1)

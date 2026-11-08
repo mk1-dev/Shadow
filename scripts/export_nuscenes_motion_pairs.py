@@ -13,6 +13,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.data import checked_write_image, digest, group_split, write_rows
+from shadow_occ.annotation.frame_receiver import write_frame_receiver
 from shadow_occ.annotation.physics_motion import (
     decompose_object_motion, fit_ground_plane, ground_homography, interpolate_box_state,
     plane_basis, project_world,
@@ -183,6 +184,7 @@ def main():
     if not scenes or not scenes <= official:
         raise ValueError("Select nonempty scenes from the requested official split")
     counts, audit, scene_counts = Counter(), [], Counter()
+    frame_cache = {}
 
     @lru_cache(maxsize=3)
     def geometry(sample_token):
@@ -235,10 +237,16 @@ def main():
                             raise ValueError("local_ground_planes_disagree")
                         basis_world = previous.ego_to_global @ plane_basis(plane_t)
                         frames, states = [], []
-                        for slot, camera, anns, points, clean in (
-                            ("t", camera_t, anns_t, points_t, clean_t),
-                            ("next", camera_next, anns_next, points_next, clean_next),
+                        for slot, camera, anns, points, clean, frame_plane, frame_basis, frame_anchor in (
+                            ("t", camera_t, anns_t, points_t, clean_t, world_plane, basis_world, previous.ego_to_global),
+                            ("next", camera_next, anns_next, points_next, clean_next, next_world_plane,
+                             following.ego_to_global @ plane_basis(plane_next), following.ego_to_global),
                         ):
+                            if camera.token in frame_cache:
+                                cached_frame, cached_states = frame_cache[camera.token]
+                                frames.append(cached_frame)
+                                states.append(cached_states)
+                                continue
                             image = cv2.imread(str(camera.image_path))
                             if image is None:
                                 raise FileNotFoundError(camera.image_path)
@@ -266,22 +274,20 @@ def main():
                                     object_corners.append(fallback)
                                     volumes.append({"instance_token": ann["instance_token"], "category": ann["category_name"],
                                         "corners_world": fallback.tolist(), "source": "annotation_time_exclusion_only"})
-                            support, support_info = observed_ground(points, clean, projection, world_plane,
+                            support, support_info = observed_ground(points, clean, projection, frame_plane,
                                                                       image.shape[:2], object_corners,
-                                                                      basis_world=basis_world,
+                                                                      basis_world=frame_basis,
                                                                       support_radius=args.support_radius)
-                            image_path = output/"images"/f"{pair_id}_{slot}.png"
-                            ground_path = output/"ground"/f"{pair_id}_{slot}.png"
-                            checked_write_image(image_path, image)
-                            checked_write_image(ground_path, support.astype(np.uint8)*255)
-                            frames.append({"image": str(image_path), "ground_support": str(ground_path),
-                                           "image_sha256": digest(image_path), "ground_sha256": digest(ground_path),
+                            frame = write_frame_receiver(output, {
                                            "source_image": str(camera.image_path.resolve()), "camera_timestamp": camera.timestamp,
                                            "sample_data_token": camera.token, "projection_world_to_image": projection.tolist(),
                                            "object_state_failures": state_failures,
                                            "object_volumes_world": volumes,
-                                           "image_size_wh": [width, height], "ground_evidence": support_info})
+                                           "image_size_wh": [width, height], "ground_evidence": support_info},
+                                           image, support, frame_plane, frame_basis, frame_anchor)
+                            frames.append(frame)
                             states.append(timed_states)
+                            frame_cache[camera.token] = (frame, timed_states)
                         if frames[0]["image_size_wh"] != frames[1]["image_size_wh"]:
                             raise ValueError("Temporal image dimensions differ")
                         motions = []
@@ -331,9 +337,11 @@ def main():
             progress.close()
 
     write_rows(output/"pairs.jsonl", records())
+    write_rows(output/"receiver_frames.jsonl", (frame for frame, _ in frame_cache.values()))
     write_rows(output/"export_audit.jsonl", audit)
     write_json(output/"export_protocol.json", {**vars(args), "counts": dict(counts),
                "protocol": "physics-motion-evidence-v1", "pair_manifest_sha256": digest(output/"pairs.jsonl"),
+               "receiver_protocol": "frame-receiver-v1", "receiver_frames": len(frame_cache),
                "boundary": "Stage 1/2 only; no shadow masks, Occ3D or automatic training labels used",
                "ground_limitations": "single local LiDAR plane; sparse dilated visibility; no semantic ground truth",
                "motion_limitations": "bracketed GT box interpolation, not dense object surface flow"})

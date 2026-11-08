@@ -2,13 +2,22 @@
 
 ## Current Research Scope: Physics-Guided Shadow Annotation
 
-The active experiment is **BEV-Flow-Guided Shadow Annotation**. Reuse the mature
-UniAD/OpenDriveVLA BEVFormer as a frozen encoder, align its spatial features with
-three-frame physical BEV and image flow, and generate receiver-grounded shadow
-regions for the existing segmenter and unified VLM. OCC training remains the
-next stage. Existing 3D object GT supplies the physical caster tracks. Decoded
-mature-model 3D predictions provide a separate entity/motion explanation, not
-shadow ground truth and not a replacement for the GT caster trajectories.
+The current main task is **continuous shadow discovery from 3D/BEV physical
+explanations versus 2D flow and appearance**, followed by physics-grounded weak
+annotation. Reuse the mature UniAD/OpenDriveVLA BEVFormer as a frozen encoder;
+do not train a new BEV, lighting, memory or VLM model for this proof of concept.
+
+The executable video path has three research modules: cross-space discrepancy
+discovery, caster/light physical explanation, and temporal region refinement.
+It exports continuous observed proposals, independently accepted weak masks,
+owner uncertainty and a separate Shadow-BEV layer. See
+[the video workflow](docs/shadow_video_discovery.md) for the clip manifest,
+CPU/HPC command and outputs. Shadow-aware OCC is the later application test,
+not an already demonstrated contribution.
+
+The existing three-frame A/B/C/D pipeline remains a frozen baseline. Existing
+3D object GT supplies caster tracks; decoded mature-model 3D predictions provide
+a separate entity/motion explanation, not shadow ground truth.
 
 The executable BEV path is:
 
@@ -134,6 +143,10 @@ decoded 3D evidence used by later competition remain intact.
 trajectory time order while holding the centre state and candidate discovery fixed;
 it is a wrong-time control, not a new set of positive training labels. Static
 tracks may be unchanged by this control and should be interpreted separately.
+Shuffle is restricted to each frame's valid receiver positions; geometry masks,
+feature values/distribution, timestamps and world metadata are unchanged. Triplet
+time reversal is one of the existing wrong-time permutations, so report it in
+the same counterfactual family rather than as an independent second contribution.
 The discrepancy formula and physical scoring formulas are not changed by these
 switches. Recipes, code hashes and source-window hashes are written to each arm.
 
@@ -823,3 +836,16 @@ has started. In Slurm, run inside the allocated GPU job.
 Without Occ3D, the project can still generate nuScenes-only shadow labels and
 run the length/pseudo-height precheck, but it cannot train the current OCC
 target or report Occupancy mIoU, RayIoU, and Semantic mIoU.
+
+## Continuous BEV / Flow Shadow Discovery
+
+The track-centric video path is documented in
+[docs/shadow_video_discovery.md](docs/shadow_video_discovery.md).
+Use `--stage signal`, `--stage projection`, then `--stage full` on the same
+clips. Default discovery does not reward large flow errors or assume that
+frozen BEV features are illumination invariant; BEV signals and region linking
+remain available, with the invariance hypothesis exposed as an explicit control.
+It uses frame-level receiver references, active discrepancy score maps,
+boundary-aware regions and BEV-aware temporal memory, then reuses the existing
+caster/light verifier. It exports separate proposal masks, weak labels and a
+Shadow-BEV layer without training OCC or changing the frozen audit recipes.

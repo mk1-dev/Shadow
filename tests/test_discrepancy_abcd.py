@@ -48,6 +48,20 @@ def test_entity_motion_ablation_keeps_original_3d_evidence_for_verification():
     assert meta["discrepancy_discovery"]["proposal_entity_motion"] == "off"
 
 
+def test_bev_shuffle_leaves_nonreceiver_features_and_validity_unchanged():
+    arrays, receiver = weak_case()
+    arrays["receiver_valid"] = receiver.copy()
+    features = np.random.default_rng(3).normal(size=(1, 8, 8, 12)).astype(np.float32)
+    arrays["learned_bev_receiver_features"] = np.repeat(features, 3, axis=0)
+    original_features = arrays["learned_bev_receiver_features"].copy()
+    original_valid = arrays["learned_bev_valid"].copy()
+    select_bev_flow_receivers(arrays, {"counts": {}}, feature_gate="shuffled", seed=17)
+    np.testing.assert_allclose(arrays["learned_bev_receiver_consistency"][~receiver], 1, atol=1e-6)
+    np.testing.assert_array_equal(arrays["learned_bev_receiver_features"], original_features)
+    np.testing.assert_array_equal(arrays["learned_bev_valid"], original_valid)
+    np.testing.assert_array_equal(arrays["receiver_valid"], receiver)
+
+
 def test_same_geometry_verification_events_for_all_candidate_modes():
     builder = script("build_physics_shadow_labels")
     arrays, mask = weak_case(6)
