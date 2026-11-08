@@ -41,6 +41,11 @@ Existing feature/flow caches can be reused with a new output directory.
 Current-only interior/boundary region descriptors support continuity only with
 geometric overlap; caster/light acceptance and owner scoring rules are unchanged.
 
+Freeze discovery outputs before visual quality review. The CPU-only
+[frozen video review tool](docs/shadow_video_review.md) exports added/removed
+region cases, evidence traces, token-based owner transitions, and actual-mask
+versus memory-only timelines without changing M1-M4 or rerunning inference.
+
 The existing three-frame A/B/C/D pipeline remains a frozen baseline. Existing
 3D object GT supplies caster tracks; decoded mature-model 3D predictions provide
 a separate entity/motion explanation, not shadow ground truth.
