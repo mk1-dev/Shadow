@@ -226,7 +226,8 @@ def test_legacy_frame_selection_is_deterministic_and_prefers_own_start_pair():
 
 
 @pytest.mark.parametrize("with_boxes", [False, True])
-def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path, monkeypatch, with_boxes):
+@pytest.mark.parametrize("spatial_mode", [None, "current-only", "temporal"])
+def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path, monkeypatch, with_boxes, spatial_mode):
     from shadow_occ.annotation.bev_flow import BEVFlowConfig
     from shadow_occ.annotation.data import checked_write_image, digest
     from tests.test_bev_flow import example
@@ -254,9 +255,16 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
         stats[pair["id"]] = {key: pair[key] for key in ("scene_name", "camera", "official_split")}
         stats[pair["id"]].update(evidence=str(path), evidence_sha256=digest(path))
     monkeypatch.setattr(module, "sample_cached_bev", lambda root, token, world:
-        (np.ones((*world.shape[:2], 2), np.float32), np.ones(world.shape[:2], bool), {}))
+        (np.ones((*world.shape[:2], 2), np.float32), np.ones(world.shape[:2], bool), {"history_mode": spatial_mode}))
+    if spatial_mode == "temporal":
+        with pytest.raises(ValueError, match="current-only"):
+            module.sample_clip(pairs, frame_index(pairs), tmp_path, stats, tmp_path,
+                              tmp_path, BEVFlowConfig(extent_m=4), spatial_feature_root=tmp_path)
+        return
     inputs, context = module.sample_clip(pairs, frame_index(pairs), tmp_path, stats, tmp_path,
-                                       tmp_path, BEVFlowConfig(extent_m=4))
+                                       tmp_path, BEVFlowConfig(extent_m=4),
+                                       spatial_feature_root=tmp_path if spatial_mode else None)
+    assert context["spatial_feature_valid"].any() == bool(spatial_mode)
     assert not inputs["receiver"][0].any()
     assert inputs["receiver"][1:].any()
     if not with_boxes:
@@ -273,6 +281,7 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
     assert maps["discrepancy_evidence_complete_by_interval"][1].any()
     assert np.isfinite(maps["discrepancy_score_map"]).any()
     assert context["receiver_sources"][1]["policy"] == "canonical_legacy_pair_reference"
+    assert "metric_flow" in context and "metric_flow" not in inputs
 
 
 def test_all_frame_count_box_motion_support():
@@ -287,13 +296,18 @@ def test_all_frame_count_box_motion_support():
 
 
 @pytest.mark.parametrize("stage", ["signal", "projection", "full"])
-def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("entity_search", [False, True])
+def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monkeypatch, stage, entity_search):
     from tests.test_bev_flow_ablations import script
     from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_projection, ground_grid
     from shadow_occ.annotation.physics_motion import plane_basis
     from tests.test_bev_flow import example
     module = script("discover_shadow_video")
     inputs = video_case(3)
+    if entity_search:
+        inputs["receiver"][:] = False
+        inputs["entity_occlusion_mask"] = np.ones_like(inputs["receiver"])
+        inputs["search_domain"] = np.ones_like(inputs["receiver"])
     pairs, images, grounds, _, _ = example()
     frames = [pairs[0]["frames"][0], pairs[1]["frames"][0], pairs[1]["frames"][1]]
     grid = BEVFlowConfig(extent_m=4).grid()
@@ -304,6 +318,10 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
         "sample_tokens": ["s0", "s1", "s2"], "receiver_sources": [], "exposures": [],
         "occupied": np.zeros((3, 16, 16), bool), "coordinates": [np.zeros((16, 16, 2))]*3,
         "observed_flow": inputs["observed_flow"], "expected_flow": inputs["expected_flow"]}
+    rng = np.random.default_rng(7)
+    spatial = rng.normal(size=(16, 16, 8)).astype(np.float32)
+    context.update(spatial_features=np.stack([spatial]*3), spatial_feature_valid=inputs["receiver"].copy(),
+        metric_flow=np.zeros((2, 16, 16, 2), np.float32), metric_flow_valid=np.ones((2, 16, 16), bool))
     class Writer:
         def __init__(self, *args):
             self.frames = 0
@@ -328,12 +346,22 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
         assert archive["shadow_target_bev"].shape == (16, 16)
         assert set(np.unique(archive["shadow_target_bev"])) <= {1, 255}
         assert (archive["shadow_owner_id"] == -1).all()
+        if entity_search:
+            assert (archive["shadow_target_bev"] == 255).all()
+            assert not archive["receiver_valid_by_frame"].any()
+            assert archive["search_valid_by_frame"].any()
         assert "bev_feature_change" not in archive.files  # interval maps live in pair_evidence
     with np.load(tmp_path/"clip/pair_evidence.npz", allow_pickle=False) as archive:
         assert "bev_feature_change" in archive.files
+        assert "spatial_bev_displacement_m" in archive.files
+    with np.load(tmp_path/"clip/001_image.npz", allow_pickle=False) as archive:
+        assert archive["shadow_proposal_image"].shape == (64, 64)
+        assert set(np.unique(archive["shadow_target_image"])) <= {1, 255}
+    assert len((tmp_path/"clip/region_memory.jsonl").read_text().splitlines()) == 3
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
     assert protocol["stage"] == stage and protocol["bev_role"] == "context"
+    assert len(protocol["modules"]) == 4
     review = json.loads((tmp_path/"clip/reviewed_signals.jsonl").read_text().strip())
     assert "projection_capacity" not in review
     assert "projection_oracle_capacity" in review and "projection_selected_direction" in review

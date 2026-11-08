@@ -28,12 +28,14 @@ class VideoShadowConfig:
     maximum_gap_seconds: float = 1.5
     link_distance_m: float = 4.0
     minimum_link_score: float = .35
+    minimum_observed_appearance: float = .05
 
     def validate(self):
         values = np.asarray(list(asdict(self).values()), float)
         if (not np.isfinite(values).all() or (values <= 0).any()
                 or not 0 < self.grow_score < self.seed_score <= 1
                 or not 0 < self.minimum_link_score <= 1
+                or self.minimum_observed_appearance >= self.seed_score
                 or not isinstance(self.minimum_area, int) or not isinstance(self.memory_frames, int)):
             raise ValueError("Invalid video shadow configuration")
 
@@ -73,7 +75,7 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
                     caster_prior=None, entity_explanation=None, fb_error_px=None,
                     occlusion_mask=None, config=None, bev_role="context", entity_explanation_valid=None,
                     ground_motion_reference_valid=None, entity_suppression_mask=None,
-                    entity_occlusion_mask=None):
+                    entity_occlusion_mask=None, search_domain=None):
     """Discover on each valid frame pair, never the all-frame intersection.
 
     delta_L[t] is the exposure-corrected L(t+1)-L(t) at fixed world cells.
@@ -93,15 +95,22 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
             or features.shape[:3] != receiver.shape or feature_valid.shape != receiver.shape):
         raise ValueError("Video evidence must use one shared receiver grid")
     receiver = receiver & np.isfinite(lab).all(axis=-1)
-    before_suppression = receiver.copy()
+    search = receiver.copy() if search_domain is None else np.asarray(search_domain, bool) & np.isfinite(lab).all(axis=-1)
+    if search.shape != receiver.shape:
+        raise ValueError("Search observations must share the frame grid")
+    before_suppression = search.copy()
     suppressed = np.zeros_like(receiver) if entity_suppression_mask is None else np.asarray(entity_suppression_mask, bool)
     entity_occluded = np.zeros_like(receiver) if entity_occlusion_mask is None else np.asarray(entity_occlusion_mask, bool)
     if suppressed.shape != receiver.shape or entity_occluded.shape != receiver.shape:
         raise ValueError("Entity suppression and occlusion must share the frame grid")
     receiver = receiver & ~suppressed & ~entity_occluded
+    search = search & ~suppressed
+    if search_domain is None:
+        search &= ~entity_occluded
     pair_visible = receiver[:-1] & receiver[1:]
     finite_delta = np.isfinite(delta_L)
     comparable = pair_visible & np.broadcast_to(exposure_valid, delta_L.shape) & finite_delta
+    appearance_comparable = search[:-1] & search[1:] & np.broadcast_to(exposure_valid, delta_L.shape) & finite_delta
     chroma = np.linalg.norm(np.diff(lab[..., 1:], axis=0), axis=-1)
     color = np.where(np.isfinite(chroma), np.exp(-chroma/config.chroma_scale), 0)
     occluded = np.zeros(delta_L.shape, bool) if occlusion_mask is None else np.asarray(occlusion_mask, bool)
@@ -153,14 +162,14 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
     pair_score = np.zeros_like(delta_L, np.float32)
     pair_partial = np.zeros_like(pair_score)
     for index in range(length-1):
-        change = np.where(comparable[index], delta_L[index], 0)
+        change = np.where(appearance_comparable[index], delta_L[index], 0)
         darken = np.clip(-change/config.light_scale_L, 0, 1)*color[index]
         restore = np.clip(change/config.light_scale_L, 0, 1)*color[index]
         for frame, value in ((index+1, darken), (index, restore)):
             appearance[frame] = np.maximum(appearance[frame], value)
             score = np.clip(value*spatial[index]*(1-entity[index]), 0, 1)
             complete = np.where(complete_by_interval[index], score, 0)
-            partial_score = np.where(comparable[index] & ~physical_reference_valid[index], value*spatial[index], 0)
+            partial_score = np.where(appearance_comparable[index] & ~complete_by_interval[index], value*spatial[index], 0)
             discrepancy[frame] = np.maximum(discrepancy[frame], complete)
             partial[frame] = np.maximum(partial[frame], partial_score)
             complete_by_frame[frame] |= complete_by_interval[index]
@@ -173,27 +182,28 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
     boundary = np.zeros_like(appearance)
     for index in range(length):
         light = np.nan_to_num(lab[index, ..., 0])
-        support = receiver[index].astype(np.float32)
+        support = search[index].astype(np.float32)
         density = cv2.GaussianBlur(support, (0, 0), 4)
         mean = cv2.GaussianBlur(light*support, (0, 0), 4)/np.maximum(density, 1e-6)
-        static[index] = np.where(receiver[index], np.clip((1-light/np.maximum(mean, 1))/.12, 0, 1), 0)
+        static[index] = np.where(search[index], np.clip((1-light/np.maximum(mean, 1))/.12, 0, 1), 0)
         gx = cv2.Sobel(light, cv2.CV_32F, 1, 0, ksize=3)/8
         gy = cv2.Sobel(light, cv2.CV_32F, 0, 1, ksize=3)/8
-        boundary[index] = np.where(receiver[index], np.clip(np.hypot(gx, gy)/config.light_scale_L, 0, 1), 0)
+        boundary[index] = np.where(search[index], np.clip(np.hypot(gx, gy)/config.light_scale_L, 0, 1), 0)
     prior = np.zeros_like(appearance) if caster_prior is None else np.asarray(caster_prior, np.float32)
     if prior.shape != receiver.shape or not np.isfinite(prior).all() or ((prior < 0) | (prior > 1)).any():
         raise ValueError("Caster prior must share video grid and lie in [0,1]")
     # A projected footprint alone never creates an observed candidate.
     caster_score = prior*np.maximum(appearance, static)
     dynamic = np.maximum(discrepancy, partial)
-    combined = np.maximum(dynamic, np.maximum(.5*static, .5*caster_score))*receiver
+    combined = np.maximum(dynamic, np.maximum(.5*static, .5*caster_score))*search
     source = ((appearance >= config.seed_score).astype(np.uint8)
               | ((discrepancy >= config.seed_score).astype(np.uint8) << 1)
               | ((caster_score*.5 >= config.seed_score).astype(np.uint8) << 2))
-    source[(static*.5 >= config.seed_score) & receiver] |= 1
+    source[(static*.5 >= config.seed_score) & search] |= 1
     return {**signatures, "appearance_score_map": np.maximum(appearance, .5*static),
         "entity_suppression_mask": suppressed, "entity_occlusion_mask": entity_occluded,
-        "entity_search_removed_mask": before_suppression & ~receiver,
+        "entity_search_removed_mask": before_suppression & ~search,
+        "search_valid_by_frame": search,
         "discrepancy_score_map": np.where(complete_by_frame, discrepancy, np.nan),
         "discrepancy_evidence_complete": complete_by_frame,
         "appearance_partial_score_map": partial, "dynamic_discovery_score_map": dynamic,
@@ -267,7 +277,8 @@ class ShadowRegionMemory:
         self.next_id = 1
         self.last_timestamp = None
 
-    def update(self, regions, timestamp, *, predicted_shift_xy=None):
+    def update(self, regions, timestamp, *, predicted_shift_xy=None, receiver=None, occlusion=None,
+               projection_masks=None):
         if self.last_timestamp is not None and timestamp <= self.last_timestamp:
             raise ValueError("Region memory requires strictly increasing timestamps")
         self.last_timestamp = timestamp
@@ -279,6 +290,7 @@ class ShadowRegionMemory:
         for row, identity in enumerate(identities):
             previous = self.entries[identity]
             old = previous["mask"]
+            projected = (projection_masks or {}).get(identity)
             if predicted_shift_xy is not None:
                 shift = np.asarray(predicted_shift_xy)*((timestamp-previous["timestamp"])/1e6)
                 matrix = np.array([[1, 0, shift[0]/self.resolution], [0, 1, shift[1]/self.resolution]], np.float32)
@@ -286,9 +298,13 @@ class ShadowRegionMemory:
             for col, region in enumerate(regions):
                 mask = region["mask"]
                 distance = np.linalg.norm(np.argwhere(old).mean(axis=0)-np.argwhere(mask).mean(axis=0))*self.resolution if old.any() else np.inf
+                if projected is not None and projected.any():
+                    distance = min(distance, np.linalg.norm(np.argwhere(projected).mean(axis=0)-np.argwhere(mask).mean(axis=0))*self.resolution)
                 if distance > self.config.link_distance_m:
                     continue
                 overlap = (old & mask).sum()/max(int((old | mask).sum()), 1)
+                if projected is not None:
+                    overlap = max(overlap, (projected & mask).sum()/max(int((projected | mask).sum()), 1))
                 spatial = np.exp(-distance/self.config.link_distance_m)
                 descriptors = previous["descriptor"], region["descriptor"]
                 if all(value is not None for value in descriptors):
@@ -296,6 +312,21 @@ class ShadowRegionMemory:
                     scores[row, col] = .35*overlap+.25*spatial+.4*similarity
                 else:
                     scores[row, col] = .6*overlap+.4*spatial
+                weight = 1.
+                for name, extra in (("appearance_descriptor", .15), ("boundary_descriptor", .1)):
+                    a, b = previous.get(name), region.get(name)
+                    if a is not None and b is not None:
+                        scores[row, col] += extra*float(np.clip(np.dot(a, b), 0, 1))
+                        weight += extra
+                old_casters, new_casters = set(previous.get("caster_candidates", [])), set(region.get("caster_candidates", []))
+                if old_casters and new_casters:
+                    scores[row, col] += .1*len(old_casters & new_casters)/len(old_casters | new_casters)
+                    weight += .1
+                a, b = previous.get("flow_correspondence", {}), region.get("flow_correspondence", {})
+                if a.get("displacement_m") is not None and b.get("displacement_m") is not None:
+                    scores[row, col] += .05*np.exp(-np.linalg.norm(np.subtract(a["displacement_m"], b["displacement_m"])))
+                    weight += .05
+                scores[row, col] /= weight
         assigned = {}
         if scores.size:
             rows, cols = linear_sum_assignment(-scores)
@@ -304,11 +335,37 @@ class ShadowRegionMemory:
                     assigned[col] = (identities[row], float(scores[row, col]))
         for entry in self.entries.values():
             entry["missed"] += 1
+            hidden = occlusion is not None and (entry["mask"] & occlusion).sum() >= .5*entry["mask"].sum()
+            entry["visibility_status"] = "occluded" if hidden else "unknown"
+            entry["receiver_visible_fraction"] = float((entry["mask"] & receiver).sum()/entry["mask"].sum()) if receiver is not None else None
         for index, region in enumerate(regions):
             identity, consistency = assigned.get(index, (self.next_id, None))
             if index not in assigned:
                 self.next_id += 1
             region.update(shadow_track_id=identity, temporal_consistency=consistency)
-            self.entries[identity] = {"mask": region["mask"].copy(), "descriptor": region["descriptor"],
-                                      "timestamp": timestamp, "missed": 0}
+            previous = self.entries.get(identity, {})
+            history = previous.get("appearance_history", [])[-7:]
+            if region.get("appearance_descriptor") is not None:
+                history = [*history, {"timestamp": timestamp, "descriptor": region["appearance_descriptor"].tolist()}]
+            region["visibility_status"] = ("visible" if region.get("image_mask_roi") is None
+                                            or region["image_mask_roi"].any() else "unknown")
+            self.entries[identity] = {**previous, **region, "mask": region["mask"].copy(), "descriptor": region["descriptor"],
+                "region_id": region.get("id"), "appearance_history": history,
+                "timestamp": timestamp, "missed": 0}
+            if self.entries[identity].get("projection_hint") is not None and "frame_slot" in region:
+                self.entries[identity]["projection_hint"] = {**self.entries[identity]["projection_hint"], "frame_slot": region["frame_slot"]}
         return regions
+
+    def remember_physics(self, region, rankings):
+        """Retain projection evidence, not a self-generated hard owner label."""
+        fits = [item for parent in rankings for item in [parent, *parent.get("alternatives", [])]
+                if item.get("shadow_fit_passes")]
+        tokens = sorted({item["instance_token"] for item in fits})
+        region["caster_candidates"] = tokens
+        entry = self.entries[region["shadow_track_id"]]
+        entry.update(region_id=region["id"], caster_candidates=tokens,
+            existence_score=max((item.get("existence_score", item["score"]) for item in fits), default=None))
+        if fits:
+            best = max(fits, key=lambda item: item.get("existence_score", item["score"]))
+            entry["projection_hint"] = {"instance_token": best["instance_token"], "light_id": best["light_id"],
+                "frame_slot": region["frame_slot"], "is_resolved_owner": False}

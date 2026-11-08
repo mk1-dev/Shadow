@@ -1,7 +1,117 @@
-# Track-Centric BEV / Flow Shadow Discovery
+# Entity-Shadow Disentangled Cross-Space Discovery
 
 This is a new executable path, not a replacement of the frozen A/B/C/D audit.
 It does not train a segmenter, VLM, lighting estimator, BEV encoder or OCC model.
+
+## Current Mainline: M1-M4
+
+```text
+RGB + 3D tracks + cached DIS + frozen mature BEV
+  M1  surface-motion entity decomposition -> suppression + caster Track Tokens
+  M2  current-only BEV matching <-> flow lifted to metric ground + Lab change
+  M3  caster/light projection + signed boundary motion + shadow-track history
+  M4  observed region memory + RGB boundary refinement + separate Shadow-BEV
+```
+
+The executable default is `--discovery-mode cross-space`. It actively unions
+metric cross-space proposals with the appearance/static/caster proposal paths.
+BEV is no longer just a region-linking descriptor in this mode.
+
+Two feature roles are deliberately separate:
+
+- `--feature-root`: existing temporal/context features for region identity and
+  caster descriptors.
+- `--spatial-feature-root`: independently exported `--history-mode current-only`
+  features for discovery. A current-only `--feature-root` can also supply both
+  roles. Temporal features are never silently relabeled as spatial evidence.
+
+Export the missing current-only cache with the existing mature model, not a new
+network. Use the SAME checkpoint/config and the matching train/val info file
+used for the temporal export:
+
+```bash
+conda activate drivevla
+python scripts/export_mature_bev.py \
+  --external-root "$UNIAD_ROOT" \
+  --checkpoint "$UNIAD_CHECKPOINT" \
+  --pairs "$SHADOW_VIDEO_PAIRS" \
+  --dataroot "$SHADOW_NUSC_ROOT" \
+  --ann-file "$UNIAD_ANN_FILE" \
+  --history-mode current-only \
+  --output-root outputs/mature_bev_current
+```
+
+Existing RGB, pair manifests, DIS, GT states and temporal BEV remain reusable.
+No pseudo-label dataset rebuild or model training is required. The main command
+rejects a temporal-only spatial cache with an actionable export instruction;
+`--discovery-mode appearance` explicitly selects the older base channel.
+
+M2 lifts each measured flow endpoint through the NEXT camera onto the receiver
+plane, then expresses its displacement in horizontal anchor-grid x/y meters.
+Current-only BEV descriptors are locally cosine-matched with uniqueness and
+reverse-cycle checks. `flow_bev_displacement_m` and `spatial_bev_displacement_m`
+therefore share units and axes. Their difference is never computed between
+image pixels and feature vectors. `spatial_bev_feature_change` retains raw
+`1-cosine`; ranking normalizes it to [0,1]. Missing/ambiguous matches remain NaN
+with false validity, not an anomalous displacement.
+
+The proposal channel combines existing observed appearance with confidence-
+weighted metric disagreement (weight 0.35) and normalized BEV change (0.25).
+It is a candidate score, not shadow truth. Unsupported entity explanation is
+reported as NaN and retained as partial evidence, not silently asserted absent.
+For physical acceptance, a proposed ground cell still needs observed appearance
+support (`minimum_observed_appearance=0.05`) and caster/light fit. Static
+appearance retains its own path, including when no temporal event is visible.
+
+M3 retains projection/light and signed-transition fits in each caster token's
+`shadow_projection_history`. Local owner scoring combines projection coverage,
+observed boundary fit against temporal counterfactuals (weight 0.25 when events
+exist), repeated support for the same shadow track/light, and caster identity
+consistency. No event is not a failed motion observation. The default CLI owner
+mode is `geometry+appearance+bev`; `physical` retains the older independent-
+shared-light owner policy. Ambiguous ownership does not remove shadow existence.
+
+M4 links with metric overlap/distance, boundary shape, Lab histogram, context-BEV
+descriptor, material correspondence and caster candidates. A caster/light
+projection supplies an ALTERNATIVE shifted old mask for linking/weak seeding,
+alongside the unshifted observation. It is not an owner label and never paints
+new pixels into a currently unobserved region. Material flow is not treated as
+shadow boundary speed. `visible -> occluded/unknown -> visible` keeps identity
+through the configured short gap without emitting missing-frame masks.
+
+Each observed region is refined on a small current-RGB ROI with a ground-
+restricted darkness/boundary watershed. The image mask is not just an enlarged
+BEV cell. Final weak labels require both this RGB support and the physical BEV
+projection. Three separate payloads are retained:
+
+- `*_image.npz`: actual image proposal, weak target and region IDs.
+- Per-frame BEV NPZ: raw proposals, RGB-supported continuous proposals, physical
+  weak targets, owner uncertainty and world coordinates.
+- `caster_memory.jsonl`: 3D caster states, appearance/BEV and projection history.
+
+`region_memory.jsonl` contains boundary/appearance histories, correspondence,
+caster candidates, visibility and separate existence/owner scores. None of these
+representations is merged into an occupancy label. Endpoints can have observed
+continuous proposals while physical weak targets remain unknown.
+
+```bash
+conda activate shadow_annotator
+python -u scripts/discover_shadow_video.py \
+  --pairs "$SHADOW_VIDEO_PAIRS" \
+  --analysis-root "$SHADOW_VIDEO_FLOW" \
+  --feature-root "$SHADOW_VIDEO_FEATURES" \
+  --spatial-feature-root outputs/mature_bev_current \
+  --clips "$SHADOW_VIDEO_CLIPS" \
+  --stage full --discovery-mode cross-space \
+  --owner-scoring geometry+appearance+bev \
+  --output-root outputs/shadow_mainline_v7
+```
+
+For Slurm, set `SHADOW_VIDEO_SPATIAL_FEATURES` in addition to the existing input
+variables and submit `slurm/discover_shadow_video.slurm` on a CPU partition.
+Frozen mature feature EXPORT uses the existing GPU environment; the subsequent
+cached-feature discovery path uses CPU. This is an algorithm implementation,
+not a claim of measured shadow quality or OCC improvement.
 
 ## Information Flow
 
@@ -26,7 +136,7 @@ It does not train a segmenter, VLM, lighting estimator, BEV encoder or OCC model
    prior, never an automatically assigned owner. Existence and association remain
    separate. Positive pixels must also lie in the selected physical projection.
 
-The default discrepancy is registered illumination change multiplied by one
+The appearance/geometry BASE discrepancy is registered illumination change multiplied by one
 minus supported entity explanation, where a physical motion reference is valid.
 There are two deliberately distinct domains:
 
@@ -57,7 +167,7 @@ The candidate union uses both channels, so missing coverage does not delete
 otherwise observable candidates or masquerade as entity exclusion. The source
 bit for discrepancy is reserved for the complete-evidence branch.
 
-Large flow error receives no shadow bonus:
+Raw image-flow error alone does not establish a shadow:
 material flow can follow the ground while a shadow boundary moves. A separate
 `ground_consistent_illumination_score` exposes exactly this case. Flow remains
 part of correspondence checking and exposure fitting.
@@ -100,8 +210,8 @@ at entity centers. Missing descriptors remain null. Existing checked GT triplets
 are retrieved FROM this memory for the physical search and final footprint;
 the requested clip track is not assigned as owner. Per-region physics decisions
 retain light compatibility, while `caster_memory_candidates` identifies the
-actual memory records used by that search. Descriptors are retained for future
-association refinement, not injected as an unvalidated owner score. This path
+actual memory records used by that search. The `physical` owner policy retains
+descriptors without using them; optional local-memory scoring is described below. This path
 uses GT identities; it does not silently equate model-predicted IDs with GT IDs.
 
 `--entity-motion-suppression off` disables the explicit motion-core suppression,
@@ -111,6 +221,75 @@ receiver already excludes volume rays, so incremental candidate removal can
 be zero. `additional_search_removed_cells` reports this honestly. The cached
 BEV backbone is unchanged; no FLOPs/speedup or association-quality gain is
 claimed without a measured comparison and independent reference.
+
+## Existing A/B Helper
+
+`--discovery-domain image-rays` adds observed entity-surface rays to candidate
+search BEFORE suppression. This is distinct from `receiver` (the default v5
+behavior). `search_valid_by_frame` can include entity observations, while
+`receiver_valid_by_frame` remains visible ground only. Box rays do not become
+observable ground. Entity appearances can generate partial proposals, never
+complete ground discrepancy. Physical ranking sees only the receiver portion
+of each region; final positive targets are also intersected with that domain.
+
+Run one paired experiment with shared input sampling:
+
+| Arm | Candidate domain | Entity suppression | Owner scoring |
+| --- | --- | --- | --- |
+| A_no_suppression | image-rays | off | geometry |
+| B_suppression_geometry | image-rays | on | geometry |
+| B_suppression_memory | image-rays | on | geometry+appearance+bev |
+
+A/B changes only explicit motion-core suppression. Caster memory, frozen BEV,
+raw DIS, exposure fit, ground reference, physical acceptance and light bank
+are identical. The third arm isolates descriptor weighting; it must retain
+exactly the same proposals and positive targets as B. Mask hashes verify this.
+The receiver-only default remains available for reproducing older results;
+changing only `--entity-motion-suppression` there is not the informative A/B.
+
+Owner modes (`--owner-scoring`):
+
+- `physical`: original factorized/independent-shared-light policy.
+- `geometry`: same linked shadow track, same candidate caster and same light
+  hypothesis across frames. Average current fit and other-frame mean fit.
+- `geometry+appearance+bev`: multiply that geometry score by caster identity
+  continuity: `1 - 0.2*(1-appearance_cosine) - 0.2*(1-BEV_cosine)`. Each cosine
+  compares the CASTER with its own matched observations in other supported
+  frames, never car appearance with a shadow or ground descriptor. Missing
+  descriptor terms contribute no penalty and provide no invented evidence.
+
+The two new modes are an experimental offline local-memory owner policy, not
+the old independent-light policy with a bonus attached. Both use the same
+minimum score 0.65, margin 0.05 and at least two distinct linked frames. Multiple
+regions in one frame do not supply extra temporal votes. Different shadow IDs,
+failed physical fits and mismatched light IDs cannot supply owner support.
+The new modes do not change shadow existence. An assigned owner's pixel mask
+is the intersection of the existing positive target and its own physical
+footprint; other positive pixels remain unresolved. None of these scores is
+a calibrated probability or a measured association accuracy.
+
+```bash
+python -u scripts/compare_shadow_entity_ab.py \
+  --pairs "$SHADOW_VIDEO_PAIRS" \
+  --analysis-root "$SHADOW_VIDEO_FLOW" \
+  --feature-root "$SHADOW_VIDEO_FEATURES" \
+  --clips "$SHADOW_VIDEO_CLIPS" \
+  --output-root outputs/shadow_entity_ab
+# Or: sbatch -p AMD slurm/compare_shadow_entity_ab.slurm
+```
+
+This CPU-only runner samples each clip once and gives the three arms identical
+arrays and caster observations. `summary.json` reports candidate cells,
+entity-contaminated candidate cells, weak-positive cells, assigned owner cells,
+resolved regions, and stage timings. Shared BEV/flow sampling is timed separately;
+total runtime includes visualization/export. Fixed-order single-pass timings
+are diagnostics, not a repeated runtime benchmark or backbone FLOP reduction.
+
+Optional `--review-regions` uses the same independent-mask manifest as the
+single-run script. Shadow preservation and proposal coverage use eligible
+review cells on the common ray grid, not image-resolution IoU. Without
+independent masks these metrics are null, not inferred from pseudo labels.
+The report does not call weak acceptance a measured precision/recall gain.
 
 ## Three Decisive Stages
 
@@ -197,6 +376,7 @@ python -u scripts/discover_shadow_video.py \
   --pairs /path/to/pairs/pairs.jsonl \
   --analysis-root /path/to/flow \
   --feature-root /path/to/mature_bev \
+  --spatial-feature-root /path/to/current_only_bev \
   --clips /path/to/selected_clips.jsonl \
   --stage signal --bev-role context \
   --output-root outputs/shadow_video_signal
@@ -210,7 +390,8 @@ required. `slurm/discover_shadow_video.slurm` exposes the same paths through
 partition, e.g. `sbatch -p AMD slurm/discover_shadow_video.slurm`.
 Entity options are also exposed as `SHADOW_VIDEO_ENTITY_SUPPRESSION`,
 `SHADOW_VIDEO_ENTITY_CORE_MARGIN_PX`, `SHADOW_VIDEO_ENTITY_MAX_RESIDUAL_PX`,
-and `SHADOW_VIDEO_ENTITY_MAX_FB_ERROR_PX`.
+and `SHADOW_VIDEO_ENTITY_MAX_FB_ERROR_PX`. Single-run domain and owner modes
+use `SHADOW_VIDEO_DISCOVERY_DOMAIN` and `SHADOW_VIDEO_OWNER_SCORING`.
 
 ## Outputs
 
@@ -235,8 +416,10 @@ and `SHADOW_VIDEO_ENTITY_MAX_FB_ERROR_PX`.
 - `*_target.png`: image trimap, `1` for physically supported weak foreground and
   `255` for unknown. Rejected candidates do not become negative labels.
 
-Version `track-centric-appearance-geometry-video-v5` adds motion-matched entity
-cores and an independently retained, consumed caster memory. V4's separation
+Version `entity-shadow-disentangled-video-v7` adds metric current-only BEV/flow
+discovery and RGB-refined temporal region representation. V6's separate candidate
+and label domains, V5's
+motion-matched entity cores and retained caster memory, V4's separation
 of box-surface motion from the ground motion reference, V3's complete/partial split and separate
 oracle/selected-direction review metrics are retained. Per-frame proposal capacity remains
 `projection_capacity`, explicitly marked as not shadow ground truth.

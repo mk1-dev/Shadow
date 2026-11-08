@@ -258,10 +258,8 @@ def image_mask_to_bev(mask, projection, world):
     return (sample_at(mask.astype(np.uint8), coordinates, nearest=True) > 0) & valid.reshape(world.shape[:2])
 
 
-def bev_mask_to_image(mask, projection, basis_world, grid, image_shape):
-    """Nearest-cell pullback, to be intersected with actual observed image support."""
-    if mask.shape != grid.shape:
-        raise ValueError("BEV mask and metric grid differ")
+def bev_image_cell_indices(projection, basis_world, grid, image_shape):
+    """Reusable image-to-grid lookup for all regions in one camera frame."""
     yy, xx = np.indices(image_shape)
     matrix = np.asarray(projection) @ np.asarray(basis_world)
     if np.linalg.cond(matrix) > 1e10:
@@ -272,6 +270,19 @@ def bev_mask_to_image(mask, projection, basis_world, grid, image_shape):
     xy[valid] = (coordinates[:2, valid]/coordinates[2, valid]).T
     i, j, inside = grid.xy_to_ij(xy)
     selected = valid & inside
-    output = np.zeros(xx.size, bool)
-    output[selected] = mask[i[selected], j[selected]]
+    output = np.full(xx.size, -1, np.int32)
+    output[selected] = i[selected]*grid.shape[1]+j[selected]
     return output.reshape(image_shape)
+
+
+def bev_mask_to_image(mask, projection, basis_world, grid, image_shape, *, cell_indices=None):
+    """Nearest-cell pullback, to be intersected with actual observed image support."""
+    if mask.shape != grid.shape:
+        raise ValueError("BEV mask and metric grid differ")
+    cells = bev_image_cell_indices(projection, basis_world, grid, image_shape) if cell_indices is None else cell_indices
+    if cells.shape != image_shape:
+        raise ValueError("Image/grid lookup dimensions differ")
+    observed = cells >= 0
+    output = np.zeros(image_shape, bool)
+    output[observed] = mask.reshape(-1)[cells[observed]]
+    return output

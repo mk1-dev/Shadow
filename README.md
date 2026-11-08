@@ -7,13 +7,23 @@ explanations versus 2D flow and appearance**, followed by physics-grounded weak
 annotation. Reuse the mature UniAD/OpenDriveVLA BEVFormer as a frozen encoder;
 do not train a new BEV, lighting, memory or VLM model for this proof of concept.
 
-The executable video path has three research modules: cross-space discrepancy
-discovery, caster/light physical explanation, and temporal region refinement.
+The executable video path has four connected modules: surface-motion entity
+decomposition, metric BEV/flow cross-space discovery, caster/light physical
+reasoning, and temporal shadow representation.
 It exports continuous observed proposals, independently accepted weak masks,
 owner uncertainty and a separate Shadow-BEV layer. See
 [the video workflow](docs/shadow_video_discovery.md) for the clip manifest,
 CPU/HPC command and outputs. Shadow-aware OCC is the later application test,
 not an already demonstrated contribution.
+
+The current mainline uses independent `current-only` BEV features for local
+spatial correspondence and temporal/context BEV features for region identity.
+Image flow is lifted through the destination camera onto the same metric grid
+before comparison. Supply `--spatial-feature-root` alongside `--feature-root`;
+export that cache with the existing mature model's `--history-mode current-only`.
+No new model training or RGB/DIS/GT dataset rebuild is needed. The pipeline
+retains caster/light history, RGB-refined image masks, short-gap region memory
+and a separate Shadow-BEV instead of merging shadows into entity occupancy.
 
 The existing three-frame A/B/C/D pipeline remains a frozen baseline. Existing
 3D object GT supplies caster tracks; decoded mature-model 3D predictions provide
@@ -844,10 +854,18 @@ target or report Occupancy mIoU, RayIoU, and Semantic mIoU.
 The track-centric video path is documented in
 [docs/shadow_video_discovery.md](docs/shadow_video_discovery.md).
 Use `--stage signal`, `--stage projection`, then `--stage full` on the same
-clips. Default discovery does not reward large flow errors or assume that
-frozen BEV features are illumination invariant; BEV signals and region linking
+clips. Default discovery does not treat raw flow error as a shadow label or assume
+that frozen BEV features are illumination invariant; metric correspondence and region linking
 remain available, with the invariance hypothesis exposed as an explicit control.
 It uses frame-level receiver references, active discrepancy score maps,
 boundary-aware regions and BEV-aware temporal memory, then reuses the existing
 caster/light verifier. It exports separate proposal masks, weak labels and a
 Shadow-BEV layer without training OCC or changing the frozen audit recipes.
+
+For the mainline entity-suppression A/B, use
+`scripts/compare_shadow_entity_ab.py` or `slurm/compare_shadow_entity_ab.slurm`.
+It shares input sampling across an unsuppressed image-ray search, a suppressed
+search, and a separate geometry-plus-descriptor owner arm. Candidate search may
+observe entity surfaces; physical weak labels still require visible ground.
+The comparison reports candidate counts, stage runtime, weak positives and
+owner assignments. Shadow preservation requires independent review masks.
