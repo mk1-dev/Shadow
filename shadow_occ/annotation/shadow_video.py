@@ -13,6 +13,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 ENTITY_STATES = {0: "missing", 1: "explained", 2: "unexplained"}
+PHYSICAL_REFERENCE_SOURCES = {0: "missing", 1: "box_surface_motion", 2: "validated_ground_motion"}
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,9 @@ def bev_signatures(features, valid):
 def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, expected_flow,
                     fb_consistent, texture_support, features, feature_valid,
                     caster_prior=None, entity_explanation=None, fb_error_px=None,
-                    occlusion_mask=None, config=None, bev_role="context", entity_explanation_valid=None):
+                    occlusion_mask=None, config=None, bev_role="context", entity_explanation_valid=None,
+                    ground_motion_reference_valid=None, entity_suppression_mask=None,
+                    entity_occlusion_mask=None):
     """Discover on each valid frame pair, never the all-frame intersection.
 
     delta_L[t] is the exposure-corrected L(t+1)-L(t) at fixed world cells.
@@ -90,6 +93,12 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
             or features.shape[:3] != receiver.shape or feature_valid.shape != receiver.shape):
         raise ValueError("Video evidence must use one shared receiver grid")
     receiver = receiver & np.isfinite(lab).all(axis=-1)
+    before_suppression = receiver.copy()
+    suppressed = np.zeros_like(receiver) if entity_suppression_mask is None else np.asarray(entity_suppression_mask, bool)
+    entity_occluded = np.zeros_like(receiver) if entity_occlusion_mask is None else np.asarray(entity_occlusion_mask, bool)
+    if suppressed.shape != receiver.shape or entity_occluded.shape != receiver.shape:
+        raise ValueError("Entity suppression and occlusion must share the frame grid")
+    receiver = receiver & ~suppressed & ~entity_occluded
     pair_visible = receiver[:-1] & receiver[1:]
     finite_delta = np.isfinite(delta_L)
     comparable = pair_visible & np.broadcast_to(exposure_valid, delta_L.shape) & finite_delta
@@ -118,7 +127,19 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
     entity_state = np.zeros(delta_L.shape, np.uint8)
     entity_state[entity_valid & (entity > 0)] = 1
     entity_state[entity_valid & (entity == 0)] = 2
-    complete_by_interval = comparable & entity_valid
+    ground_reference = np.zeros(delta_L.shape, bool) if ground_motion_reference_valid is None else np.asarray(ground_motion_reference_valid, bool)
+    if ground_reference.shape != delta_L.shape:
+        raise ValueError("Ground motion reference must share the interval grid")
+    # Box-surface flow lives on entities; it must not be spread onto receivers.
+    # A receiver instead uses geometric ground motion validated by local texture
+    # anchors (including same-patch support when boundary flow is unavailable).
+    ground_reference = (ground_reference & pair_visible & ~occluded
+                        & np.isfinite(expected_flow).all(axis=-1))
+    reference_source = np.zeros(delta_L.shape, np.uint8)
+    reference_source[entity_valid & pair_visible & ~occluded] = 1
+    reference_source[ground_reference & ~entity_valid] = 2
+    physical_reference_valid = reference_source != 0
+    complete_by_interval = comparable & physical_reference_valid
     # The default does not assume BEV illumination invariance. Keep the old
     # hypothesis as an explicit control, while descriptors still link regions.
     stability = signatures["bev_pair_stability"]
@@ -139,7 +160,7 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
             appearance[frame] = np.maximum(appearance[frame], value)
             score = np.clip(value*spatial[index]*(1-entity[index]), 0, 1)
             complete = np.where(complete_by_interval[index], score, 0)
-            partial_score = np.where(comparable[index] & ~entity_valid[index], value*spatial[index], 0)
+            partial_score = np.where(comparable[index] & ~physical_reference_valid[index], value*spatial[index], 0)
             discrepancy[frame] = np.maximum(discrepancy[frame], complete)
             partial[frame] = np.maximum(partial[frame], partial_score)
             complete_by_frame[frame] |= complete_by_interval[index]
@@ -171,12 +192,17 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
               | ((caster_score*.5 >= config.seed_score).astype(np.uint8) << 2))
     source[(static*.5 >= config.seed_score) & receiver] |= 1
     return {**signatures, "appearance_score_map": np.maximum(appearance, .5*static),
+        "entity_suppression_mask": suppressed, "entity_occlusion_mask": entity_occluded,
+        "entity_search_removed_mask": before_suppression & ~receiver,
         "discrepancy_score_map": np.where(complete_by_frame, discrepancy, np.nan),
         "discrepancy_evidence_complete": complete_by_frame,
         "appearance_partial_score_map": partial, "dynamic_discovery_score_map": dynamic,
         "partial_evidence_candidate": partial >= config.seed_score, "proposal_score_map": combined,
         "caster_prior_map": prior, "entity_explanation_map": entity,
         "entity_explanation_valid_map": entity_valid, "entity_explanation_state": entity_state,
+        "ground_motion_reference_valid_map": ground_reference,
+        "physical_reference_valid_map": physical_reference_valid,
+        "physical_reference_source": reference_source,
         "discrepancy_evidence_complete_by_interval": complete_by_interval,
         "flow_present": flow_present, "fb_consistent": fb_consistent & flow_present,
         "flow_out_of_receiver": ~pair_visible, "flow_low_texture": pair_visible & ~texture_support,

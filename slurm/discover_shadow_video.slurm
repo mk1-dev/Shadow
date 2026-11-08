@@ -13,7 +13,7 @@ source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
 conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
-python -m pytest -q tests/test_shadow_video.py tests/test_receiver_explanations.py tests/test_physics_shadow_labels.py
+python -m pytest -q tests/test_shadow_video.py tests/test_entity_memory.py tests/test_receiver_explanations.py tests/test_physics_shadow_labels.py
 EXTRA=()
 if [[ -n "${SHADOW_VIDEO_REVIEW_REGIONS:-}" ]]; then
   EXTRA+=(--review-regions "$SHADOW_VIDEO_REVIEW_REGIONS")
@@ -25,4 +25,8 @@ python -u scripts/discover_shadow_video.py \
   --clips "${SHADOW_VIDEO_CLIPS:?Set the selected track clip JSONL}" \
   --output-root "${SHADOW_VIDEO_OUTPUT:?Set a new output directory}" \
   --stage "${SHADOW_VIDEO_STAGE:-full}" \
-  --bev-role "${SHADOW_VIDEO_BEV_ROLE:-context}" "${EXTRA[@]}"
+  --bev-role "${SHADOW_VIDEO_BEV_ROLE:-context}" \
+  --entity-motion-suppression "${SHADOW_VIDEO_ENTITY_SUPPRESSION:-on}" \
+  --entity-core-margin-px "${SHADOW_VIDEO_ENTITY_CORE_MARGIN_PX:-2.0}" \
+  --entity-max-residual-px "${SHADOW_VIDEO_ENTITY_MAX_RESIDUAL_PX:-2.0}" \
+  --entity-max-fb-error-px "${SHADOW_VIDEO_ENTITY_MAX_FB_ERROR_PX:-1.5}" "${EXTRA[@]}"

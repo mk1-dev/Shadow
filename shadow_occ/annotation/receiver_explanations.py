@@ -75,6 +75,18 @@ def attach_appearance_prior(arrays, frames, lookup, base):
     return arrays, {"sources": sources, "role": "appearance score only; cannot establish geometry or caster identity"}
 
 
+def _ray_box_entry(camera, endpoints, corners):
+    planes = ConvexHull(corners).equations
+    origin = planes[:, :3] @ camera+planes[:, 3]
+    rate = (endpoints-camera) @ planes[:, :3].T
+    parallel = np.abs(rate) < 1e-10
+    crossing = np.divide(-origin[None], rate, out=np.zeros_like(rate), where=~parallel)
+    enter = np.maximum(0, np.max(np.where(rate < -1e-10, crossing, -np.inf), axis=1))
+    leave = np.minimum(1, np.min(np.where(rate > 1e-10, crossing, np.inf), axis=1))
+    hit = (enter <= leave) & ~(parallel & (origin[None] > 1e-8)).any(axis=1)
+    return np.where(hit, enter, np.inf)
+
+
 def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=None):
     """Intersect camera-to-ground segments with all-class convex GT volumes.
 
@@ -90,6 +102,9 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
     flow_valid = np.zeros((length-1, *shape), bool)
     expected = np.full((length-1, *shape, 2), np.nan, np.float32)
     residual = np.full((length-1, *shape), np.nan, np.float32)
+    owner = np.full((length, *shape), -1, np.int32)
+    core_distance = np.full((length, *shape), np.nan, np.float32)
+    target_visible = np.zeros((length-1, *shape), bool)
     for slot, frame in enumerate(frames):
         projection = np.asarray(frame["projection_world_to_image"], np.float64)
         camera = np.linalg.solve(projection[:, :3], -projection[:, 3])
@@ -101,7 +116,7 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
         nearest = np.full(len(receivers), np.inf)
         next_volumes = ({value["instance_token"]: value for value in frames[slot+1]["object_volumes_world"]
                          if value.get("instance_token")} if slot < length-1 else {})
-        for volume in frame["object_volumes_world"]:
+        for volume_id, volume in enumerate(frame["object_volumes_world"]):
             corners = np.asarray(volume["corners_world"], np.float64)
             corner_uv, corner_depth, valid = project_world(corners, projection)
             if (corner_depth <= 0).all():
@@ -113,27 +128,28 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
             indices = np.flatnonzero(eligible)
             if not len(indices):
                 continue
-            planes = ConvexHull(corners).equations
-            origin = planes[:, :3] @ camera+planes[:, 3]
-            rate = directions[indices] @ planes[:, :3].T
-            parallel = np.abs(rate) < 1e-10
-            crossing = np.divide(-origin[None], rate, out=np.zeros_like(rate), where=~parallel)
-            enter = np.maximum(0, np.max(np.where(rate < -1e-10, crossing, -np.inf), axis=1))
-            leave = np.minimum(1, np.min(np.where(rate > 1e-10, crossing, np.inf), axis=1))
-            hit = ((enter <= leave) & (enter < 1-1e-5)
-                   & ~(parallel & (origin[None] > 1e-8)).any(axis=1)
-                   & (enter < nearest[indices]))
+            enter = _ray_box_entry(camera, receivers[indices], corners)
+            hit = (enter < 1-1e-5) & (enter < nearest[indices])
             indices, fraction = indices[hit], enter[hit]
             if not len(indices):
                 continue
             nearest[indices] = fraction
             support[slot].flat[indices] = True
+            owner[slot].flat[indices] = volume_id
+            core_distance[slot].flat[indices] = np.nan
+            if valid.all():
+                hull = cv2.convexHull(corner_uv.astype(np.float32)).reshape(-1, 2)
+                edges = np.roll(hull, -1, axis=0)-hull
+                offsets = uv[indices, None]-hull[None]
+                distances = np.abs(edges[None, :, 0]*offsets[..., 1]-edges[None, :, 1]*offsets[..., 0])
+                core_distance[slot].flat[indices] = np.min(distances/np.maximum(np.linalg.norm(edges, axis=1), 1e-8), axis=1)
             if slot == length-1:
                 continue
             # A nearer fallback/non-track box must clear any farther motion proxy.
             flow_valid[slot].flat[indices] = False
             expected[slot].reshape(-1, 2)[indices] = np.nan
             residual[slot].flat[indices] = np.nan
+            target_visible[slot].flat[indices] = False
             following = next_volumes.get(volume.get("instance_token"))
             if (volume.get("source") != "camera_time_interpolated_box" or following is None
                     or following.get("source") != "camera_time_interpolated_box"):
@@ -146,6 +162,16 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
             next_width, next_height = frames[slot+1]["image_size_wh"]
             good &= ((following_uv >= 0).all(axis=1) & (following_uv[:, 0] <= next_width-1)
                      & (following_uv[:, 1] <= next_height-1))
+            next_projection = np.asarray(frames[slot+1]["projection_world_to_image"], np.float64)
+            next_camera = np.linalg.solve(next_projection[:, :3], -next_projection[:, 3])
+            ray_length = np.linalg.norm(predicted_world-next_camera, axis=1)
+            unobscured = good.copy()
+            # Reject self-occlusion and nearer objects at the predicted surface,
+            # not at the unrelated ground endpoint of this image ray.
+            for next_volume in frames[slot+1]["object_volumes_world"]:
+                entry = _ray_box_entry(next_camera, predicted_world, np.asarray(next_volume["corners_world"]))
+                unobscured &= ~((1-entry)*ray_length > .05)
+            target_visible[slot].flat[indices] = unobscured
             observed = observed_flows[slot].reshape(-1, 2)[indices]
             good &= np.isfinite(observed).all(axis=1)
             if observed_flow_valid is not None:
@@ -156,7 +182,9 @@ def box_ray_evidence(world, frames, pixels, observed_flows, observed_flow_valid=
             residual[slot].flat[chosen] = np.linalg.norm(observed[good]-displacement, axis=1)
             flow_valid[slot].flat[chosen] = True
     return {"physical_ray_volume_support": support, "box_surface_flow_valid": flow_valid,
-            "box_surface_expected_flow_px": expected, "box_surface_flow_residual_px": residual}
+            "box_surface_expected_flow_px": expected, "box_surface_flow_residual_px": residual,
+            "box_surface_owner_index": owner, "box_surface_core_distance_px": core_distance,
+            "box_surface_target_visible": target_visible}
 
 
 def illumination_change(arrays, receiver_shape):

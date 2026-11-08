@@ -225,7 +225,8 @@ def test_legacy_frame_selection_is_deterministic_and_prefers_own_start_pair():
     assert a[key]["frame"]["ground_sha256"] == b[key]["frame"]["ground_sha256"] == "own_plane"
 
 
-def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_boxes", [False, True])
+def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path, monkeypatch, with_boxes):
     from shadow_occ.annotation.bev_flow import BEVFlowConfig
     from shadow_occ.annotation.data import checked_write_image, digest
     from tests.test_bev_flow import example
@@ -233,6 +234,11 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
     module = script("discover_shadow_video")
     pairs, images, grounds, _, _ = example()
     frames = [pairs[0]["frames"][0], pairs[1]["frames"][0], pairs[1]["frames"][1]]
+    if with_boxes:
+        corners = np.array([[x, y, z] for x in (-2.5, -1.5) for y in (-2.5, -1.5) for z in (0, 2)])
+        for frame in frames:
+            frame["object_volumes_world"] = [{"instance_token": "entity", "corners_world": corners.tolist(),
+                                             "source": "camera_time_interpolated_box"}]
     grounds[0][:] = False
     stats = {}
     for slot, frame in enumerate(frames):
@@ -252,10 +258,20 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
     inputs, context = module.sample_clip(pairs, frame_index(pairs), tmp_path, stats, tmp_path,
                                        tmp_path, BEVFlowConfig(extent_m=4))
     assert not inputs["receiver"][0].any()
-    assert inputs["receiver"][1:].all()
+    assert inputs["receiver"][1:].any()
+    if not with_boxes:
+        assert inputs["receiver"][1:].all()
     maps = video_proposals(**inputs)
     assert not maps["pair_correspondence_valid"][0].any()
-    assert maps["pair_correspondence_valid"][1].all()
+    assert maps["pair_correspondence_valid"][1].any()
+    assert not (inputs["entity_explanation_valid"] & maps["pair_correspondence_valid"]).any()
+    if with_boxes:
+        assert inputs["entity_explanation_valid"].any()
+    # The two domains are intentionally disjoint. A validated ground reference,
+    # not spreading box flow, must still make complete receiver evidence possible.
+    assert (maps["physical_reference_source"][1] == 2).any()
+    assert maps["discrepancy_evidence_complete_by_interval"][1].any()
+    assert np.isfinite(maps["discrepancy_score_map"]).any()
     assert context["receiver_sources"][1]["policy"] == "canonical_legacy_pair_reference"
 
 
@@ -389,6 +405,67 @@ def test_nonvisible_receivers_are_not_partial_appearance_evidence():
     assert np.isnan(maps["discrepancy_score_map"]).all()
     assert not maps["appearance_partial_score_map"].any()
     assert not maps["partial_evidence_candidate"].any()
+
+
+def test_ground_receiver_has_complete_reference_while_box_motion_remains_missing():
+    inputs = video_case()
+    ground = np.ones_like(inputs["delta_L"], bool)
+    maps = video_proposals(**inputs, ground_motion_reference_valid=ground)
+    assert not maps["entity_explanation_valid_map"].any()
+    assert not maps["entity_explanation_state"].any()
+    assert (maps["physical_reference_source"] == 2).all()
+    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert maps["proposal_source_bits"][1, 6, 6] == 3
+    assert not maps["partial_evidence_candidate"].any()
+
+
+def test_same_patch_ground_reference_does_not_require_boundary_flow_itself():
+    inputs = video_case()
+    inputs["fb_consistent"][:, 6, 6] = False
+    maps = video_proposals(**inputs, ground_motion_reference_valid=np.ones_like(inputs["delta_L"], bool))
+    assert not maps["flow_confidence_map"][:, 6, 6].any()
+    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert (maps["physical_reference_source"][:, 6, 6] == 2).all()
+
+
+def test_ground_reference_cannot_fill_invisible_occluded_or_nonfinite_geometry():
+    inputs = video_case()
+    inputs["receiver"][:, 4, 4] = False
+    inputs["expected_flow"][:, 5, 5] = np.nan
+    occluded = np.zeros_like(inputs["delta_L"], bool)
+    occluded[:, 6, 6] = True
+    maps = video_proposals(**inputs, ground_motion_reference_valid=np.ones_like(inputs["delta_L"], bool),
+                          occlusion_mask=occluded)
+    for y, x in ((4, 4), (5, 5), (6, 6)):
+        assert not maps["physical_reference_valid_map"][:, y, x].any()
+        assert np.isnan(maps["pair_discrepancy_score_map"][:, y, x]).all()
+    assert (maps["physical_reference_source"][:, 7, 7] == 2).all()
+
+
+def test_no_ground_or_entity_reference_preserves_partial_candidates():
+    inputs = video_case()
+    maps = video_proposals(**inputs, ground_motion_reference_valid=np.zeros_like(inputs["delta_L"], bool))
+    assert not maps["physical_reference_source"].any()
+    assert np.isnan(maps["discrepancy_score_map"]).all()
+    assert maps["appearance_partial_score_map"][1, 6, 6] > .9
+    assert maps["proposal_score_map"][1, 6, 6] > .9
+
+
+def test_zero_projection_overlap_does_not_select_light_zero_or_oracle_fallback():
+    from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage
+    bank = np.zeros((96, 8, 8), bool)
+    bank[:, :2, :2] = True
+    proposal = np.zeros((8, 8), bool)
+    proposal[5:7, 5:7] = True
+    report = projection_coverage(proposal, bank)
+    assert report["status"] == "no_supported_direction"
+    assert report["best_cover"] == report["best_iou"] == report["union_cover"] == 0
+    assert report["best_cover_light_id"] is report["best_iou_light_id"] is None
+    assert len(report["by_light"]) == 96
+    review = reviewed_projection_coverage(bank[0], bank, report["best_cover_light_id"])
+    assert review["projection_oracle_capacity"]["best_cover"] == 1
+    assert review["projection_selected_direction"]["light_id"] is None
+    assert review["projection_selected_direction"]["cover"] is None
 
 
 def test_review_projection_keeps_proposal_selected_direction_when_oracle_disagrees():

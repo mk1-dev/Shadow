@@ -17,14 +17,15 @@ from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_mask_to_image, bev
 from shadow_occ.annotation.cached_bev import sample_cached_bev
 from shadow_occ.annotation.data import checked_write_image, digest, load_array, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.frame_receiver import frame_index
+from shadow_occ.annotation.entity_memory import CasterMemory, EntityMotionConfig, match_entity_motion
 from shadow_occ.annotation.physics_io import check_pair_files, load_motion_analysis, read_evidence
 from shadow_occ.annotation.physics_labels import (
     LabelConfig, factorized_shadow_decision, footprint_mask, light_bank,
-    light_support_index, rank_hypotheses, window_tracks,
+    light_support_index, rank_hypotheses,
 )
 from shadow_occ.annotation.physics_motion import pair_evidence, project_world, sample_at
 from shadow_occ.annotation.receiver_explanations import box_ray_evidence
-from shadow_occ.annotation.shadow_video import ENTITY_STATES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
+from shadow_occ.annotation.shadow_video import ENTITY_STATES, PHYSICAL_REFERENCE_SOURCES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
 from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage, summarize_signals
 from shadow_occ.utils.io import write_json
 
@@ -49,7 +50,8 @@ def select_chain(pairs, clip):
     return chain
 
 
-def sample_clip(chain, index, base, stats, analysis, feature_root, config):
+def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
+                entity_config=None, entity_suppression=True):
     """One fixed world grid; per-frame masks and independent valid frame pairs."""
     observations = [index[(chain[0]["scene_name"], chain[0]["camera"], chain[0]["frames"][0]["sample_data_token"])]]
     observations += [index[(pair["scene_name"], pair["camera"], pair["frames"][1]["sample_data_token"])] for pair in chain]
@@ -85,7 +87,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config):
         features.append(feature)
         feature_valid.append(supported & support)
     visible, occupied = np.stack(visible), np.stack(occupied)
-    observed, expected, fb, texture, deltas, comparable, fits, fb_error = ([] for _ in range(8))
+    observed, expected, fb, texture, deltas, comparable, fits, fb_error, ground_reference = ([] for _ in range(9))
     for slot, pair in enumerate(chain):
         evidence, _ = read_evidence(pair, stats, analysis)
         # Re-register cached flow against canonical frame support, without flow inference.
@@ -97,12 +99,20 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config):
         fb.append(sample_at(fresh["flow_reliable"].astype(np.float32), coordinates[slot]) >= .999)
         fb_error.append(sample_at(fresh["flow_fb_error_px"], coordinates[slot]))
         texture.append(sample_at(fresh["receiver_texture"].astype(np.float32), coordinates[slot]) >= .999)
+        ground_reference.append(sample_at(fresh["receiver_flow_supported"].astype(np.float32), coordinates[slot]) >= .999)
         fit = fresh["details"]["exposure"]
         fits.append(fit)
         comparable.append(bool(fit["valid"]))
         deltas.append(fit["scale"]*labs[slot+1][..., 0]+fit["offset_L"]-labs[slot][..., 0])
     observed, expected, fb = np.stack(observed), np.stack(expected), np.stack(fb)
     volumes = box_ray_evidence(world, frames, coordinates, observed, fb)
+    entity_config = entity_config or EntityMotionConfig()
+    entity_maps = match_entity_motion(volumes, fb, np.stack(fb_error), entity_config, enabled=entity_suppression)
+    caster_memory = CasterMemory(chain, frames)
+    for slot in range(len(frames)):
+        matched = entity_maps["entity_motion_matched_by_interval"][slot] if slot < len(chain) else np.zeros(grid.shape, bool)
+        caster_memory.observe(slot, labs[slot], volumes["box_surface_owner_index"][slot], matched,
+            feature_root, observations[slot]["sample_token"], sample_cached_bev)
     receiver = visible & ~occupied & ~volumes["physical_ray_volume_support"]
     entity_good = volumes["box_surface_flow_valid"] & fb
     ground_error = np.linalg.norm(observed-expected, axis=-1)
@@ -113,11 +123,16 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config):
         "expected_flow": expected, "fb_consistent": fb, "texture_support": np.stack(texture),
         "features": np.stack(features), "feature_valid": np.stack(feature_valid),
         "entity_explanation": entity_fit.astype(np.float32), "entity_explanation_valid": entity_good,
+        "ground_motion_reference_valid": np.stack(ground_reference),
+        "entity_suppression_mask": entity_maps["entity_suppression_mask"],
+        "entity_occlusion_mask": entity_maps["entity_occlusion_mask"],
         "fb_error_px": np.stack(fb_error),
         "occlusion_mask": volumes["physical_ray_volume_support"][:-1] | volumes["physical_ray_volume_support"][1:]}, {
         "frames": frames, "images": images, "grounds": grounds, "world": world,
         "plane": plane, "basis": basis, "anchor": anchor, "grid": grid,
         "projection": bev_projection(anchor, grid), "exposures": fits, "coordinates": coordinates,
+        "entity_maps": entity_maps, "caster_memory": caster_memory,
+        "entity_motion_config": asdict(entity_config), "entity_suppression_enabled": entity_suppression,
         "observed_flow": observed, "expected_flow": expected, "occupied": occupied,
         "sample_tokens": [item["sample_token"] for item in observations],
         "receiver_sources": [{"camera_token": frame["sample_data_token"], "ground_sha256": frame["ground_sha256"],
@@ -133,6 +148,8 @@ def caster_priors(chain, context, selected_track, directions, *, project=True):
             if obj["instance_token"] == selected_track:
                 states[slot] = np.asarray(obj["landmarks_world_t"])
                 states[slot+1] = np.asarray(obj["landmarks_world_next"])
+    if "caster_memory" in context:
+        states = context["caster_memory"].states(selected_track)
     prior = np.zeros((len(frames), *shape), np.float32)
     banks, valid_banks = {}, {}
     for slot, points in states.items():
@@ -170,6 +187,10 @@ def panel(image, context, slot, maps, regions, proposed, accepted):
         if valid.all():
             hull = cv2.convexHull(np.rint(np.clip(uv, -10000, 10000)).astype(np.int32))
             cv2.polylines(boxes, [hull], True, (80, 200, 80), 1)
+    for y, x in np.argwhere(maps["entity_suppression_mask"][slot]):
+        point = context["coordinates"][slot][y, x]
+        if np.isfinite(point).all() and (point >= 0).all():
+            cv2.circle(boxes, tuple(np.rint(point).astype(int)), 2, (255, 240, 0), -1)
     bev = heat(maps["proposal_score_map"][slot])
     for region in regions:
         cv2.drawContours(bev, cv2.findContours(region["mask"].astype(np.uint8), cv2.RETR_EXTERNAL,
@@ -199,7 +220,7 @@ def panel(image, context, slot, maps, regions, proposed, accepted):
     residual = maps["ground_motion_residual_px"][interval]
     delta = context["delta_L"][interval]
     projection = context.get("projection_review_mask", np.zeros_like(regions[0]["mask"]) if regions else np.zeros(bev.shape[:2], bool))
-    tiles = [(image, "RGB"), (boxes, "3D GT projection"),
+    tiles = [(image, "RGB"), (boxes, "3D GT / matched cores cyan"),
              (flow_panel, "flow: observed yellow / geometry blue"),
              (heat(.5+delta/24), "A: signed illumination change"),
              (heat(residual/6), "B: flow residual (not shadow speed)"),
@@ -225,9 +246,13 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     if stage not in {"signal", "projection", "full"}:
         raise ValueError("Video stage must be signal, projection or full")
     output.mkdir(parents=True, exist_ok=False)
+    if "caster_memory" not in context:
+        context["caster_memory"] = CasterMemory(chain, context["frames"])
+    caster_memory = context["caster_memory"]
     directions = light_bank()
     prior = caster_priors(chain, context, clip["track_id"], directions, project=stage != "signal")
     maps = video_proposals(**inputs, caster_prior=prior, config=config, bev_role=bev_role)
+    maps.update(context.get("entity_maps", {}))
     context["delta_L"] = inputs["delta_L"]
     regions_by_frame, pool = [], []
     memory = ShadowRegionMemory(context["grid"].resolution, config)
@@ -247,14 +272,16 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         for number, region in enumerate(regions):
             region["id"] = f"{slot:03d}_{number:03d}"
             if stage == "full" and 0 < slot < len(chain):
-                tracks, _ = window_tracks(chain[slot-1], chain[slot])
-                rank_maps = {"visible": inputs["receiver"][slot], "dark": region["mask"],
+                tracks = caster_memory.tracks(slot)
+                rank_maps = {"visible": maps["receiver_valid_by_frame"][slot], "dark": region["mask"],
                     "onset": maps["onset"][slot], "recovery": maps["recovery"][slot],
                     "flow_supported": maps["flow_confidence_map"][slot-1:slot+1].any(axis=0) > 0,
                     "geometric_correspondence": maps["pair_correspondence_valid"][slot-1:slot+1].any(axis=0),
                     "same_patch_cycle": maps["onset"][slot] & maps["recovery"][slot]}
                 rankings, report = rank_hypotheses(region["mask"], rank_maps, tracks, context["plane"], context["basis"],
                     context["projection"], directions, physical_config, polygon_cache=polygon_cache)
+                region["caster_memory_candidates"] = [caster_memory.association_context(track["instance_token"], slot)
+                                                       for track in tracks]
                 candidate = {"id": region["id"], "scene_name": clip["scene_name"],
                     "official_split": chain[0]["official_split"],
                     "frame_tokens": [value["sample_data_token"] for value in context["frames"][slot-1:slot+2]],
@@ -265,7 +292,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         regions_by_frame.append(regions)
     support_index = light_support_index(pool)
     rows, video, reviewed_rows = [], None, []
-    owner_tokens = sorted({volume["instance_token"] for frame in context["frames"] for volume in frame["object_volumes_world"]})
+    owner_tokens = sorted(caster_memory.records)
     try:
         for slot, (frame, image, regions) in enumerate(zip(context["frames"], context["images"], regions_by_frame)):
             proposal = np.zeros(context["grid"].shape, bool)
@@ -285,9 +312,8 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                         "association": None, "reason": "endpoint_missing_two_sided_physics" if stage == "full" else "physics_not_run"}
                 if decision["shadow_accepted"]:
                     hypothesis = decision["selected"]
-                    selected_volume = next(volume for volume in frame["object_volumes_world"]
-                                           if volume["instance_token"] == hypothesis["instance_token"])
-                    supported_mask = mask & footprint_mask(selected_volume["corners_world"], context["plane"],
+                    caster_state = caster_memory.states(hypothesis["instance_token"])[slot]
+                    supported_mask = mask & footprint_mask(caster_state[1:], context["plane"],
                         directions[hypothesis["light_id"]], context["projection"], mask.shape)
                     target[supported_mask] = 1
                     confidence[supported_mask] = region["rank_score"]
@@ -301,6 +327,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                     "area_cells": int(mask.sum()), "source_bits": np.unique(maps["proposal_source_bits"][slot][mask]).tolist(),
                     "complete_discrepancy_cells": int((mask & maps["discrepancy_evidence_complete"][slot]).sum()),
                     "partial_evidence_cells": int((mask & maps["partial_evidence_candidate"][slot]).sum()),
+                    "caster_memory_candidates": region.get("caster_memory_candidates", []),
                     "physics": decision})
             bank = context["caster_projection_bank"].get(slot, np.zeros((0, *target.shape), bool))
             bank_valid = context["caster_projection_valid"].get(slot, np.ones(len(bank), bool))
@@ -347,8 +374,13 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                                     directions_world=directions, projection_valid=bank_valid)
             rows.append({"frame_token": frame["sample_data_token"], "timestamp": frame["camera_timestamp"],
                 "evidence": str(path), "regions": frame_rows, "positive_cells": int(positive.sum()),
+                "entity_suppressed_cells": int(maps["entity_suppression_mask"][slot].sum()),
+                "entity_occluded_cells": int(maps["entity_occlusion_mask"][slot].sum()),
+                "additional_search_removed_cells": int(maps["entity_search_removed_mask"][slot].sum()),
+                "entity_surface_index_to_instance_token": [volume["instance_token"] for volume in frame["object_volumes_world"]],
                 "projection_capacity": coverage,
-                "selected_direction": {"light_id": best_id, "selection_source": "observed_proposal_best_cover_without_review_masks"},
+                "selected_direction": {"light_id": best_id, "status": coverage["status"],
+                    "selection_source": "observed_proposal_best_cover_without_review_masks"},
                 "requested_track_id": clip["track_id"], "requested_track_is_not_owner_gt": True})
     finally:
         if video is not None:
@@ -357,12 +389,22 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         observed_flow_px=inputs["observed_flow"], expected_flow_px=inputs["expected_flow"],
         **{key: value for key, value in maps.items() if value.shape[0] == len(chain)})
     write_rows(output/"frames.jsonl", rows)
+    write_rows(output/"caster_memory.jsonl", caster_memory.rows())
     write_rows(output/"reviewed_signals.jsonl", reviewed_rows)
-    write_json(output/"protocol.json", {"protocol": "track-centric-appearance-geometry-video-v3", "clip": clip,
+    write_json(output/"protocol.json", {"protocol": "track-centric-appearance-geometry-video-v5", "clip": clip,
         "stage": stage, "bev_role": bev_role,
-        "discrepancy_definition": "registered illumination change * (1-entity explanation) only where entity coverage is valid",
+        "discrepancy_definition": "registered illumination change * (1-supported entity explanation) with a validated ground or entity motion reference",
         "entity_state_legend": ENTITY_STATES,
-        "partial_evidence_contract": "missing entity coverage retains appearance candidates, not evidence of entity exclusion; incomplete discrepancy is NaN",
+        "entity_motion_config": context.get("entity_motion_config", asdict(EntityMotionConfig())),
+        "entity_suppression_enabled": context.get("entity_suppression_enabled", True),
+        "entity_suppression_contract": "front box-surface proxy + image-pixel core margin + FB-valid flow match + predicted surface visibility; never whole 2D rectangles",
+        "entity_map_coordinates": "fixed world receiver-ray grid; entity surface along ray, occluded ground endpoint; not dense image segmentation",
+        "caster_memory_contract": "all GT identities retained independently of suppression; checked memory triplets drive caster/light search; appearance and BEV descriptors retained, not owner truth",
+        "entity_occlusion_contract": "unmatched or boundary box rays remain unobservable ground, never background negatives; last frame has no outgoing suppression prediction",
+        "compute_contract": "cached BEV backbone unchanged; existing GT receiver exclusion can make incremental search removal zero",
+        "physical_reference_source_legend": PHYSICAL_REFERENCE_SOURCES,
+        "ground_reference_contract": "canonical per-pair ground geometry validated by direct or same-patch textured DIS anchors; never copied box motion or inferred free space",
+        "partial_evidence_contract": "missing physical motion reference retains appearance candidates; incomplete discrepancy is NaN; entity state remains missing on receivers without box-surface predictions",
         "projection_review_contract": "oracle capacity optimizes on reference; selected direction is frozen on proposals before reading review masks",
         "bev_role_contract": "context=descriptors/linking only; stability=explicit invariance hypothesis; off=no BEV linking",
         "discovery_config": asdict(config), "physics_config": asdict(physical_config),
@@ -378,6 +420,9 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         "flow_occlusion": "FB inconsistency is not an occlusion label; occlusion cause unknown",
         "training_performed": False, "is_shadow_gt": False})
     return {"id": clip["id"], "frames": len(rows), "regions": sum(len(row["regions"]) for row in rows),
+            "entity_suppressed_cells": sum(row["entity_suppressed_cells"] for row in rows),
+            "additional_search_removed_cells": sum(row["additional_search_removed_cells"] for row in rows),
+            "caster_memory_tracks": len(caster_memory.records),
             "positive_cells": sum(row["positive_cells"] for row in rows), "output": str(output)}
 
 
@@ -394,10 +439,16 @@ def main():
     parser.add_argument("--grow-score", type=float, default=.18)
     parser.add_argument("--stage", choices=["signal", "projection", "full"], default="full")
     parser.add_argument("--bev-role", choices=["context", "stability", "off"], default="context")
+    parser.add_argument("--entity-motion-suppression", choices=["on", "off"], default="on")
+    parser.add_argument("--entity-core-margin-px", type=float, default=2.0)
+    parser.add_argument("--entity-max-residual-px", type=float, default=2.0)
+    parser.add_argument("--entity-max-fb-error-px", type=float, default=1.5)
     parser.add_argument("--review-regions", help="Optional independent image masks: clip_id,frame_token,region_type,mask")
     args = parser.parse_args()
     config = VideoShadowConfig(seed_score=args.seed_score, grow_score=args.grow_score)
     config.validate()
+    entity_config = EntityMotionConfig(args.entity_core_margin_px, args.entity_max_residual_px, args.entity_max_fb_error_px)
+    entity_config.validate()
     output = Path(args.output_root).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
@@ -421,7 +472,8 @@ def main():
             check_pair_files(pair, Path(args.pairs).resolve().parent)
         inputs, context = sample_clip(chain, index, Path(args.pairs).resolve().parent,
             stats, Path(args.analysis_root).resolve(), args.feature_root,
-            BEVFlowConfig(extent_m=args.extent_m, resolution_m=args.resolution_m))
+            BEVFlowConfig(extent_m=args.extent_m, resolution_m=args.resolution_m),
+            entity_config=entity_config, entity_suppression=args.entity_motion_suppression == "on")
         clip_reviews = {}
         for review in reviews:
             if review["clip_id"] == clip["id"]:

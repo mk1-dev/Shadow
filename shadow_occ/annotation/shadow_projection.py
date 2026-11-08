@@ -29,6 +29,7 @@ def projection_coverage(observed, projections, light_ids=None, valid=None):
     area = int(observed.sum())
     if not len(projections) or not area:
         return {"observed_cells": area, **counts,
+            "status": "empty_reference" if not area else "no_valid_hypotheses",
             "best_cover": None, "best_iou": None, "union_cover": None,
             "best_cover_light_id": None, "best_iou_light_id": None, "by_light": []}
     intersections = (projections & observed).sum(axis=(1, 2))
@@ -36,10 +37,13 @@ def projection_coverage(observed, projections, light_ids=None, valid=None):
     covers = intersections/area
     ious = intersections/np.maximum(unions, 1)
     best_cover, best_iou = int(np.argmax(covers)), int(np.argmax(ious))
+    supported_direction = bool(intersections.any())
     return {"observed_cells": area, **counts,
+        "status": "supported_direction" if supported_direction else "no_supported_direction",
         "best_cover": float(covers[best_cover]), "best_iou": float(ious[best_iou]),
         "union_cover": float((observed & projections.any(axis=0)).sum()/area),
-        "best_cover_light_id": ids[best_cover], "best_iou_light_id": ids[best_iou],
+        "best_cover_light_id": ids[best_cover] if supported_direction else None,
+        "best_iou_light_id": ids[best_iou] if supported_direction else None,
         "by_light": [{"light_id": light_id, "intersection": int(intersection),
             "union": int(union), "cover": float(cover), "iou": float(iou)}
             for light_id, intersection, union, cover, iou in zip(ids, intersections, unions, covers, ious)]}
@@ -91,6 +95,7 @@ def summarize_signals(inputs, maps, slot, mask):
         "flow_residual_px": maps["ground_motion_residual_px"][intervals],
         "bev_feature_change": reference_bev,
         "entity_explanation": np.where(maps["entity_explanation_valid_map"][intervals], maps["entity_explanation_map"][intervals], np.nan),
+        "ground_reference_valid": maps["ground_motion_reference_valid_map"][intervals].astype(float),
         "discrepancy": maps["discrepancy_score_map"][slot:slot+1],
         "partial_appearance": maps["appearance_partial_score_map"][slot:slot+1],
     }

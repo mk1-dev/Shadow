@@ -12,6 +12,8 @@ It does not train a segmenter, VLM, lighting estimator, BEV encoder or OCC model
    occupancy or a calibrated free-ground classifier.
 3. Compare exposure-corrected appearance, measured DIS flow and geometrically
    expected flow. Compare available GT box-surface motion with ground motion.
+   Match high-confidence entity cores before discovery; retain entity identity
+   and observations independently in caster memory (details below).
 4. Propose from discrepancy, supplementary static appearance, and observed
    appearance inside caster/light search regions. A light projection or a flow
    error alone cannot create shadow evidence.
@@ -25,10 +27,30 @@ It does not train a segmenter, VLM, lighting estimator, BEV encoder or OCC model
    separate. Positive pixels must also lie in the selected physical projection.
 
 The default discrepancy is registered illumination change multiplied by one
-minus supported entity explanation, only where entity coverage is valid.
+minus supported entity explanation, where a physical motion reference is valid.
+There are two deliberately distinct domains:
+
+- Box-surface motion lives on visible entities and remains an exclusion or
+  competing-motion explanation. It is never copied or dilated onto ground.
+- Ground receivers use expected geometric ground motion validated by existing
+  `receiver_flow_supported` evidence: reliable textured DIS anchors or local
+  same-connected-ground-patch support. Boundary flow itself may be unreliable.
+
+`physical_reference_source` distinguishes `0=missing`, `1=box_surface_motion`,
+and `2=validated_ground_motion`. A ground reference requires visibility in both
+frames, finite expected motion, no volume occlusion, and actual local motion
+support. A projected grid or absence of a predicted object alone cannot provide
+this reference. Ground validation does not imply that a region is a shadow or
+that all unannotated entities have been ruled out.
+
 `entity_explanation_state` distinguishes `0=missing`, `1=explained` (a supported
 nonzero explanation), and `2=unexplained` (a supported prediction with zero fit).
-No new acceptance threshold is introduced. When coverage is missing, observed
+It correctly remains missing on receivers lacking box-surface predictions;
+ground support does not relabel it as an entity prediction. The complete branch
+uses either supported physical reference, avoiding the v3 contradiction of
+requiring box-surface coverage inside an explicitly entity-free receiver.
+
+No new acceptance threshold is introduced. When both references are missing, observed
 appearance still proposes regions through `appearance_partial_score_map`, while
 `discrepancy_score_map` is NaN and `discrepancy_evidence_complete` is false.
 The candidate union uses both channels, so missing coverage does not delete
@@ -45,6 +67,50 @@ descriptors participate in region assignment. `--bev-role context` (default)
 does not suppress proposals when BEV changes. `--bev-role stability` explicitly
 tests the old illumination-invariance hypothesis; `--bev-role off` also removes
 BEV descriptors from linking. Do not increase BEV weights to manufacture a gain.
+
+## Motion-Matched Entity Suppression and Caster Memory
+
+M1 first separates explained entity surfaces from the receiver search domain:
+
+`GT surface motion + DIS -> entity suppression + caster memory -> receiver discrepancy -> caster/light association`
+
+`entity_suppression_mask` requires a front box-surface ray hit, a projected
+silhouette-core margin of 2 image pixels, FB-valid flow with at most 1.5 px
+cycle error, and at most 2 px surface-motion residual. Predicted surface points
+must remain in the next image and not be hidden by the same or another box.
+Surface motion uses corresponding 3D points under an affine box transform,
+not a constant box-center displacement. This is a bounding-volume proxy,
+not pixel-perfect instance segmentation. All thresholds use the calibrated
+working image coordinates used by the cached DIS flow.
+
+The maps use the world receiver-RAY grid: an entity surface lies along a camera
+ray whose ground endpoint is occluded. They are not dense image instance masks.
+No match is spread onto nearby ground or propagated to the next ground cell.
+The last frame lacks outgoing motion evidence and has no new suppression claim.
+`entity_occlusion_mask` keeps all GT-volume ray support unavailable as ground;
+unmatched/boundary rays remain `entity_uncertain_mask`. Neither becomes a
+negative shadow training label. Adjacent observable shadow regions remain in
+the receiver search domain even if their flow resembles the vehicle's motion.
+
+`caster_memory.jsonl` retains every observed GT identity, including those with
+no matched pixels or temporarily outside the image. It stores camera-time 3D
+states, observed finite-difference velocities, projection history, normalized
+Lab histograms from matched surfaces, and BEV descriptors sampled separately
+at entity centers. Missing descriptors remain null. Existing checked GT triplets
+are retrieved FROM this memory for the physical search and final footprint;
+the requested clip track is not assigned as owner. Per-region physics decisions
+retain light compatibility, while `caster_memory_candidates` identifies the
+actual memory records used by that search. Descriptors are retained for future
+association refinement, not injected as an unvalidated owner score. This path
+uses GT identities; it does not silently equate model-predicted IDs with GT IDs.
+
+`--entity-motion-suppression off` disables the explicit motion-core suppression,
+not the geometric occlusion exclusion or caster memory. It is a same-input
+control, not permission to treat hidden ground as free space. The current GT
+receiver already excludes volume rays, so incremental candidate removal can
+be zero. `additional_search_removed_cells` reports this honestly. The cached
+BEV backbone is unchanged; no FLOPs/speedup or association-quality gain is
+claimed without a measured comparison and independent reference.
 
 ## Three Decisive Stages
 
@@ -85,6 +151,9 @@ appearance. Projection evaluation has two separate fields:
   the separately ranked physical verifier chose the same direction.
 
 A missing/invalid selected direction has missing metrics, not oracle fallback.
+If all valid directions have zero overlap, capacity reports
+`status=no_supported_direction`, both selected IDs are null, and numerical
+coverage stays zero. It does not select direction zero via `argmax`.
 Masks are evaluation-only; they
 never seed proposals, tune acceptance or enter training targets. Missing entity
 or receiver evidence is reported as missing rather than silently zero-filled.
@@ -123,7 +192,7 @@ missing samples or silently shorten a clip.
 ## Run on HPC
 
 ```bash
-python -m pytest -q tests/test_shadow_video.py tests/test_receiver_explanations.py
+python -m pytest -q tests/test_shadow_video.py tests/test_entity_memory.py tests/test_receiver_explanations.py
 python -u scripts/discover_shadow_video.py \
   --pairs /path/to/pairs/pairs.jsonl \
   --analysis-root /path/to/flow \
@@ -139,6 +208,9 @@ required. `slurm/discover_shadow_video.slurm` exposes the same paths through
 `SHADOW_VIDEO_CLIPS`, `SHADOW_VIDEO_OUTPUT`, `SHADOW_VIDEO_STAGE`,
 `SHADOW_VIDEO_BEV_ROLE`, and optional `SHADOW_VIDEO_REVIEW_REGIONS`. Submit with the site's CPU
 partition, e.g. `sbatch -p AMD slurm/discover_shadow_video.slurm`.
+Entity options are also exposed as `SHADOW_VIDEO_ENTITY_SUPPRESSION`,
+`SHADOW_VIDEO_ENTITY_CORE_MARGIN_PX`, `SHADOW_VIDEO_ENTITY_MAX_RESIDUAL_PX`,
+and `SHADOW_VIDEO_ENTITY_MAX_FB_ERROR_PX`.
 
 ## Outputs
 
@@ -152,15 +224,21 @@ partition, e.g. `sbatch -p AMD slurm/discover_shadow_video.slurm`.
   grid coordinates. Owner `-1` means unresolved; it is not the selected clip ID.
 - `pair_evidence.npz`: signed exposure-corrected light changes, raw measured and
   geometric flow, BEV changes, and flow validity/confidence/status maps.
+- `caster_memory.jsonl`: identities, geometry, motion, projection history and
+  separately retained appearance/BEV descriptors. Per-frame evidence exports
+  suppression/occlusion/uncertain masks; pair evidence retains matched motion,
+  residual and target visibility. Surface owner indices map to the per-frame
+  `entity_surface_index_to_instance_token` list, not the shadow-owner lookup.
 - `reviewed_signals.jsonl`: optional independent-region comparisons, not new
   pseudo labels. Actual camera intervals are retained in `protocol.json`;
   reading keyframe pairs does not create a denser camera stream.
 - `*_target.png`: image trimap, `1` for physically supported weak foreground and
   `255` for unknown. Rejected candidates do not become negative labels.
 
-Version `track-centric-appearance-geometry-video-v3` separates complete and
-partial evidence and replaces the ambiguous review `projection_capacity` field
-with oracle and selected-direction fields. Per-frame proposal capacity remains
+Version `track-centric-appearance-geometry-video-v5` adds motion-matched entity
+cores and an independently retained, consumed caster memory. V4's separation
+of box-surface motion from the ground motion reference, V3's complete/partial split and separate
+oracle/selected-direction review metrics are retained. Per-frame proposal capacity remains
 `projection_capacity`, explicitly marked as not shadow ground truth.
 
 FB inconsistency is not called an occlusion label. Occlusion support is explicitly
