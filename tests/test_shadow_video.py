@@ -32,7 +32,7 @@ def test_missing_remote_frame_does_not_clear_other_observed_pairs():
     inputs = video_case()
     inputs["receiver"][-1] = False
     maps = video_proposals(**inputs)
-    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert maps["dynamic_discovery_score_map"][1, 6, 6] > .9
     assert not maps["pair_correspondence_valid"][-1].any()
     assert maps["pair_correspondence_valid"][0].all()
     assert not maps["proposal_score_map"][-1].any()
@@ -41,8 +41,8 @@ def test_missing_remote_frame_does_not_clear_other_observed_pairs():
 def test_signed_changes_are_assigned_to_dark_observation_not_bright_endpoint():
     maps = video_proposals(**video_case())
     assert maps["onset"][1, 6, 6] and maps["recovery"][2, 6, 6]
-    assert not maps["discrepancy_score_map"][0, 6, 6]
-    assert not maps["discrepancy_score_map"][3, 6, 6]
+    assert not maps["dynamic_discovery_score_map"][0, 6, 6]
+    assert not maps["dynamic_discovery_score_map"][3, 6, 6]
 
 
 def test_missing_flow_is_not_motion_but_brightness_can_still_propose():
@@ -51,7 +51,7 @@ def test_missing_flow_is_not_motion_but_brightness_can_still_propose():
     maps = video_proposals(**inputs)
     assert not maps["flow_present"].any()
     assert not maps["flow_confidence_map"].any()
-    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert maps["dynamic_discovery_score_map"][1, 6, 6] > .9
 
 
 def test_flow_only_or_caster_prior_cannot_manufacture_shadow():
@@ -60,7 +60,7 @@ def test_flow_only_or_caster_prior_cannot_manufacture_shadow():
     inputs["delta_L"][:] = 0
     inputs["observed_flow"][:] = 100
     maps = video_proposals(**inputs, caster_prior=np.ones((5, 16, 16), np.float32))
-    assert not maps["discrepancy_score_map"].any()
+    assert not maps["dynamic_discovery_score_map"].any()
     assert not (maps["proposal_score_map"] >= VideoShadowConfig().grow_score).any()
 
 
@@ -70,8 +70,8 @@ def test_bev_change_is_observed_without_assuming_illumination_invariance():
     stable = video_proposals(**inputs)
     inputs["features"][1] *= -1
     changed = video_proposals(**inputs)
-    np.testing.assert_array_equal(stable["discrepancy_score_map"], changed["discrepancy_score_map"])
-    assert changed["discrepancy_score_map"][1, 6, 6] > .9
+    np.testing.assert_array_equal(stable["dynamic_discovery_score_map"], changed["dynamic_discovery_score_map"])
+    assert changed["dynamic_discovery_score_map"][1, 6, 6] > .9
     assert changed["bev_feature_change"][0, 6, 6] > stable["bev_feature_change"][0, 6, 6]
     np.testing.assert_array_equal(inputs["features"][0], original[0])
 
@@ -81,7 +81,7 @@ def test_bev_stability_is_an_explicit_hypothesis_control_not_default():
     inputs["features"][1] *= -1
     default = video_proposals(**inputs)
     control = video_proposals(**inputs, bev_role="stability")
-    assert default["discrepancy_score_map"][1, 6, 6] > control["discrepancy_score_map"][1, 6, 6]
+    assert default["dynamic_discovery_score_map"][1, 6, 6] > control["dynamic_discovery_score_map"][1, 6, 6]
 
 
 def test_geometry_following_flow_keeps_shadow_signal_without_error_bonus():
@@ -89,7 +89,7 @@ def test_geometry_following_flow_keeps_shadow_signal_without_error_bonus():
     matched = video_proposals(**inputs)
     inputs["observed_flow"][:] = 100
     mismatched = video_proposals(**inputs)
-    np.testing.assert_array_equal(matched["discrepancy_score_map"], mismatched["discrepancy_score_map"])
+    np.testing.assert_array_equal(matched["dynamic_discovery_score_map"], mismatched["dynamic_discovery_score_map"])
     assert matched["ground_consistent_illumination_score"][0, 6, 6] > .9
     assert mismatched["ground_consistent_illumination_score"][0, 6, 6] < .01
 
@@ -104,7 +104,9 @@ def test_unsupported_entity_scores_cannot_suppress_observed_illumination():
     inputs = video_case()
     maps = video_proposals(**inputs, entity_explanation=np.ones_like(inputs["delta_L"]),
                           entity_explanation_valid=np.zeros_like(inputs["delta_L"], bool))
-    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert np.isnan(maps["discrepancy_score_map"][1, 6, 6])
+    assert maps["appearance_partial_score_map"][1, 6, 6] > .9
+    assert maps["proposal_score_map"][1, 6, 6] > .9
 
 
 def test_fb_failure_is_not_claimed_to_be_occlusion():
@@ -132,7 +134,7 @@ def test_unknown_bev_features_do_not_claim_free_ground():
     inputs["feature_valid"][:] = False
     maps = video_proposals(**inputs)
     assert np.isnan(maps["bev_pair_stability"]).all()
-    assert maps["discrepancy_score_map"][1, 6, 6] > .9
+    assert maps["dynamic_discovery_score_map"][1, 6, 6] > .9
 
 
 def test_nonfinite_receiver_appearance_is_unknown_not_static_darkness():
@@ -316,7 +318,13 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
     assert protocol["stage"] == stage and protocol["bev_role"] == "context"
-    assert (tmp_path/"clip/reviewed_signals.jsonl").read_text().strip()
+    review = json.loads((tmp_path/"clip/reviewed_signals.jsonl").read_text().strip())
+    assert "projection_capacity" not in review
+    assert "projection_oracle_capacity" in review and "projection_selected_direction" in review
+    assert protocol["entity_state_legend"]["0"] == "missing"
+    with np.load(tmp_path/"clip/001.npz", allow_pickle=False) as archive:
+        assert "appearance_partial_score_map" in archive.files
+        assert not archive["discrepancy_evidence_complete"].any()
 
 
 def test_projection_capacity_does_not_confuse_max_cover_with_iou():
@@ -350,8 +358,66 @@ def test_reviewed_signals_are_distributions_not_new_training_targets():
     report = summarize_signals(inputs, maps, 1, shadow)
     assert report["region_cells"] == 25
     assert report["signals"]["flow_residual_px"]["mean"] == 0
-    assert report["signals"]["discrepancy"]["mean"] > .9
+    assert report["signals"]["discrepancy"]["mean"] is None
+    assert report["signals"]["partial_appearance"]["mean"] > .9
     np.testing.assert_array_equal(inputs["lab"], before)
+
+
+def test_entity_missing_and_supported_failure_have_distinct_evidence_without_losing_candidates():
+    inputs = video_case()
+    missing = video_proposals(**inputs)
+    supported = video_proposals(**inputs, entity_explanation=np.zeros_like(inputs["delta_L"]),
+                                entity_explanation_valid=np.ones_like(inputs["delta_L"], bool))
+    explained = video_proposals(**inputs, entity_explanation=np.ones_like(inputs["delta_L"]),
+                                entity_explanation_valid=np.ones_like(inputs["delta_L"], bool))
+    assert not missing["entity_explanation_state"].any()
+    assert (supported["entity_explanation_state"] == 2).all()
+    assert (explained["entity_explanation_state"] == 1).all()
+    assert np.isnan(missing["discrepancy_score_map"]).all()
+    assert supported["discrepancy_score_map"][1, 6, 6] > .9
+    assert not explained["discrepancy_score_map"].any()
+    assert missing["partial_evidence_candidate"][1, 6, 6]
+    assert missing["proposal_source_bits"][1, 6, 6] == 1
+    assert supported["proposal_source_bits"][1, 6, 6] == 3
+    np.testing.assert_array_equal(missing["proposal_score_map"], supported["proposal_score_map"])
+
+
+def test_nonvisible_receivers_are_not_partial_appearance_evidence():
+    inputs = video_case()
+    inputs["receiver"][:] = False
+    maps = video_proposals(**inputs)
+    assert np.isnan(maps["discrepancy_score_map"]).all()
+    assert not maps["appearance_partial_score_map"].any()
+    assert not maps["partial_evidence_candidate"].any()
+
+
+def test_review_projection_keeps_proposal_selected_direction_when_oracle_disagrees():
+    from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage
+    bank = np.zeros((2, 8, 8), bool)
+    bank[0, 2:4, 1:3] = True
+    bank[1, 2:4, 5:7] = True
+    proposal, reference = bank[0], bank[1]
+    selected = projection_coverage(proposal, bank)["best_cover_light_id"]
+    report = reviewed_projection_coverage(reference, bank, selected)
+    assert report["projection_oracle_capacity"]["best_cover_light_id"] == 1
+    assert report["projection_oracle_capacity"]["best_cover"] == 1
+    assert report["projection_selected_direction"]["light_id"] == 0
+    assert report["projection_selected_direction"]["cover"] == 0
+    changed = reviewed_projection_coverage(bank[0], bank, selected)
+    assert changed["projection_selected_direction"]["light_id"] == 0
+    assert changed["projection_selected_direction"]["cover"] == 1
+
+
+def test_review_projection_does_not_replace_missing_or_invalid_selection_with_oracle():
+    from shadow_occ.annotation.shadow_projection import reviewed_projection_coverage
+    bank = np.ones((2, 4, 4), bool)
+    report = reviewed_projection_coverage(bank[0], bank, None)
+    assert report["projection_oracle_capacity"]["best_cover"] == 1
+    assert report["projection_selected_direction"]["status"] == "not_selected"
+    assert report["projection_selected_direction"]["cover"] is None
+    report = reviewed_projection_coverage(bank[0], bank, 0, valid=np.array([False, True]))
+    assert report["projection_selected_direction"]["status"] == "invalid_direction"
+    assert report["projection_selected_direction"]["cover"] is None
 
 
 def test_reviewed_illumination_with_invalid_exposure_is_missing_not_evidence():

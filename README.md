@@ -57,9 +57,11 @@ Cloudy/weak/unknown windows are retained, and static shadows are not excluded.
 Use `slurm/tag_shadow_observability.slurm` for the existing audit-case pilot;
 it trains no model and compares the already frozen physical results by stratum.
 
-## Cross-Space Discovery
+## Cross-Space Discovery (Frozen Three-Frame Baseline)
 
-The default candidate path is now `--discovery-mode discrepancy`. First build
+This section describes the frozen three-frame candidate path, whose default is
+`--discovery-mode discrepancy`, not the video path's default `--bev-role context`.
+First build
 ground/GT/decoded-3D motion explanations, then compare projected motion and
 receiver appearance with observed flow/RGB on the entire valid receiver grid.
 The new branch does not require a local-darkness threshold, a component seed,

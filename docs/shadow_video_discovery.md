@@ -25,7 +25,17 @@ It does not train a segmenter, VLM, lighting estimator, BEV encoder or OCC model
    separate. Positive pixels must also lie in the selected physical projection.
 
 The default discrepancy is registered illumination change multiplied by one
-minus supported entity explanation. Large flow error receives no shadow bonus:
+minus supported entity explanation, only where entity coverage is valid.
+`entity_explanation_state` distinguishes `0=missing`, `1=explained` (a supported
+nonzero explanation), and `2=unexplained` (a supported prediction with zero fit).
+No new acceptance threshold is introduced. When coverage is missing, observed
+appearance still proposes regions through `appearance_partial_score_map`, while
+`discrepancy_score_map` is NaN and `discrepancy_evidence_complete` is false.
+The candidate union uses both channels, so missing coverage does not delete
+otherwise observable candidates or masquerade as entity exclusion. The source
+bit for discrepancy is reserved for the complete-evidence branch.
+
+Large flow error receives no shadow bonus:
 material flow can follow the ground while a shadow boundary moves. A separate
 `ground_consistent_illumination_score` exposes exactly this case. Flow remains
 part of correspondence checking and exposure fitting.
@@ -63,8 +73,19 @@ Optionally provide independently reviewed image regions with `--review-regions`:
 
 Supported region types are `shadow`, `stable_ground`, `material_boundary` and
 `entity`. `reviewed_signals.jsonl` reports finite/missing counts and distributions
-of illumination, flow, BEV, entity explanation and discrepancy, plus projection
-coverage against these independent regions. Masks are evaluation-only; they
+of illumination, flow, BEV, entity explanation, complete discrepancy and partial
+appearance. Projection evaluation has two separate fields:
+
+- `projection_oracle_capacity` selects the best direction on the review mask.
+  This is explicitly an oracle upper bound, never a generalization result.
+- `projection_selected_direction` evaluates the direction selected from the
+  automatic proposal before reading any review masks. It never reselects a
+  direction using the review mask. Its selection policy is recorded as
+  `observed_proposal_best_cover_without_review_masks`; this is not a claim that
+  the separately ranked physical verifier chose the same direction.
+
+A missing/invalid selected direction has missing metrics, not oracle fallback.
+Masks are evaluation-only; they
 never seed proposals, tune acceptance or enter training targets. Missing entity
 or receiver evidence is reported as missing rather than silently zero-filled.
 
@@ -136,6 +157,11 @@ partition, e.g. `sbatch -p AMD slurm/discover_shadow_video.slurm`.
   reading keyframe pairs does not create a denser camera stream.
 - `*_target.png`: image trimap, `1` for physically supported weak foreground and
   `255` for unknown. Rejected candidates do not become negative labels.
+
+Version `track-centric-appearance-geometry-video-v3` separates complete and
+partial evidence and replaces the ambiguous review `projection_capacity` field
+with oracle and selected-direction fields. Per-frame proposal capacity remains
+`projection_capacity`, explicitly marked as not shadow ground truth.
 
 FB inconsistency is not called an occlusion label. Occlusion support is explicitly
 the GT-volume ray proxy; unknown causes remain unknown. Flow interpolation is

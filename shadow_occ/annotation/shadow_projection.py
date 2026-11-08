@@ -45,6 +45,40 @@ def projection_coverage(observed, projections, light_ids=None, valid=None):
             for light_id, intersection, union, cover, iou in zip(ids, intersections, unions, covers, ious)]}
 
 
+def selected_direction_coverage(observed, projections, light_id, valid=None):
+    """Evaluate a preselected bank index without optimizing on the reference."""
+    observed, projections = np.asarray(observed, bool), np.asarray(projections, bool)
+    if projections.ndim != 3 or projections.shape[1:] != observed.shape:
+        raise ValueError("Projection bank and reference must share a receiver grid")
+    supported = np.ones(len(projections), bool) if valid is None else np.asarray(valid, bool)
+    if supported.shape != (len(projections),):
+        raise ValueError("Projection validity must have one value per light")
+    result = {"light_id": light_id, "observed_cells": int(observed.sum()),
+              "cover": None, "iou": None, "intersection": None, "union": None}
+    if light_id is None:
+        return {**result, "status": "not_selected"}
+    if not isinstance(light_id, (int, np.integer)) or not 0 <= light_id < len(projections):
+        raise ValueError("Selected light ID is outside the projection bank")
+    if not supported[light_id]:
+        return {**result, "status": "invalid_direction"}
+    if not observed.any():
+        return {**result, "status": "empty_reference"}
+    mask = projections[light_id]
+    intersection, union = int((observed & mask).sum()), int((observed | mask).sum())
+    return {**result, "status": "evaluated", "intersection": intersection, "union": union,
+            "cover": intersection/int(observed.sum()), "iou": intersection/max(union, 1)}
+
+
+def reviewed_projection_coverage(reference, projections, selected_light_id, valid=None):
+    """Separate reference-selected oracle capacity from the frozen model choice."""
+    return {
+        "projection_oracle_capacity": {**projection_coverage(reference, projections, valid=valid),
+            "evaluation_kind": "reference_optimized_capacity_upper_bound_not_generalization"},
+        "projection_selected_direction": {**selected_direction_coverage(reference, projections, selected_light_id, valid),
+            "selection_source": "observed_proposal_best_cover_without_review_masks"},
+    }
+
+
 def summarize_signals(inputs, maps, slot, mask):
     """Read-only distributions for independently identified receiver regions."""
     mask = np.asarray(mask, bool)
@@ -58,6 +92,7 @@ def summarize_signals(inputs, maps, slot, mask):
         "bev_feature_change": reference_bev,
         "entity_explanation": np.where(maps["entity_explanation_valid_map"][intervals], maps["entity_explanation_map"][intervals], np.nan),
         "discrepancy": maps["discrepancy_score_map"][slot:slot+1],
+        "partial_appearance": maps["appearance_partial_score_map"][slot:slot+1],
     }
     output = {}
     for name, field in values.items():
@@ -69,4 +104,6 @@ def summarize_signals(inputs, maps, slot, mask):
             "p10": float(np.percentile(valid, 10)) if len(valid) else None,
             "p90": float(np.percentile(valid, 90)) if len(valid) else None}
     return {"region_cells": int(mask.sum()), "visible_receiver_cells": int((mask & inputs["receiver"][slot]).sum()),
+            "complete_discrepancy_cells": int((mask & maps["discrepancy_evidence_complete"][slot]).sum()),
+            "partial_candidate_cells": int((mask & maps["partial_evidence_candidate"][slot]).sum()),
             "signals": output}

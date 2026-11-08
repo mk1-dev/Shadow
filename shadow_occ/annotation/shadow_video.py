@@ -12,6 +12,9 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
+ENTITY_STATES = {0: "missing", 1: "explained", 2: "unexplained"}
+
+
 @dataclass(frozen=True)
 class VideoShadowConfig:
     seed_score: float = .35
@@ -112,6 +115,10 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
     if entity_valid.shape != delta_L.shape:
         raise ValueError("Entity explanation validity must share the interval grid")
     entity = np.where(entity_valid, entity, 0)
+    entity_state = np.zeros(delta_L.shape, np.uint8)
+    entity_state[entity_valid & (entity > 0)] = 1
+    entity_state[entity_valid & (entity == 0)] = 2
+    complete_by_interval = comparable & entity_valid
     # The default does not assume BEV illumination invariance. Keep the old
     # hypothesis as an explicit control, while descriptors still link regions.
     stability = signatures["bev_pair_stability"]
@@ -119,8 +126,11 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
     ground_correspondence = confidence*np.exp(-np.nan_to_num(flow_residual, nan=0)/config.flow_scale_px)
     appearance = np.zeros(receiver.shape, np.float32)
     discrepancy = np.zeros_like(appearance)
+    partial = np.zeros_like(appearance)
+    complete_by_frame = np.zeros(receiver.shape, bool)
     onset, recovery = np.zeros(receiver.shape, bool), np.zeros(receiver.shape, bool)
     pair_score = np.zeros_like(delta_L, np.float32)
+    pair_partial = np.zeros_like(pair_score)
     for index in range(length-1):
         change = np.where(comparable[index], delta_L[index], 0)
         darken = np.clip(-change/config.light_scale_L, 0, 1)*color[index]
@@ -128,8 +138,13 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
         for frame, value in ((index+1, darken), (index, restore)):
             appearance[frame] = np.maximum(appearance[frame], value)
             score = np.clip(value*spatial[index]*(1-entity[index]), 0, 1)
-            discrepancy[frame] = np.maximum(discrepancy[frame], score)
-            pair_score[index] = np.maximum(pair_score[index], score)
+            complete = np.where(complete_by_interval[index], score, 0)
+            partial_score = np.where(comparable[index] & ~entity_valid[index], value*spatial[index], 0)
+            discrepancy[frame] = np.maximum(discrepancy[frame], complete)
+            partial[frame] = np.maximum(partial[frame], partial_score)
+            complete_by_frame[frame] |= complete_by_interval[index]
+            pair_score[index] = np.maximum(pair_score[index], complete)
+            pair_partial[index] = np.maximum(pair_partial[index], partial_score)
         onset[index+1] |= comparable[index] & (-change >= config.light_scale_L) & (color[index] >= .5)
         recovery[index] |= comparable[index] & (change >= config.light_scale_L) & (color[index] >= .5)
     # Static appearance is a separate proposal source, never a fabricated event.
@@ -149,15 +164,20 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
         raise ValueError("Caster prior must share video grid and lie in [0,1]")
     # A projected footprint alone never creates an observed candidate.
     caster_score = prior*np.maximum(appearance, static)
-    combined = np.maximum(discrepancy, np.maximum(.5*static, .5*caster_score))*receiver
+    dynamic = np.maximum(discrepancy, partial)
+    combined = np.maximum(dynamic, np.maximum(.5*static, .5*caster_score))*receiver
     source = ((appearance >= config.seed_score).astype(np.uint8)
               | ((discrepancy >= config.seed_score).astype(np.uint8) << 1)
               | ((caster_score*.5 >= config.seed_score).astype(np.uint8) << 2))
     source[(static*.5 >= config.seed_score) & receiver] |= 1
     return {**signatures, "appearance_score_map": np.maximum(appearance, .5*static),
-        "discrepancy_score_map": discrepancy, "proposal_score_map": combined,
+        "discrepancy_score_map": np.where(complete_by_frame, discrepancy, np.nan),
+        "discrepancy_evidence_complete": complete_by_frame,
+        "appearance_partial_score_map": partial, "dynamic_discovery_score_map": dynamic,
+        "partial_evidence_candidate": partial >= config.seed_score, "proposal_score_map": combined,
         "caster_prior_map": prior, "entity_explanation_map": entity,
-        "entity_explanation_valid_map": entity_valid,
+        "entity_explanation_valid_map": entity_valid, "entity_explanation_state": entity_state,
+        "discrepancy_evidence_complete_by_interval": complete_by_interval,
         "flow_present": flow_present, "fb_consistent": fb_consistent & flow_present,
         "flow_out_of_receiver": ~pair_visible, "flow_low_texture": pair_visible & ~texture_support,
         "flow_fb_inconsistent": flow_present & ~fb_consistent,
@@ -165,9 +185,11 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
         "flow_occlusion_known": np.full(delta_L.shape, occlusion_mask is not None, bool),
         "flow_interpolation_filled": np.zeros(delta_L.shape, bool),
         "flow_confidence_map": confidence,
-        "ground_motion_residual_px": flow_residual, "pair_discrepancy_score_map": pair_score,
+        "ground_motion_residual_px": flow_residual,
+        "pair_discrepancy_score_map": np.where(complete_by_interval, pair_score, np.nan),
+        "pair_partial_appearance_score_map": pair_partial,
         "ground_flow_correspondence_score": ground_correspondence,
-        "ground_consistent_illumination_score": ground_correspondence*pair_score,
+        "ground_consistent_illumination_score": ground_correspondence*np.maximum(pair_score, pair_partial),
         "boundary_confidence": boundary, "proposal_source_bits": source,
         "onset": onset, "recovery": recovery, "receiver_valid_by_frame": receiver,
         "pair_correspondence_valid": pair_visible, "exposure_valid": comparable}

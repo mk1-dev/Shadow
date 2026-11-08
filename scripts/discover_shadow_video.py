@@ -24,8 +24,8 @@ from shadow_occ.annotation.physics_labels import (
 )
 from shadow_occ.annotation.physics_motion import pair_evidence, project_world, sample_at
 from shadow_occ.annotation.receiver_explanations import box_ray_evidence
-from shadow_occ.annotation.shadow_video import ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
-from shadow_occ.annotation.shadow_projection import projection_coverage, summarize_signals
+from shadow_occ.annotation.shadow_video import ENTITY_STATES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
+from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage, summarize_signals
 from shadow_occ.utils.io import write_json
 
 
@@ -299,6 +299,8 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 frame_rows.append({"id": region["id"], "shadow_track_id": region["shadow_track_id"],
                     "ranking_score": region["rank_score"], "temporal_consistency": region["temporal_consistency"],
                     "area_cells": int(mask.sum()), "source_bits": np.unique(maps["proposal_source_bits"][slot][mask]).tolist(),
+                    "complete_discrepancy_cells": int((mask & maps["discrepancy_evidence_complete"][slot]).sum()),
+                    "partial_evidence_cells": int((mask & maps["partial_evidence_candidate"][slot]).sum()),
                     "physics": decision})
             bank = context["caster_projection_bank"].get(slot, np.zeros((0, *target.shape), bool))
             bank_valid = context["caster_projection_valid"].get(slot, np.ones(len(bank), bool))
@@ -315,7 +317,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 reviewed_rows.append({"frame_token": frame["sample_data_token"], "region_type": review["region_type"],
                     "reference_kind": "independent_review_only_not_training",
                     **summarize_signals(inputs, maps, slot, receiver_mask),
-                    "projection_capacity": projection_coverage(receiver_mask, bank, valid=bank_valid)})
+                    **reviewed_projection_coverage(receiver_mask, bank, best_id, valid=bank_valid)})
             positive = target == 1
             to_image = lambda mask: bev_mask_to_image(mask, frame["projection_world_to_image"], context["basis"], context["grid"], image.shape[:2]) & context["grounds"][slot]
             image_proposal, image_positive = to_image(proposal), to_image(positive)
@@ -346,6 +348,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             rows.append({"frame_token": frame["sample_data_token"], "timestamp": frame["camera_timestamp"],
                 "evidence": str(path), "regions": frame_rows, "positive_cells": int(positive.sum()),
                 "projection_capacity": coverage,
+                "selected_direction": {"light_id": best_id, "selection_source": "observed_proposal_best_cover_without_review_masks"},
                 "requested_track_id": clip["track_id"], "requested_track_is_not_owner_gt": True})
     finally:
         if video is not None:
@@ -355,9 +358,12 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         **{key: value for key, value in maps.items() if value.shape[0] == len(chain)})
     write_rows(output/"frames.jsonl", rows)
     write_rows(output/"reviewed_signals.jsonl", reviewed_rows)
-    write_json(output/"protocol.json", {"protocol": "track-centric-appearance-geometry-video-v2", "clip": clip,
+    write_json(output/"protocol.json", {"protocol": "track-centric-appearance-geometry-video-v3", "clip": clip,
         "stage": stage, "bev_role": bev_role,
-        "discrepancy_definition": "registered illumination change * (1-supported entity explanation); no flow-error bonus",
+        "discrepancy_definition": "registered illumination change * (1-entity explanation) only where entity coverage is valid",
+        "entity_state_legend": ENTITY_STATES,
+        "partial_evidence_contract": "missing entity coverage retains appearance candidates, not evidence of entity exclusion; incomplete discrepancy is NaN",
+        "projection_review_contract": "oracle capacity optimizes on reference; selected direction is frozen on proposals before reading review masks",
         "bev_role_contract": "context=descriptors/linking only; stability=explicit invariance hypothesis; off=no BEV linking",
         "discovery_config": asdict(config), "physics_config": asdict(physical_config),
         "owner_index_to_instance_token": owner_tokens, "receiver_sources": context["receiver_sources"],
