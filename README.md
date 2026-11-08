@@ -25,7 +25,12 @@ No new model training or RGB/DIS/GT dataset rebuild is needed. The pipeline
 retains caster/light history, RGB-refined image masks, short-gap region memory
 and a separate Shadow-BEV instead of merging shadows into entity occupancy.
 
-M2 v8 keeps reliable, low-confidence and missing BEV correspondences distinct.
+M2 v8 uses geometry-anchored BEV correspondence: world receiver points are mapped
+through each frame's LIDAR_TOP transform, native-grid validity and interpolation
+support before local feature refinement. Local offsets are feature-registration
+residuals, not ground motion. Reliable, low-confidence, ambiguous and missing
+matches remain distinct. `correspondence.mp4`, `bev_geometry.npz` and
+`correspondence.json` expose the spatial mechanism and explicit coverage counts.
 Cross-space seeds grow within currently observed Lab/boundary-compatible ground
 and can seed an independently valid adjacent frame, without treating material
 flow as shadow speed. Proposal growth does not change physical label acceptance.

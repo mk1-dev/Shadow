@@ -44,7 +44,7 @@ class CrossSpaceGrowthConfig:
             raise ValueError("Invalid cross-space region growth settings")
 
 
-SPATIAL_MATCH_STATES = {0: "missing", 1: "low_confidence", 2: "reliable"}
+SPATIAL_MATCH_STATES = {0: "missing", 1: "low_confidence", 2: "reliable", 3: "ambiguous"}
 
 
 def lift_flow_to_bev(world, frames, pixels, flow, flow_valid, receiver, basis, projection, resolution):
@@ -113,10 +113,12 @@ def _local_match(first, second, first_valid, second_valid, config):
 
 
 def match_spatial_bev(features, valid, resolution, config=None):
-    """Separate reliable, low-confidence and missing current-only matches.
+    """Refine the SAME WORLD receiver anchor on current-only descriptors.
 
-    Low-confidence vectors are proposals weighted by uniqueness and cycle error;
-    they do not become reliable geometry. Tied descriptors carry no motion vote.
+    Inputs are already mapped through each frame's world-to-native-BEV transform.
+    Thus the expected ground correspondence is the same array cell, not an
+    unconstrained feature guess. Output offsets are feature-registration
+    residuals around that anchor, NOT measured physical ground motion.
     """
     config = config or CorrespondenceConfig()
     config.validate()
@@ -150,21 +152,24 @@ def match_spatial_bev(features, valid, resolution, config=None):
         reverse_margin = sample_at(reverse_margin, endpoints, nearest=True)
         reverse_count = sample_at(reverse_count, endpoints, nearest=True)
         cycle = np.linalg.norm(forward+reverse, axis=-1)
-        available = valid[slot] & (count > 0) & np.isfinite(best) & (best >= config.minimum_cosine)
+        anchor_valid = valid[slot] & valid[slot+1]
+        available = anchor_valid & (count > 0) & np.isfinite(best) & (best >= config.minimum_cosine)
         reversible = available & (reverse_count > 0) & np.isfinite(reverse_best) & (reverse_best >= config.minimum_cosine)
         supported &= sample_at(reverse_valid.astype(np.uint8), endpoints, nearest=True) > 0
-        supported &= cycle <= config.cycle_tolerance_cells
-        # A single visible alternative is weak support, not proof of uniqueness.
-        uniqueness = np.where(count == 1, .1, np.clip(margin/.1, 0, 1))
-        reverse_uniqueness = np.where(reverse_count == 1, .1, np.clip(reverse_margin/.1, 0, 1))
+        supported &= anchor_valid & (cycle <= config.cycle_tolerance_cells)
+        # A forced argmax on a singleton/tie is not a measured motion vector.
+        ambiguous = available & ((count < 2) | (margin <= 1e-6)
+                                  | (reversible & ((reverse_count < 2) | (reverse_margin <= 1e-6))))
+        uniqueness = np.clip(margin/.1, 0, 1)
+        reverse_uniqueness = np.clip(reverse_margin/.1, 0, 1)
         quality = np.minimum(uniqueness, reverse_uniqueness)
         quality *= np.where(supported, 1, np.exp(-cycle/config.cycle_tolerance_cells))
-        quality = np.where(reversible, quality, 0)
+        quality = np.where(reversible & ~ambiguous, quality, 0)
         usable = reversible & (quality > 0)
         vectors[slot] = np.where(usable[..., None], forward*resolution, np.nan)
         good[slot] = supported
         confidence[slot] = quality
-        state[slot] = np.where(supported, 2, np.where(available, 1, 0))
+        state[slot] = np.where(ambiguous, 3, np.where(supported, 2, np.where(available, 1, 0)))
         candidate_count[slot] = count
         cycle_error[slot] = np.where(reversible, cycle, np.nan)
         match_cosine[slot] = np.where(available, best, np.nan)
@@ -176,7 +181,11 @@ def match_spatial_bev(features, valid, resolution, config=None):
         "spatial_bev_match_confidence": confidence, "spatial_bev_feature_change": change,
         "spatial_bev_match_state": state, "spatial_bev_match_usable": confidence > 0,
         "spatial_bev_candidate_count": candidate_count, "spatial_bev_cycle_error_cells": cycle_error,
-        "spatial_bev_match_cosine": match_cosine, "spatial_bev_match_margin": match_margin}
+        "spatial_bev_match_cosine": match_cosine, "spatial_bev_match_margin": match_margin,
+        "spatial_bev_geometry_pair_valid": valid[:-1] & valid[1:],
+        "spatial_bev_anchor_cosine": np.where(np.isfinite(change), 1-change, np.nan),
+        "spatial_bev_local_offset_m": vectors,
+        "spatial_bev_local_residual_m": np.linalg.norm(vectors, axis=-1)}
 
 
 def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_valid,
@@ -214,7 +223,12 @@ def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_
             partial_score[at] = np.maximum(partial_score[at], partial)
             score[at] = np.maximum(complete_score[at], partial_score[at])
     maps.update(signals)
+    geometric_pair = maps["receiver_valid_by_frame"][:-1] & maps["receiver_valid_by_frame"][1:]
     maps.update(flow_bev_displacement_m=flow_bev, flow_bev_valid=flow_valid,
+        bev_flow_observable_pair=geometric_pair,
+        bev_flow_matchable_pair=geometric_pair & signals["spatial_bev_geometry_pair_valid"],
+        ground_flow_geometry_residual_px=maps["ground_motion_residual_px"].copy(),
+        ground_flow_geometry_residual_m=np.where(flow_valid, np.linalg.norm(flow_bev, axis=-1), np.nan),
         flow_bev_discrepancy_m=np.where(matched, difference, np.nan),
         flow_bev_discrepancy_valid=reliable, flow_bev_discrepancy_supported=matched,
         cross_space_discovery_score=score,
@@ -223,6 +237,32 @@ def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_
         cross_space_entity_factor=entity_factor,
         cross_space_entity_factor_known=known_entity)
     return maps
+
+
+def correspondence_summary(maps):
+    """Coverage denominators and consistency diagnostics, not true accuracy."""
+    rows = []
+    for slot, observable in enumerate(maps["bev_flow_observable_pair"]):
+        matchable = maps["bev_flow_matchable_pair"][slot]
+        reliable = maps["spatial_bev_match_valid"][slot] & matchable
+        row = {"interval": slot, "observable_receiver_cells": int(observable.sum()),
+            "geometry_anchored_descriptor_cells": int(matchable.sum()),
+            "reliable_local_match_cells": int(reliable.sum()),
+            "ambiguous_local_match_cells": int(((maps["spatial_bev_match_state"][slot] == 3) & matchable).sum())}
+        row["descriptor_coverage"] = float(matchable.sum()/observable.sum()) if observable.any() else None
+        row["reliable_local_match_coverage"] = float(reliable.sum()/matchable.sum()) if matchable.any() else None
+        for name in ("spatial_bev_anchor_cosine", "spatial_bev_cycle_error_cells",
+                     "spatial_bev_local_residual_m", "ground_flow_geometry_residual_px"):
+            values = maps[name][slot][matchable & np.isfinite(maps[name][slot])]
+            row[name+"_median"] = float(np.median(values)) if len(values) else None
+        rows.append(row)
+    totals = {key: sum(row[key] for row in rows) for key in ("observable_receiver_cells",
+        "geometry_anchored_descriptor_cells", "reliable_local_match_cells", "ambiguous_local_match_cells")}
+    observable, matchable = totals["observable_receiver_cells"], totals["geometry_anchored_descriptor_cells"]
+    totals["descriptor_coverage"] = totals["geometry_anchored_descriptor_cells"]/observable if observable else None
+    totals["reliable_local_match_coverage"] = totals["reliable_local_match_cells"]/matchable if matchable else None
+    return {"pairs": rows, "totals": totals, "correctness_is_measured_accuracy": False,
+        "contract": "Coverage uses independently observable receiver pairs. Cosine, cycle and residuals are consistency diagnostics, not audited correspondence correctness."}
 
 
 def grow_cross_space_regions(maps, lab, resolution, video_config, *, timestamps=None, config=None):

@@ -48,16 +48,21 @@ rejects a temporal-only spatial cache with an actionable export instruction;
 
 M2 lifts each measured flow endpoint through the NEXT camera onto the receiver
 plane, then expresses its displacement in horizontal anchor-grid x/y meters.
-Current-only BEV descriptors are locally cosine-matched with uniqueness and
-reverse-cycle checks. `flow_bev_displacement_m` and `spatial_bev_displacement_m`
-therefore share units and axes. Their difference is never computed between
-image pixels and feature vectors. `spatial_bev_feature_change` retains raw
+Current-only BEV descriptors are first sampled at the same WORLD point through
+each cache's `lidar_to_world` transform, native range and cell-center layout,
+then locally refined around this geometric ground correspondence. Ego motion
+changes native BEV coordinates, not the identity of the fixed world receiver.
+`flow_bev_displacement_m` and the legacy `spatial_bev_displacement_m` alias share
+units/axes, but the latter is a **feature-registration offset, not physical ground
+motion**. Its explicit name is now `spatial_bev_local_offset_m`.
+`spatial_bev_feature_change` retains raw
 `1-cosine`; ranking normalizes it to [0,1]. In v8, correspondence is explicitly
-`0=missing`, `1=low_confidence`, or `2=reliable`. The existing cosine, uniqueness
-and reverse-cycle thresholds still define reliable matches. Sparse singleton
-matches have at most 0.1 motion weight; small margins and cycle errors reduce
-the weight rather than discarding every vector. Repeated/tied features have
-zero motion weight and NaN vectors, not confident zero motion. Missing features
+`0=missing`, `1=low_confidence`, `2=reliable`, or `3=ambiguous`. The existing cosine,
+uniqueness and reverse-cycle thresholds still define reliable matches. Distinct
+but low-margin matches retain small weights; repeated/tied and singleton matches
+are ambiguous, with zero motion weight and NaN offsets, not confident zero
+motion. Local search cannot replace a missing geometric anchor with a neighbour.
+Missing features
 remain missing. `spatial_bev_match_valid` and `flow_bev_discrepancy_valid` retain
 their reliable-only meaning; `*_match_usable` and
 `flow_bev_discrepancy_supported` include weighted low-confidence evidence.
@@ -69,6 +74,49 @@ reported as NaN and retained as partial evidence, not silently asserted absent.
 For physical acceptance, a proposed ground cell still needs observed appearance
 support (`minimum_observed_appearance=0.05`) and caster/light fit. Static
 appearance retains its own path, including when no temporal event is visible.
+
+### Geometry-Anchored Correspondence (v8 refinement)
+
+Native BEV sampling now preserves explicit `bev_valid_hw` support. Older caches
+remain usable by deriving finite/nonzero descriptor support; this is not a
+camera visibility or free-ground prediction. Every contributing bilinear sample
+must have valid native support. Mapping includes sensor calibration, per-sample
+pose, native x/y resolution, cell centers and the point-cloud range. Current-only
+extraction protocol, grid range/layout and model hashes must agree within a clip.
+Camera timestamps and LIDAR_TOP feature timestamps are both retained, with their
+offsets and actual intervals; neither is silently replaced by the other's clock.
+
+Two different residuals are retained:
+
+- `ground_flow_geometry_residual_px`: measured versus expected static-ground
+  image flow. Its metric counterpart is `ground_flow_geometry_residual_m`.
+- `spatial_bev_local_residual_m`: the magnitude of local feature displacement
+  relative to the geometry-predicted SAME-WORLD position. It is not an entity,
+  ground or shadow velocity.
+
+`spatial_bev_anchor_cosine` records the descriptor agreement at the geometric
+anchor even if local feature matching is ambiguous. Geometry stays available
+when smooth semantic BEV descriptors cannot identify a unique offset. Normal
+ground flow plus changing Lab-L can still propose a shadow. The existing M2
+score weights and M3 acceptance are unchanged; the legacy Flow-minus-BEV field
+is only a comparison proxy, not a measurement of physical motion or shadow truth.
+
+Each cross-space clip additionally exports:
+
+- `bev_geometry.npz`: world receiver points, native BEV coordinates, native valid
+  grids, range/interpolation support, metric resolutions, transforms and clocks.
+- `correspondence.mp4` and `pair_*_correspondence.jpg`: world grid on RGB, both
+  native BEV grids and geometric anchors, world-aligned descriptors, local
+  offsets/confidence, image flow, geometric flow residual, Lab-L and proposals.
+  First-three-channel BEV previews are normalized only for display, not matching.
+- `correspondence.json`: observable receiver-pair cells, geometry-anchored
+  descriptor cells and reliable local matches with their separate denominators.
+  Cosine, cycle error and residual medians describe consistency; they are not
+  true matching accuracy. Independent review remains a later quality evaluation.
+
+Reuse existing current-only/temporal BEV, RGB, DIS and GT caches. No feature
+re-export, dataset rebuild or training is required. Use a new output directory,
+such as `outputs/shadow_mainline_v8_geometry`.
 
 ### M2 Seed-to-Region Continuation (v8)
 
@@ -144,7 +192,7 @@ python -u scripts/discover_shadow_video.py \
   --clips "$SHADOW_VIDEO_CLIPS" \
   --stage full --discovery-mode cross-space \
   --owner-scoring geometry+appearance+bev \
-  --output-root outputs/shadow_mainline_v8
+  --output-root outputs/shadow_mainline_v8_geometry
 ```
 
 For Slurm, set `SHADOW_VIDEO_SPATIAL_FEATURES` in addition to the existing input

@@ -13,7 +13,7 @@ source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
 conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
-python -m pytest -q tests/test_shadow_video.py tests/test_video_correspondence.py tests/test_shadow_representation.py tests/test_entity_memory.py
+python -m pytest -q tests/test_cached_bev.py tests/test_shadow_video.py tests/test_video_correspondence.py tests/test_shadow_representation.py tests/test_entity_memory.py
 EXTRA=()
 if [[ -n "${SHADOW_VIDEO_REVIEW_REGIONS:-}" ]]; then
   EXTRA+=(--review-regions "$SHADOW_VIDEO_REVIEW_REGIONS")

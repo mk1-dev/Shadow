@@ -1,5 +1,6 @@
 import copy
 import json
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -254,8 +255,15 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
             flow_next_to_t=np.zeros((64, 64, 2), np.float32), receiver_flow_supported=np.ones((64, 64), bool))
         stats[pair["id"]] = {key: pair[key] for key in ("scene_name", "camera", "official_split")}
         stats[pair["id"]].update(evidence=str(path), evidence_sha256=digest(path))
-    monkeypatch.setattr(module, "sample_cached_bev", lambda root, token, world:
-        (np.ones((*world.shape[:2], 2), np.float32), np.ones(world.shape[:2], bool), {"history_mode": spatial_mode}))
+    def cached(root, token, world, *, return_geometry=False):
+        valid = np.ones(world.shape[:2], bool)
+        result = (np.ones((*world.shape[:2], 2), np.float32), valid, {"history_mode": spatial_mode})
+        geometry = {"native_uv": np.stack(np.indices(valid.shape)[::-1], axis=-1).astype(np.float32),
+            "native_valid": valid, "native_preview": np.ones((*valid.shape, 3), np.uint8),
+            "sample_valid": valid, "in_range": valid, "interpolation_support": valid.astype(np.float32),
+            "resolution_xy_m": np.ones(2), "validity_source": "test_support"}
+        return (*result, geometry) if return_geometry else result
+    monkeypatch.setattr(module, "sample_cached_bev", cached)
     if spatial_mode == "temporal":
         with pytest.raises(ValueError, match="current-only"):
             module.sample_clip(pairs, frame_index(pairs), tmp_path, stats, tmp_path,
@@ -282,6 +290,17 @@ def test_raw_pair_sampling_keeps_partial_visibility_on_fixed_clip_grid(tmp_path,
     assert np.isfinite(maps["discrepancy_score_map"]).any()
     assert context["receiver_sources"][1]["policy"] == "canonical_legacy_pair_reference"
     assert "metric_flow" in context and "metric_flow" not in inputs
+    if spatial_mode == "current-only" and not with_boxes:
+        monkeypatch.setattr(module.cv2, "VideoWriter", lambda *args: SimpleNamespace(
+            isOpened=lambda: True, write=lambda value: None, release=lambda: None))
+        module.run_clip({"id": "geometry", "track_id": "car", "scene_name": "scene1"}, pairs,
+            inputs, context, tmp_path/"geometry_clip", VideoShadowConfig(), stage="signal")
+        with np.load(tmp_path/"geometry_clip/bev_geometry.npz", allow_pickle=False) as geometry:
+            assert geometry["native_uv"].shape == (3, 16, 16, 2)
+            assert geometry["native_valid"].shape == (3, 16, 16)
+            assert geometry["camera_intervals_seconds"].shape == (2,)
+            assert np.isnan(geometry["bev_timestamps_us"]).all()  # Unknown clock stays missing.
+        assert (tmp_path/"geometry_clip/pair_001_correspondence.jpg").is_file()
 
 
 def test_all_frame_count_box_motion_support():
@@ -328,7 +347,7 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
         def isOpened(self):
             return True
         def write(self, frame):
-            assert frame.shape == (1024, 1152, 3)
+            assert frame.shape in {(1024, 1152, 3), (768, 1152, 3)}
             self.frames += 1
         def release(self):
             pass
@@ -366,7 +385,10 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
     assert protocol["protocol"] == "entity-shadow-disentangled-video-v8"
-    assert protocol["spatial_match_states"] == {"0": "missing", "1": "low_confidence", "2": "reliable"}
+    assert protocol["spatial_match_states"] == {"0": "missing", "1": "low_confidence", "2": "reliable", "3": "ambiguous"}
+    correspondence = json.loads((tmp_path/"clip/correspondence.json").read_text())
+    assert correspondence["totals"]["observable_receiver_cells"] == (0 if entity_search else 512)
+    assert (tmp_path/"clip/pair_000_correspondence.jpg").is_file()
     assert protocol["stage"] == stage and protocol["bev_role"] == "context"
     assert len(protocol["modules"]) == 4
     review = json.loads((tmp_path/"clip/reviewed_signals.jsonl").read_text().strip())

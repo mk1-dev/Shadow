@@ -21,7 +21,7 @@ def test_uniad_sequence_layout_preserves_y_rows_x_columns():
 def test_sampling_uses_lidar_calibration_not_ego_grid_resize(tmp_path):
     grid = BEVFlowConfig(extent_m=2, resolution_m=1).grid()
     world = ground_grid(plane_basis([0, 0, 1, 0]), np.eye(4), grid)
-    feature = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+    feature = np.arange(1, 17, dtype=np.float32).reshape(1, 4, 4)
     sensor = np.eye(4)
     sensor[0, 3] = 1
     record = SimpleNamespace(scene_name="scene1", lidar_ego_to_global=np.eye(4), lidar_sensor_to_ego=sensor)
@@ -29,6 +29,62 @@ def test_sampling_uses_lidar_calibration_not_ego_grid_resize(tmp_path):
     actual, valid, _ = sample_cached_bev(tmp_path, "s0", world)
     np.testing.assert_array_equal(actual[:, 1:, 0], feature[0, :, :-1])
     assert not valid[:, 0].any() and valid[:, 1:].all()
+
+
+def test_native_geometry_preserves_non_square_grid_rotation_and_metric_resolution(tmp_path):
+    ego = np.eye(4)
+    ego[:2, :2] = [[0, -1], [1, 0]]
+    ego[:3, 3] = [5, 9, 1]
+    sensor = np.eye(4)
+    sensor[:3, 3] = [1, -.5, 0]
+    record = SimpleNamespace(scene_name="scene1", lidar_ego_to_global=ego, lidar_sensor_to_ego=sensor)
+    feature = np.arange(1, 16, dtype=np.float32).reshape(1, 3, 5)
+    write_cached_bev(tmp_path, "s0", feature, record, 12345, [-5, -1.5, -2, 5, 1.5, 2], {})
+    yy, xx = np.indices((3, 5))
+    local = np.stack([-5+(xx+.5)*2, -1.5+yy+.5, np.zeros_like(xx)], axis=-1)
+    world = (np.c_[local.reshape(-1, 3), np.ones(15)] @ (ego @ sensor).T)[:, :3].reshape(3, 5, 3)
+    actual, valid, source, geometry = sample_cached_bev(tmp_path, "s0", world, return_geometry=True)
+    np.testing.assert_allclose(actual[..., 0], feature[0])
+    np.testing.assert_allclose(geometry["native_uv"], np.stack([xx, yy], axis=-1))
+    np.testing.assert_allclose(geometry["resolution_xy_m"], [2, 1])
+    assert valid.all() and geometry["native_valid"].all()
+    assert source["timestamp"] == 12345
+
+
+def test_same_world_ground_descriptor_survives_ego_translation_and_rotation(tmp_path):
+    poses = [np.eye(4), np.eye(4)]
+    poses[1][:2, :2] = [[0, -1], [1, 0]]
+    poses[1][0, 3] = 1
+    yy, xx = np.indices((8, 8))
+    local = np.stack([xx-3.5, yy-3.5, np.zeros_like(xx)], axis=-1)
+    grid = BEVFlowConfig(extent_m=1.5, resolution_m=1).grid()
+    world = ground_grid(plane_basis([0, 0, 1, 0]), np.eye(4), grid)
+    sampled = []
+    anchors = []
+    for slot, pose in enumerate(poses):
+        record = SimpleNamespace(scene_name="scene", lidar_ego_to_global=pose, lidar_sensor_to_ego=np.eye(4))
+        centres = (np.c_[local.reshape(-1, 3), np.ones(64)] @ pose.T)[:, :3].reshape(8, 8, 3)
+        feature = np.stack([centres[..., 0], centres[..., 1], np.ones((8, 8))])
+        write_cached_bev(tmp_path, f"s{slot}", feature, record, slot*500_000, [-4, -4, -1, 4, 4, 1], {})
+        values, valid, _, geometry = sample_cached_bev(tmp_path, f"s{slot}", world, return_geometry=True)
+        assert valid.all()
+        sampled.append(values)
+        anchors.append(geometry["native_uv"])
+    np.testing.assert_allclose(sampled[0], sampled[1], atol=1e-6)
+    assert not np.allclose(anchors[0], anchors[1])
+
+
+def test_bilinear_sampling_does_not_invent_support_across_invalid_native_cells(tmp_path):
+    record = SimpleNamespace(scene_name="scene", lidar_ego_to_global=np.eye(4), lidar_sensor_to_ego=np.eye(4))
+    valid = np.ones((4, 4), bool)
+    valid[1, 1] = False
+    write_cached_bev(tmp_path, "s0", np.ones((2, 4, 4)), record, 0, [-2, -2, -1, 2, 2, 1], {}, valid_mask=valid)
+    world = np.array([[[-.5, -.5, 0], [0, -.5, 0], [.5, -.5, 0]]])
+    values, supported, _, geometry = sample_cached_bev(tmp_path, "s0", world, return_geometry=True)
+    np.testing.assert_array_equal(supported, [[False, False, True]])
+    np.testing.assert_allclose(geometry["interpolation_support"], [[0, .5, 1]])
+    assert geometry["in_range"].all()
+    assert not values[0, :2].any() and np.isfinite(values).all()
 
 
 def test_three_frame_features_are_aligned_at_world_receivers(tmp_path):

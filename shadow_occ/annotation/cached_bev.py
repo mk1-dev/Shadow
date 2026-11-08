@@ -11,11 +11,17 @@ from shadow_occ.annotation.data import digest
 from shadow_occ.utils.io import write_json
 
 
-def write_cached_bev(output, token, feature, record, timestamp, pc_range, source, objects=None):
+def write_cached_bev(output, token, feature, record, timestamp, pc_range, source, objects=None, *, valid_mask=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     path = output/f"{token}.npz"
-    np.savez_compressed(path, bev_chw=feature.astype(np.float16))
+    feature = np.asarray(feature, np.float32)
+    native_valid = np.isfinite(feature).all(axis=0) & (np.linalg.norm(feature, axis=0) > 1e-6)
+    if valid_mask is not None:
+        if np.shape(valid_mask) != feature.shape[1:]:
+            raise ValueError("BEV validity must use the native feature grid")
+        native_valid &= np.asarray(valid_mask, bool)
+    np.savez_compressed(path, bev_chw=feature.astype(np.float16), bev_valid_hw=native_valid)
     object_reference = {}
     if objects is not None:
         from shadow_occ.annotation.mature_objects import object_frame_source, write_cached_objects
@@ -26,7 +32,9 @@ def write_cached_bev(output, token, feature, record, timestamp, pc_range, source
         **object_reference,
         "coordinate_frame": "LIDAR_TOP", "lidar_to_world": (record.lidar_ego_to_global @ record.lidar_sensor_to_ego).tolist(),
         "pc_range": list(pc_range), "shape_chw": list(feature.shape), "feature_sha256": digest(path),
-        "layout": "C,H,W; rows=y; columns=x; cell centres", "timestamp": timestamp})
+        "layout": "C,H,W; rows=y; columns=x; cell centres", "timestamp": timestamp,
+        "validity": "native finite nonzero descriptor support, not camera visibility or free ground",
+        "timestamp_reference": "LIDAR_TOP sample_data microseconds"})
 
 
 def spatial_bev(value, height, width, layout="HWBC"):
@@ -51,7 +59,7 @@ def spatial_bev(value, height, width, layout="HWBC"):
     return np.ascontiguousarray(value, dtype=np.float32)
 
 
-def sample_cached_bev(root, token, world_points):
+def sample_cached_bev(root, token, world_points, *, return_geometry=False):
     """Map receiver world points to the mature model's current LIDAR_TOP grid."""
     root = Path(root)
     meta = json.loads((root/f"{token}.json").read_text(encoding="utf-8"))
@@ -62,21 +70,46 @@ def sample_cached_bev(root, token, world_points):
         raise ValueError("BEV feature cache changed")
     with np.load(path, allow_pickle=False) as archive:
         feature = archive["bev_chw"].astype(np.float32)
+        native_valid = np.isfinite(feature).all(axis=0) & (np.linalg.norm(feature, axis=0) > 1e-6)
+        validity_source = "derived_finite_nonzero_legacy"
+        if "bev_valid_hw" in archive:
+            if archive["bev_valid_hw"].shape != feature.shape[1:]:
+                raise ValueError("Cached BEV validity and native feature grid disagree")
+            native_valid &= archive["bev_valid_hw"].astype(bool)
+            validity_source = "explicit_native_support"
     lower, upper = np.asarray(meta["pc_range"][:3]), np.asarray(meta["pc_range"][3:])
     height, width = feature.shape[1:]
     xyz = np.c_[world_points.reshape(-1, 3), np.ones(world_points.shape[0]*world_points.shape[1])]
     local = (xyz @ np.linalg.inv(np.asarray(meta["lidar_to_world"])).T)[:, :3]
     column = (local[:, 0]-lower[0])/(upper[0]-lower[0])*width-0.5
     row = (local[:, 1]-lower[1])/(upper[1]-lower[1])*height-0.5
-    valid = (column >= 0) & (column <= width-1) & (row >= 0) & (row <= height-1)
+    valid = (np.isfinite(local).all(axis=-1) & (column >= 0) & (column <= width-1)
+             & (row >= 0) & (row <= height-1) & (local[:, 2] >= lower[2]) & (local[:, 2] <= upper[2]))
     shape = world_points.shape[:2]
-    sampled = cv2.remap(feature.transpose(1, 2, 0), column.reshape(shape).astype(np.float32),
-                        row.reshape(shape).astype(np.float32), cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT)
+    uv = np.stack([column, row], axis=-1).reshape(*shape, 2).astype(np.float32)
+    safe_uv = np.where(valid.reshape(*shape, 1), uv, -1)
+    weights = cv2.remap(native_valid.astype(np.float32), safe_uv[..., 0], safe_uv[..., 1],
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    sampled = cv2.remap(np.where(native_valid[None], feature, 0).transpose(1, 2, 0),
+                        safe_uv[..., 0], safe_uv[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     if sampled.ndim == 2:
         sampled = sampled[..., None]
-    sampled[~valid.reshape(shape)] = 0
-    return sampled, valid.reshape(shape), meta
+    in_range = valid.reshape(shape)
+    valid = in_range & (weights >= .999) & np.isfinite(sampled).all(axis=-1) & (np.linalg.norm(sampled, axis=-1) > 1e-6)
+    sampled = np.where(valid[..., None], sampled/np.maximum(weights[..., None], 1e-6), 0)
+    if not return_geometry:
+        return sampled, valid, meta
+    channels = feature[np.arange(3) % len(feature)].transpose(1, 2, 0)
+    preview = np.zeros((*native_valid.shape, 3), np.uint8)
+    if native_valid.any():
+        lo, hi = np.percentile(channels[native_valid], [5, 95], axis=0)
+        preview = (24+231*np.clip(np.nan_to_num((channels-lo)/np.maximum(hi-lo, 1e-6)), 0, 1)).astype(np.uint8)
+        preview[~native_valid] = 0
+    geometry = {"native_uv": uv, "native_valid": native_valid, "native_preview": preview,
+        "in_range": in_range, "interpolation_support": weights, "sample_valid": valid,
+        "resolution_xy_m": (upper[:2]-lower[:2])/np.array([width, height]),
+        "validity_source": validity_source}
+    return sampled, valid, meta, geometry
 
 
 def attach_cached_bev(arrays, metadata, root):

@@ -3,7 +3,7 @@ import numpy as np
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_projection, ground_grid
 from shadow_occ.annotation.physics_motion import project_world
 from shadow_occ.annotation.video_correspondence import (CrossSpaceGrowthConfig, cross_space_proposals,
-    grow_cross_space_regions, lift_flow_to_bev, match_spatial_bev)
+    correspondence_summary, grow_cross_space_regions, lift_flow_to_bev, match_spatial_bev)
 from shadow_occ.annotation.shadow_video import VideoShadowConfig, refine_regions, video_proposals
 from tests.test_bev_flow import example
 from tests.test_shadow_video import video_case
@@ -43,6 +43,19 @@ def test_spatial_feature_correspondence_returns_displacement_in_meters():
                                np.broadcast_to([.5, 0], (5, 5, 2)))
 
 
+def test_local_search_cannot_replace_a_missing_geometric_anchor_with_a_neighbour():
+    rng = np.random.default_rng(4)
+    first = rng.normal(size=(9, 9, 16)).astype(np.float32)
+    features = np.stack([first, np.roll(first, 1, axis=1)])
+    valid = np.ones((2, 9, 9), bool)
+    valid[1, 4, 4] = False
+    result = match_spatial_bev(features, valid, .5)
+    assert result["spatial_bev_candidate_count"][0, 4, 4] > 0
+    assert not result["spatial_bev_geometry_pair_valid"][0, 4, 4]
+    assert result["spatial_bev_match_state"][0, 4, 4] == 0
+    assert np.isnan(result["spatial_bev_local_offset_m"][0, 4, 4]).all()
+
+
 def test_constant_or_missing_bev_is_not_a_confident_zero_motion_match():
     features = np.ones((2, 9, 9, 4), np.float32)
     for valid in (np.ones((2, 9, 9), bool), np.zeros((2, 9, 9), bool)):
@@ -51,21 +64,24 @@ def test_constant_or_missing_bev_is_not_a_confident_zero_motion_match():
         assert np.isnan(result["spatial_bev_displacement_m"]).all()
         assert not result["spatial_bev_match_confidence"].any()
         assert not result["spatial_bev_match_usable"].any()
-        assert (result["spatial_bev_match_state"] == (1 if valid.any() else 0)).all()
+        assert (result["spatial_bev_match_state"] == (3 if valid.any() else 0)).all()
+        assert result["spatial_bev_geometry_pair_valid"].all() == bool(valid.any())
 
 
-def test_sparse_single_candidate_is_low_confidence_not_missing_or_reliable():
+def test_sparse_single_candidate_is_ambiguous_without_forcing_a_motion_vector():
     features = np.zeros((2, 5, 5, 2), np.float32)
     valid = np.zeros((2, 5, 5), bool)
     features[:, 2, 2] = [1, 0]
     valid[:, 2, 2] = True
     result = match_spatial_bev(features, valid, .5)
     at = (0, 2, 2)
-    assert result["spatial_bev_match_state"][at] == 1
-    assert result["spatial_bev_match_usable"][at]
+    assert result["spatial_bev_match_state"][at] == 3
+    assert not result["spatial_bev_match_usable"][at]
     assert not result["spatial_bev_match_valid"][at]
-    np.testing.assert_allclose(result["spatial_bev_match_confidence"][at], .1)
-    np.testing.assert_allclose(result["spatial_bev_displacement_m"][at], [0, 0])
+    assert result["spatial_bev_match_confidence"][at] == 0
+    assert np.isnan(result["spatial_bev_local_offset_m"][at]).all()
+    assert result["spatial_bev_geometry_pair_valid"][at]
+    np.testing.assert_allclose(result["spatial_bev_anchor_cosine"][at], 1)
     assert np.isnan(result["spatial_bev_match_margin"][at])
     assert result["spatial_bev_candidate_count"][at] == 1
 
@@ -74,8 +90,9 @@ def test_ambiguous_match_has_small_weight_instead_of_becoming_reliable_geometry(
     features = np.zeros((2, 5, 5, 2), np.float32)
     valid = np.zeros((2, 5, 5), bool)
     features[0, 2, 2] = features[1, 2, 2] = [1, 0]
+    features[0, 2, 3] = [0, 1]
     features[1, 2, 3] = [1, .01]
-    valid[0, 2, 2] = valid[1, 2, 2:4] = True
+    valid[:, 2, 2:4] = True
     result = match_spatial_bev(features, valid, .5)
     at = (0, 2, 2)
     assert result["spatial_bev_match_state"][at] == 1
@@ -92,13 +109,44 @@ def test_low_confidence_flow_bev_vote_is_weighted_and_not_marked_reliable():
     features = np.zeros((3, 16, 16, 2), np.float32)
     valid = np.zeros((3, 16, 16), bool)
     features[:, 6, 6] = [1, 0]
-    valid[:, 6, 6] = True
+    features[:, 6, 7] = [1, .01]
+    valid[:, 6, 6:8] = True
     flow = np.zeros((2, 16, 16, 2), np.float32)
     flow[..., 0] = .75
     result = cross_space_proposals(maps, features, valid, flow, np.ones((2, 16, 16), bool), .5)
     assert result["flow_bev_discrepancy_supported"][:, 6, 6].all()
     assert not result["flow_bev_discrepancy_valid"].any()
-    np.testing.assert_allclose(result["cross_space_discovery_score"][:, 6, 6], .035, atol=1e-6)
+    assert (result["cross_space_discovery_score"][:, 6, 6] > 0).all()
+    assert (result["cross_space_discovery_score"][:, 6, 6] < .01).all()
+
+
+def test_stable_geometry_and_ambiguous_semantics_preserve_illumination_evidence():
+    inputs = video_case(3)
+    maps = video_proposals(**inputs)
+    features = np.ones((3, 16, 16, 4), np.float32)
+    result = cross_space_proposals(maps, features, np.ones((3, 16, 16), bool),
+        np.zeros((2, 16, 16, 2), np.float32), np.ones((2, 16, 16), bool), .5)
+    assert (result["spatial_bev_match_state"] == 3).all()
+    assert result["bev_flow_matchable_pair"].all()
+    np.testing.assert_allclose(result["ground_flow_geometry_residual_m"], 0)
+    assert result["cross_space_discovery_score"][1, 6, 6] >= .35
+    assert np.isnan(result["spatial_bev_local_residual_m"]).all()
+
+
+def test_coverage_separates_observable_geometry_and_local_descriptor_matching():
+    inputs = video_case(3)
+    inputs["receiver"][0, :, :8] = False
+    maps = video_proposals(**inputs)
+    valid = np.ones((3, 16, 16), bool)
+    valid[:, :, 12:] = False
+    result = cross_space_proposals(maps, np.ones((3, 16, 16, 2)), valid,
+        np.zeros((2, 16, 16, 2)), np.ones((2, 16, 16), bool), .5)
+    report = correspondence_summary(result)
+    assert report["totals"]["observable_receiver_cells"] == 384
+    assert report["totals"]["geometry_anchored_descriptor_cells"] == 256
+    assert report["totals"]["descriptor_coverage"] == 256/384
+    assert report["totals"]["reliable_local_match_cells"] == 0
+    assert not report["correctness_is_measured_accuracy"]
 
 
 def test_metric_difference_can_propose_below_appearance_seed_threshold():

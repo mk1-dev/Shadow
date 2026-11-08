@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_image_cell_indices, bev_mask_to_image, bev_projection, ground_grid, image_mask_to_bev, rasterize_volumes
 from shadow_occ.annotation.cached_bev import sample_cached_bev
+from shadow_occ.annotation.correspondence_view import correspondence_panel
 from shadow_occ.annotation.data import checked_write_image, digest, load_array, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.frame_receiver import frame_index
 from shadow_occ.annotation.entity_memory import CasterMemory, EntityMotionConfig, OwnerScoringConfig, match_entity_motion
@@ -30,7 +31,7 @@ from shadow_occ.annotation.receiver_explanations import box_ray_evidence
 from shadow_occ.annotation.shadow_video import ENTITY_STATES, PHYSICAL_REFERENCE_SOURCES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
 from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage, summarize_signals
 from shadow_occ.annotation.video_correspondence import (CorrespondenceConfig, CrossSpaceGrowthConfig,
-    SPATIAL_MATCH_STATES, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
+    SPATIAL_MATCH_STATES, correspondence_summary, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
 from shadow_occ.annotation.shadow_representation import describe_regions, memory_state, paste_region_image, project_region_memory, refine_image_region
 from shadow_occ.utils.io import write_json
 
@@ -71,7 +72,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
     grid = config.grid()
     world = ground_grid(basis, anchor, grid)
     images, grounds, coordinates, visible, labs, occupied, features, feature_valid, in_image = ([] for _ in range(9))
-    spatial_features, spatial_valid, spatial_sources = [], [], []
+    spatial_features, spatial_valid, spatial_sources, spatial_geometry = [], [], [], []
     for item in observations:
         frame = item["frame"]
         image = cv2.imread(str(resolve_path(frame["image"], base)))
@@ -85,20 +86,34 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
         support = inside.reshape(grid.shape) & (sample_at(ground.astype(np.float32), pixels) >= .999)
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
         lab[..., 0] *= 100/255
-        feature, supported, feature_source = sample_cached_bev(feature_root, item["sample_token"], world)
+        feature, supported, feature_source, geometry = sample_cached_bev(
+            feature_root, item["sample_token"], world, return_geometry=True)
         spatial, spatial_supported, spatial_source = feature, supported, feature_source
         if spatial_feature_root is not None and Path(spatial_feature_root).resolve() != Path(feature_root).resolve():
-            spatial, spatial_supported, spatial_source = sample_cached_bev(spatial_feature_root, item["sample_token"], world)
+            spatial, spatial_supported, spatial_source, geometry = sample_cached_bev(
+                spatial_feature_root, item["sample_token"], world, return_geometry=True)
         if spatial_feature_root is not None and spatial_source.get("history_mode") != "current-only":
             raise ValueError("Spatial discovery requires --history-mode current-only BEV exports")
         if spatial_source.get("history_mode") != "current-only":
             spatial, spatial_supported = np.zeros_like(feature), np.zeros(supported.shape, bool)
+            geometry = {**geometry, "sample_valid": np.zeros_like(supported)}
         for key in ("checkpoint_sha256", "model_config_sha256"):
             if feature_source.get(key) is not None and spatial_source.get(key) is not None and feature_source[key] != spatial_source[key]:
                 raise ValueError("Spatial and temporal BEV caches use different mature models")
+        if spatial_sources:
+            for key in ("checkpoint_sha256", "model_config_sha256", "external_exporter_sha256",
+                        "history_mode", "pc_range", "shape_chw", "coordinate_frame", "layout"):
+                previous = spatial_sources[0].get(key)
+                if previous is not None and spatial_source.get(key) is not None and previous != spatial_source[key]:
+                    raise ValueError(f"Current-only BEV extraction protocol changed within clip: {key}")
         spatial_features.append(spatial)
         spatial_valid.append(spatial_supported & support)
-        spatial_sources.append({"sample_token": item["sample_token"], "history_mode": spatial_source.get("history_mode"),
+        spatial_geometry.append(geometry)
+        spatial_sources.append({**spatial_source, "sample_token": item["sample_token"],
+            "camera_token": frame["sample_data_token"], "camera_timestamp": frame["camera_timestamp"],
+            "camera_minus_bev_seconds": ((frame["camera_timestamp"]-spatial_source["timestamp"])/1e6
+                                         if spatial_source.get("timestamp") is not None else None),
+            "native_validity_source": geometry["validity_source"],
             "available_for_discovery": spatial_source.get("history_mode") == "current-only"})
         images.append(image)
         grounds.append(ground)
@@ -161,6 +176,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
         "entity_motion_config": asdict(entity_config), "entity_suppression_enabled": entity_suppression,
         "discovery_domain": discovery_domain,
         "spatial_feature_sources": spatial_sources,
+        "spatial_geometry": spatial_geometry,
         "spatial_features": np.stack(spatial_features), "spatial_feature_valid": np.stack(spatial_valid),
         "metric_flow": metric_flow["flow_bev_displacement_m"], "metric_flow_valid": metric_flow["flow_bev_valid"],
         "observed_flow": observed, "expected_flow": expected, "occupied": occupied,
@@ -255,7 +271,7 @@ def panel(image, context, slot, maps, regions, proposed, accepted):
     tiles = [(image, "RGB"), (boxes, "3D GT / matched cores cyan"),
              (flow_panel, "flow: observed yellow / geometry blue"),
              (heat(.5+delta/24), "A: signed illumination change"),
-             (heat(residual), "B: metric Flow - BEV" if metric_panel else "B: image flow residual"),
+             (heat(residual), "B: Flow - BEV offset proxy" if metric_panel else "B: image flow residual"),
              (heat(bev_change), "C: current-only BEV change" if spatial_panel else "C: temporal BEV context change"),
              (heat(np.where(maps["entity_explanation_valid_map"][interval], maps["entity_explanation_map"][interval], np.nan)), "D: entity motion explanation"),
              (bev, "E: actual discrepancy proposals"),
@@ -308,6 +324,21 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         maps["proposal_source_bits"][(maps["cross_space_discovery_score"] >= config.seed_score)
                                      | maps["cross_space_region_support"]] |= 8
     timing["proposal_seconds"] = perf_counter()-tick
+    if "bev_flow_matchable_pair" in maps:
+        write_json(output/"correspondence.json", correspondence_summary(maps))
+    if context.get("spatial_geometry"):
+        geometry = context["spatial_geometry"]
+        camera_times = np.asarray([frame["camera_timestamp"] for frame in context["frames"]], np.float64)
+        bev_times = np.asarray([source.get("timestamp", np.nan) for source in context["spatial_feature_sources"]], np.float64)
+        np.savez_compressed(output/"bev_geometry.npz", receiver_world_xyz=context["world"],
+            **{key: np.stack([record[key] for record in geometry]) for key in
+               ("native_uv", "native_valid", "in_range", "interpolation_support", "sample_valid", "resolution_xy_m")},
+            camera_timestamps_us=camera_times, bev_timestamps_us=bev_times,
+            camera_intervals_seconds=np.diff(camera_times)/1e6, bev_intervals_seconds=np.diff(bev_times)/1e6,
+            lidar_to_world=np.asarray([source.get("lidar_to_world", np.full((4, 4), np.nan))
+                                      for source in context["spatial_feature_sources"]]),
+            native_pc_ranges_m=np.asarray([source.get("pc_range", np.full(6, np.nan))
+                                          for source in context["spatial_feature_sources"]]))
     maps.update(context.get("entity_maps", {}))
     context["delta_L"] = inputs["delta_L"]
     regions_by_frame, pool, region_memory_rows = [], [], []
@@ -392,6 +423,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             "regions": [memory_state(entry, identity) for identity, entry in memory.entries.items()]})
     support_index = light_support_index(pool)
     rows, video, reviewed_rows = [], None, []
+    correspondence_video = None
     mask_hashes = {name: hashlib.sha256() for name in ("proposal", "target", "owner")}
     owner_tokens = sorted(caster_memory.records)
     try:
@@ -526,6 +558,15 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 if not video.isOpened():
                     raise RuntimeError("OpenCV MP4 encoder could not open review.mp4")
             video.write(mosaic)
+            if "bev_flow_matchable_pair" in maps and slot < len(chain):
+                correspondence = correspondence_panel(context, maps, slot)
+                checked_write_image(output/f"pair_{slot:03d}_correspondence.jpg", correspondence)
+                if correspondence_video is None:
+                    correspondence_video = cv2.VideoWriter(str(output/"correspondence.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 2,
+                        (correspondence.shape[1], correspondence.shape[0]))
+                    if not correspondence_video.isOpened():
+                        raise RuntimeError("OpenCV MP4 encoder could not open correspondence.mp4")
+                correspondence_video.write(correspondence)
             if len(bank):
                 np.savez_compressed(output/f"{slot:03d}_light_bank.npz", projected_box_masks=bank,
                                     directions_world=directions, projection_valid=bank_valid)
@@ -549,6 +590,8 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     finally:
         if video is not None:
             video.release()
+        if correspondence_video is not None:
+            correspondence_video.release()
     np.savez_compressed(output/"pair_evidence.npz", delta_L=inputs["delta_L"],
         observed_flow_px=inputs["observed_flow"], expected_flow_px=inputs["expected_flow"],
         **{key: value for key, value in maps.items() if value.shape[0] == len(chain)})
@@ -571,8 +614,11 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         "stage": stage, "bev_role": bev_role,
         "modules": ["M1_entity_decomposition", "M2_metric_BEV_flow_discovery", "M3_caster_light_reasoning", "M4_temporal_shadow_representation"],
         "discovery_mode": discovery_mode, "correspondence_config": asdict(correspondence_config),
+        "m2_correspondence": "geometry-anchored-v1",
         "cross_space_growth_config": asdict(growth_config), "spatial_match_states": SPATIAL_MATCH_STATES,
-        "spatial_match_contract": "reliable retains cosine/uniqueness/cycle gates; low confidence contributes a weighted proposal, not reliable geometry; repeated features have zero motion weight",
+        "spatial_match_contract": "world points mapped through each LIDAR_TOP transform before local refinement; local offsets are feature registration residuals, not physical motion; singleton/tied matches are ambiguous with NaN offsets; low-confidence distinct matches retain weighted evidence",
+        "residual_contract": "ground_flow_geometry_residual_px is observed minus geometric image flow; spatial_bev_local_residual_m is feature offset relative to the same-world anchor; flow_bev_discrepancy_m is only a legacy proxy, not shadow speed or truth",
+        "coverage_contract": "correspondence.json separates observable receiver pairs, geometry-anchored descriptors and reliable local matches; consistency diagnostics are not measured correctness",
         "cross_space_growth_contract": "bounded Lab-anchor and boundary constrained growth on currently observed ground; uniform interiors use measured seed-color agreement as appearance support; one-hop same-world temporal seeds require independent valid pairs and current appearance; no flow-as-shadow-speed or masks in missing frames",
         "spatial_feature_sources": context.get("spatial_feature_sources", []),
         "feature_roles": "current-only spatial features for BEV correspondence; temporal/context features for region identity; absent spatial cache is missing evidence",
