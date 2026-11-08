@@ -222,6 +222,8 @@ def video_proposals(lab, receiver, delta_L, exposure_valid, *, observed_flow, ex
         "flow_interpolation_filled": np.zeros(delta_L.shape, bool),
         "flow_confidence_map": confidence,
         "ground_motion_residual_px": flow_residual,
+        "ground_motion_residual_observed_px": np.where(pair_visible & ~occluded & flow_present
+            & np.isfinite(expected_flow).all(axis=-1), np.linalg.norm(observed_flow-expected_flow, axis=-1), np.nan),
         "pair_discrepancy_score_map": np.where(complete_by_interval, pair_score, np.nan),
         "pair_partial_appearance_score_map": pair_partial,
         "ground_flow_correspondence_score": ground_correspondence,
@@ -318,6 +320,14 @@ class ShadowRegionMemory:
                     if a is not None and b is not None:
                         scores[row, col] += extra*float(np.clip(np.dot(a, b), 0, 1))
                         weight += extra
+                # Current-only semantics can disambiguate a geometrically
+                # overlapping region, but cannot join distant look-alike roads.
+                a, b = previous.get("spatial_bev_descriptor"), region.get("spatial_bev_descriptor")
+                anchors = [value.get("spatial_bev_support", {}).get("anchor_consistency") for value in (previous, region)]
+                if overlap > 0 and a is not None and b is not None and all(value is not None for value in anchors):
+                    extra = .15*float(np.clip(min(anchors), 0, 1))
+                    scores[row, col] += extra*float(np.clip(np.dot(a, b), 0, 1))
+                    weight += extra
                 old_casters, new_casters = set(previous.get("caster_candidates", [])), set(region.get("caster_candidates", []))
                 if old_casters and new_casters:
                     scores[row, col] += .1*len(old_casters & new_casters)/len(old_casters | new_casters)

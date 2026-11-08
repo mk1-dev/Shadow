@@ -3,7 +3,7 @@ import numpy as np
 from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_projection, ground_grid
 from shadow_occ.annotation.physics_motion import project_world
 from shadow_occ.annotation.video_correspondence import (CrossSpaceGrowthConfig, cross_space_proposals,
-    correspondence_summary, grow_cross_space_regions, lift_flow_to_bev, match_spatial_bev)
+    correspondence_summary, ground_flow_confidence, grow_cross_space_regions, lift_flow_to_bev, match_spatial_bev)
 from shadow_occ.annotation.shadow_video import VideoShadowConfig, refine_regions, video_proposals
 from tests.test_bev_flow import example
 from tests.test_shadow_video import video_case
@@ -101,7 +101,7 @@ def test_ambiguous_match_has_small_weight_instead_of_becoming_reliable_geometry(
     assert not result["spatial_bev_match_valid"][at]
 
 
-def test_low_confidence_flow_bev_vote_is_weighted_and_not_marked_reliable():
+def test_low_confidence_local_match_cannot_add_a_motion_vote_or_shadow_without_appearance():
     inputs = video_case(3)
     inputs["lab"][..., 0] = 70
     inputs["delta_L"][:] = 0
@@ -114,10 +114,10 @@ def test_low_confidence_flow_bev_vote_is_weighted_and_not_marked_reliable():
     flow = np.zeros((2, 16, 16, 2), np.float32)
     flow[..., 0] = .75
     result = cross_space_proposals(maps, features, valid, flow, np.ones((2, 16, 16), bool), .5)
-    assert result["flow_bev_discrepancy_supported"][:, 6, 6].all()
+    assert not result["flow_bev_discrepancy_supported"][:, 6, 6].any()
     assert not result["flow_bev_discrepancy_valid"].any()
-    assert (result["cross_space_discovery_score"][:, 6, 6] > 0).all()
-    assert (result["cross_space_discovery_score"][:, 6, 6] < .01).all()
+    np.testing.assert_allclose(result["cross_space_discovery_score"], 0, atol=2e-6)
+    assert np.isnan(result["spatial_bev_local_offset_m"][:, 6, 6]).all()
 
 
 def test_stable_geometry_and_ambiguous_semantics_preserve_illumination_evidence():
@@ -149,7 +149,7 @@ def test_coverage_separates_observable_geometry_and_local_descriptor_matching():
     assert not report["correctness_is_measured_accuracy"]
 
 
-def test_metric_difference_can_propose_below_appearance_seed_threshold():
+def test_anchor_consistency_proposes_weak_appearance_with_optional_flow_support():
     inputs = video_case(3)
     inputs["lab"][1:, 5:10, 5:10, 0] = 68
     inputs["delta_L"] = np.diff(inputs["lab"][..., 0], axis=0)
@@ -161,13 +161,76 @@ def test_metric_difference_can_propose_below_appearance_seed_threshold():
     flow = np.zeros((2, 16, 16, 2), np.float32)
     flow[..., 0] = .75
     result = cross_space_proposals(maps, features, valid, flow, np.ones(valid[:-1].shape, bool), .5)
-    assert result["cross_space_discovery_score"][1, 6, 6] >= .35
+    with_flow_score = result["cross_space_discovery_score"][1, 6, 6]
+    assert with_flow_score >= .35
     assert result["flow_bev_discrepancy_valid"][0, 6, 6]
     assert np.isnan(result["cross_space_entity_factor"][0, 6, 6])  # Missing entity prediction remains missing.
     assert np.isnan(result["cross_space_complete_score"][1, 6, 6])
     assert result["cross_space_partial_score"][1, 6, 6] >= .35
     result = cross_space_proposals(maps, features, valid, flow, np.zeros(valid[:-1].shape, bool), .5)
-    assert result["cross_space_discovery_score"][1, 6, 6] < .35
+    assert .35 <= result["cross_space_discovery_score"][1, 6, 6] < with_flow_score
+    assert not result["flow_appearance_support_score"].any()
+
+
+def test_anchor_first_proposes_without_unique_local_match_or_observed_flow():
+    inputs = video_case(3)
+    inputs["lab"][1:, 5:10, 5:10, 0] = 68
+    inputs["delta_L"] = np.diff(inputs["lab"][..., 0], axis=0)
+    inputs["observed_flow"][:] = np.nan
+    maps = video_proposals(**inputs)
+    assert maps["appearance_score_map"][1, 6, 6] < .35
+    result = cross_space_proposals(maps, np.ones((3, 16, 16, 4)), np.ones((3, 16, 16), bool),
+        np.full((2, 16, 16, 2), np.nan), np.zeros((2, 16, 16), bool), .5)
+    assert result["cross_space_discovery_score"][1, 6, 6] >= .35
+    assert (result["spatial_bev_match_state"] == 3).all()
+    assert not result["m2_flow_state"].any()
+    assert np.isnan(result["m2_flow_quality"]).all()
+    assert not result["flow_appearance_support_score"].any()
+
+
+def test_large_ground_residual_cannot_increase_shadow_score():
+    scores = []
+    for observed in (0, 100, np.nan):
+        inputs = video_case(3)
+        inputs["lab"][1:, 5:10, 5:10, 0] = 68
+        inputs["delta_L"] = np.diff(inputs["lab"][..., 0], axis=0)
+        inputs["observed_flow"][:] = observed
+        maps = video_proposals(**inputs)
+        result = cross_space_proposals(maps, np.ones((3, 16, 16, 4)), np.ones((3, 16, 16), bool),
+            np.zeros((2, 16, 16, 2)), np.ones((2, 16, 16), bool), .5)
+        scores.append(result["cross_space_discovery_score"].copy())
+        if observed == 100:
+            assert (result["m2_flow_state"] == 1).all()
+            assert not result["flow_appearance_support_score"].any()
+    assert scores[0][1, 6, 6] > scores[1][1, 6, 6]
+    np.testing.assert_allclose(scores[1], scores[2])
+
+
+def test_flow_confidence_separates_bad_fb_texture_missing_and_wrong_geometry():
+    inputs = video_case(3)
+    inputs["observed_flow"][:, 3, 3] = 100
+    inputs["fb_consistent"][:, 4, 4] = False
+    inputs["texture_support"][:, 5, 5] = False
+    inputs["observed_flow"][:, 6, 6] = np.nan
+    result = ground_flow_confidence(video_proposals(**inputs))
+    for y in (3, 4, 5):
+        assert (result["m2_flow_state"][:, y, y] == 1).all()
+    assert (result["m2_flow_state"][:, 2, 2] == 2).all()
+    assert (result["m2_flow_state"][:, 6, 6] == 0).all()
+    assert np.isnan(result["m2_flow_quality"][:, 6, 6]).all()
+    # A failed FB check is low-confidence observed flow, not absence of data.
+    assert np.isfinite(result["ground_flow_geometry_residual_px"][:, 4, 4]).all()
+
+
+def test_feature_change_alone_is_not_shadow_evidence():
+    inputs = video_case(3)
+    inputs["lab"][..., 0] = 70
+    inputs["delta_L"][:] = 0
+    rng = np.random.default_rng(6)
+    result = cross_space_proposals(video_proposals(**inputs), rng.normal(size=(3, 16, 16, 8)),
+        np.ones((3, 16, 16), bool), np.zeros((2, 16, 16, 2)), np.ones((2, 16, 16), bool), .5)
+    assert (result["spatial_bev_feature_change"] > .1).any()
+    np.testing.assert_allclose(result["cross_space_discovery_score"], 0, atol=2e-6)
 
 
 def test_temporal_only_missing_spatial_features_cannot_claim_cross_space_discovery():

@@ -25,16 +25,21 @@ No new model training or RGB/DIS/GT dataset rebuild is needed. The pipeline
 retains caster/light history, RGB-refined image masks, short-gap region memory
 and a separate Shadow-BEV instead of merging shadows into entity occupancy.
 
-M2 v8 uses geometry-anchored BEV correspondence: world receiver points are mapped
+M2 v8+ uses anchor-first cross-space reasoning: world receiver points are mapped
 through each frame's LIDAR_TOP transform, native-grid validity and interpolation
 support before local feature refinement. Local offsets are feature-registration
-residuals, not ground motion. Reliable, low-confidence, ambiguous and missing
-matches remain distinct. `correspondence.mp4`, `bev_geometry.npz` and
+residuals, not ground motion. Same-world anchor consistency supports observed
+illumination changes without requiring a unique local match. Flow is reliable,
+low-confidence or missing; large residuals never add shadow evidence. Reliable,
+low-confidence, ambiguous and missing BEV matches remain distinct.
+`correspondence.mp4`, `bev_geometry.npz` and
 `correspondence.json` expose the spatial mechanism and explicit coverage counts.
 Cross-space seeds grow within currently observed Lab/boundary-compatible ground
 and can seed an independently valid adjacent frame, without treating material
 flow as shadow speed. Proposal growth does not change physical label acceptance.
 Existing feature/flow caches can be reused with a new output directory.
+Current-only interior/boundary region descriptors support continuity only with
+geometric overlap; caster/light acceptance and owner scoring rules are unchanged.
 
 The existing three-frame A/B/C/D pipeline remains a frozen baseline. Existing
 3D object GT supplies caster tracks; decoded mature-model 3D predictions provide

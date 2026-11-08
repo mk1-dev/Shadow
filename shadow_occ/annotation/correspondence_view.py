@@ -45,7 +45,7 @@ def correspondence_panel(context, maps, slot):
             native.append(np.zeros_like(registered))
     local = _heat(np.where(maps["bev_flow_matchable_pair"][slot],
                            maps["spatial_bev_match_confidence"][slot], np.nan))
-    yy, xx = np.where(maps["spatial_bev_match_usable"][slot])
+    yy, xx = np.where(maps["spatial_bev_match_valid"][slot])
     for index in np.linspace(0, max(len(xx)-1, 0), min(len(xx), 80), dtype=int):
         y, x = yy[index], xx[index]
         vector = maps["spatial_bev_local_offset_m"][slot, y, x]/context["grid"].resolution
@@ -64,15 +64,21 @@ def correspondence_panel(context, maps, slot):
             if np.isfinite(start).all() and np.isfinite(end).all():
                 cv2.arrowedLine(flow, tuple(np.rint(start).astype(int)), tuple(np.rint(end).astype(int)), color, 1)
     delta = np.where(maps["exposure_valid"][slot], context["delta_L"][slot], np.nan)
+    flow_state = np.zeros((*receiver.shape[1:], 3), np.uint8)
+    flow_state[maps["m2_flow_state"][slot] == 1] = (0, 160, 240)
+    flow_state[maps["m2_flow_state"][slot] == 2] = (70, 200, 70)
     tiles = [(rgb, "World receiver anchors: camera"),
         (native[0], "Native BEV t: channels 0..2 + anchors"),
         (native[1], "Native BEV t+1: geometry anchors"),
         (registered, "World-aligned current-only BEV"),
+        (_heat(maps["bev_anchor_consistency"][slot]), "Primary: same-world anchor consistency"),
         (local, "Local offsets + confidence (not motion)"),
         (flow, "Image flow: observed / geometric"),
         (_heat(maps["ground_flow_geometry_residual_px"][slot]/6), "Ground geometry flow residual / 6 px"),
+        (flow_state, "Flow: low orange / reliable green"),
         (_heat(.5+delta/24), "Exposure-corrected signed Lab-L"),
-        (_heat(maps["proposal_score_map"][slot+1]), "Next-frame discrepancy proposals")]
+        (_heat(maps["proposal_score_map"][slot+1]), "Next-frame discrepancy proposals"),
+        (_heat(maps["m2_flow_quality"][slot]), "Ground-flow quality (not probability)")]
     panels = []
     for value, title in tiles:
         tile = np.zeros((256, 384, 3), np.uint8)
@@ -81,4 +87,4 @@ def correspondence_panel(context, maps, slot):
         tile[26:26+resized.shape[0], :resized.shape[1]] = resized
         cv2.putText(tile, title, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 255), 1)
         panels.append(tile)
-    return np.vstack([np.hstack(panels[start:start+3]) for start in range(0, 9, 3)])
+    return np.vstack([np.hstack(panels[start:start+3]) for start in range(0, len(panels), 3)])

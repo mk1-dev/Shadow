@@ -14,9 +14,9 @@ class CorrespondenceConfig:
     minimum_cosine: float = .2
     minimum_margin: float = .02
     cycle_tolerance_cells: float = 1.0
-    displacement_scale_m: float = .75
-    flow_weight: float = .35
-    feature_weight: float = .25
+    displacement_scale_m: float = .75  # Retained for legacy proxy readers, not positive evidence.
+    flow_weight: float = .35  # Reliable material correspondence supporting observed appearance.
+    feature_weight: float = .25  # Same-world anchor consistency, not feature-change magnitude.
 
     def validate(self):
         if (not isinstance(self.radius_cells, int) or not 1 <= self.radius_cells <= 8
@@ -44,7 +44,38 @@ class CrossSpaceGrowthConfig:
             raise ValueError("Invalid cross-space region growth settings")
 
 
+@dataclass(frozen=True)
+class FlowConfidenceConfig:
+    maximum_ground_residual_px: float = 3.0
+    residual_scale_px: float = 3.0
+    minimum_fb_confidence: float = .5
+
+    def validate(self):
+        if (not np.isfinite(list(self.__dict__.values())).all()
+                or min(self.maximum_ground_residual_px, self.residual_scale_px) <= 0
+                or not 0 < self.minimum_fb_confidence <= 1):
+            raise ValueError("Invalid ground-flow confidence settings")
+
+
 SPATIAL_MATCH_STATES = {0: "missing", 1: "low_confidence", 2: "reliable", 3: "ambiguous"}
+FLOW_STATES = {0: "missing", 1: "low_confidence", 2: "reliable"}
+
+
+def ground_flow_confidence(maps, config=None):
+    """Judge material correspondence, never score large residuals as shadows."""
+    config = config or FlowConfidenceConfig()
+    config.validate()
+    residual = maps["ground_motion_residual_observed_px"]
+    observed = maps["pair_correspondence_valid"] & maps["flow_present"] & ~maps["flow_occluded"] & np.isfinite(residual)
+    fb_quality = maps["flow_confidence_map"]
+    texture = ~maps["flow_low_texture"]
+    quality = fb_quality*np.exp(-np.nan_to_num(residual, nan=0)/config.residual_scale_px)*texture
+    reliable = (observed & maps["fb_consistent"] & texture
+                & (fb_quality >= config.minimum_fb_confidence) & (residual <= config.maximum_ground_residual_px))
+    return {"m2_flow_state": np.where(reliable, 2, np.where(observed, 1, 0)).astype(np.uint8),
+        "m2_flow_quality": np.where(observed, quality, np.nan).astype(np.float32),
+        "m2_flow_reliable": reliable,
+        "ground_flow_geometry_residual_px": np.where(observed, residual, np.nan)}
 
 
 def lift_flow_to_bev(world, frames, pixels, flow, flow_valid, receiver, basis, projection, resolution):
@@ -184,36 +215,40 @@ def match_spatial_bev(features, valid, resolution, config=None):
         "spatial_bev_match_cosine": match_cosine, "spatial_bev_match_margin": match_margin,
         "spatial_bev_geometry_pair_valid": valid[:-1] & valid[1:],
         "spatial_bev_anchor_cosine": np.where(np.isfinite(change), 1-change, np.nan),
-        "spatial_bev_local_offset_m": vectors,
-        "spatial_bev_local_residual_m": np.linalg.norm(vectors, axis=-1)}
+        "spatial_bev_local_offset_m": np.where(good[..., None], vectors, np.nan),
+        "spatial_bev_local_residual_m": np.where(good, np.linalg.norm(vectors, axis=-1), np.nan)}
 
 
 def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_valid,
-                          resolution, config=None):
-    """Propose from metric cross-space discrepancy; physics still accepts labels."""
+                          resolution, config=None, *, flow_config=None):
+    """Anchor-first appearance reasoning; local matching is optional refinement."""
     config = config or CorrespondenceConfig()
     signals = match_spatial_bev(spatial_features, spatial_valid & maps["receiver_valid_by_frame"], resolution, config)
+    flow_signals = ground_flow_confidence(maps, flow_config)
     length = maps["receiver_valid_by_frame"].shape[0]
     score = np.zeros_like(maps["proposal_score_map"])
     complete_score, partial_score = np.zeros_like(score), np.zeros_like(score)
     complete_valid = np.zeros(score.shape, bool)
+    anchor_score, flow_score = np.zeros_like(score), np.zeros_like(score)
+    anchor_by_frame = np.full(score.shape, np.nan, np.float32)
     known_entity = maps["entity_explanation_valid_map"]
     entity_factor = np.where(known_entity, 1-maps["entity_explanation_map"], np.nan)
     paired = maps["exposure_valid"]
-    flow_quality = signals["spatial_bev_match_confidence"]*maps["flow_confidence_map"]
-    matched = flow_valid & signals["spatial_bev_match_usable"] & paired
-    reliable = matched & signals["spatial_bev_match_valid"]
-    difference = np.linalg.norm(flow_bev-signals["spatial_bev_displacement_m"], axis=-1)
-    flow_score = np.where(matched, np.nan_to_num(difference/config.displacement_scale_m), 0)
-    feature_change = signals["spatial_bev_feature_change"]
-    feature_score = np.where(paired & np.isfinite(feature_change), feature_change/2, 0)
-    extra = config.flow_weight*flow_quality*np.clip(flow_score, 0, 1)+config.feature_weight*feature_score
+    anchor_valid = signals["spatial_bev_geometry_pair_valid"]
+    anchor = np.where(anchor_valid, np.clip(signals["spatial_bev_anchor_cosine"], 0, 1), np.nan)
+    reliable = flow_valid & signals["spatial_bev_match_valid"] & flow_signals["m2_flow_reliable"] & paired
+    difference = np.linalg.norm(flow_bev-signals["spatial_bev_local_offset_m"], axis=-1)
+    flow_quality = np.where(flow_signals["m2_flow_reliable"] & flow_valid, flow_signals["m2_flow_quality"], 0)
     for slot in range(length-1):
         for at in (slot, slot+1):
             base = maps["appearance_score_map"][at]
-            observed = (paired[slot] & (np.isfinite(feature_change[slot]) | matched[slot])
-                        & maps["receiver_valid_by_frame"][at])
-            raw = np.clip(base+extra[slot], 0, 1)
+            observed = paired[slot] & anchor_valid[slot] & maps["receiver_valid_by_frame"][at]
+            anchor_support = base*config.feature_weight*np.nan_to_num(anchor[slot])
+            flow_support = base*config.flow_weight*flow_quality[slot]
+            raw = np.clip(base+anchor_support+flow_support, 0, 1)
+            anchor_score[at] = np.maximum(anchor_score[at], np.where(observed, anchor_support, 0))
+            flow_score[at] = np.maximum(flow_score[at], np.where(observed, flow_support, 0))
+            anchor_by_frame[at] = np.fmax(anchor_by_frame[at], np.where(observed, anchor[slot], np.nan))
             # The unknown channel does NOT apply an invented entity complement.
             # It proposes unexplained observations, then defers to M3 physics.
             full = np.where(observed & known_entity[slot], raw*entity_factor[slot], 0)
@@ -223,14 +258,16 @@ def cross_space_proposals(maps, spatial_features, spatial_valid, flow_bev, flow_
             partial_score[at] = np.maximum(partial_score[at], partial)
             score[at] = np.maximum(complete_score[at], partial_score[at])
     maps.update(signals)
+    maps.update(flow_signals)
     geometric_pair = maps["receiver_valid_by_frame"][:-1] & maps["receiver_valid_by_frame"][1:]
     maps.update(flow_bev_displacement_m=flow_bev, flow_bev_valid=flow_valid,
         bev_flow_observable_pair=geometric_pair,
         bev_flow_matchable_pair=geometric_pair & signals["spatial_bev_geometry_pair_valid"],
-        ground_flow_geometry_residual_px=maps["ground_motion_residual_px"].copy(),
         ground_flow_geometry_residual_m=np.where(flow_valid, np.linalg.norm(flow_bev, axis=-1), np.nan),
-        flow_bev_discrepancy_m=np.where(matched, difference, np.nan),
-        flow_bev_discrepancy_valid=reliable, flow_bev_discrepancy_supported=matched,
+        flow_bev_discrepancy_m=np.where(reliable, difference, np.nan),
+        flow_bev_discrepancy_valid=reliable, flow_bev_discrepancy_supported=reliable,
+        bev_anchor_consistency=anchor, bev_anchor_consistency_by_frame=anchor_by_frame,
+        anchor_appearance_support_score=anchor_score, flow_appearance_support_score=flow_score,
         cross_space_discovery_score=score,
         cross_space_complete_score=np.where(complete_valid, complete_score, np.nan),
         cross_space_partial_score=partial_score, cross_space_complete_valid=complete_valid,
@@ -249,6 +286,8 @@ def correspondence_summary(maps):
             "geometry_anchored_descriptor_cells": int(matchable.sum()),
             "reliable_local_match_cells": int(reliable.sum()),
             "ambiguous_local_match_cells": int(((maps["spatial_bev_match_state"][slot] == 3) & matchable).sum())}
+        for value, label in FLOW_STATES.items():
+            row[label+"_flow_cells"] = int((matchable & (maps["m2_flow_state"][slot] == value)).sum())
         row["descriptor_coverage"] = float(matchable.sum()/observable.sum()) if observable.any() else None
         row["reliable_local_match_coverage"] = float(reliable.sum()/matchable.sum()) if matchable.any() else None
         for name in ("spatial_bev_anchor_cosine", "spatial_bev_cycle_error_cells",
@@ -257,7 +296,8 @@ def correspondence_summary(maps):
             row[name+"_median"] = float(np.median(values)) if len(values) else None
         rows.append(row)
     totals = {key: sum(row[key] for row in rows) for key in ("observable_receiver_cells",
-        "geometry_anchored_descriptor_cells", "reliable_local_match_cells", "ambiguous_local_match_cells")}
+        "geometry_anchored_descriptor_cells", "reliable_local_match_cells", "ambiguous_local_match_cells",
+        "missing_flow_cells", "low_confidence_flow_cells", "reliable_flow_cells")}
     observable, matchable = totals["observable_receiver_cells"], totals["geometry_anchored_descriptor_cells"]
     totals["descriptor_coverage"] = totals["geometry_anchored_descriptor_cells"]/observable if observable else None
     totals["reliable_local_match_coverage"] = totals["reliable_local_match_cells"]/matchable if matchable else None
@@ -304,6 +344,8 @@ def grow_cross_space_regions(maps, lab, resolution, video_config, *, timestamps=
                          & (lab[target, ..., 0] <= lab[source, ..., 0]+config.light_tolerance_L)
                          & (maps["boundary_confidence"][target] <= config.maximum_boundary))
             value = np.where(supported, score[source]*config.temporal_decay, 0)
+            if "bev_anchor_consistency" in maps:
+                value *= np.nan_to_num(maps["bev_anchor_consistency"][slot])
             better = value > temporal_score[target]
             temporal_score[target] = np.maximum(temporal_score[target], value)
             temporal_source[target][better] = source

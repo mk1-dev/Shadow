@@ -80,3 +80,49 @@ def test_region_descriptors_retain_appearance_shape_and_material_correspondence(
     assert regions[0]["appearance_descriptor"].shape == (24,)
     assert regions[0]["boundary_descriptor"].shape == (3,)
     assert regions[0]["flow_correspondence"]["displacement_m"] == [.5, 0.]
+
+
+def test_current_only_region_descriptor_balances_interior_and_boundary_not_background():
+    item = region()
+    mask = item["mask"]
+    interior = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    features = np.full((16, 16, 2), -100, np.float32)
+    features[mask & ~interior] = [1, 0]
+    features[interior] = [0, 1]
+    lab = np.full((16, 16, 3), [60, 128, 128], np.float32)
+    describe_regions([item], lab, np.zeros((16, 16)), spatial_features=features,
+        spatial_valid=np.ones((16, 16), bool), anchor_consistency=np.full((16, 16), .9))
+    np.testing.assert_allclose(item["spatial_bev_descriptor"], [2**-.5, 2**-.5], atol=1e-6)
+    assert item["spatial_bev_support"]["interior_cells"] == 4
+    assert item["spatial_bev_support"]["boundary_cells"] == 12
+    assert item["spatial_bev_support"]["anchor_consistency"] == .9
+    memory = ShadowRegionMemory(.5)
+    identity = memory.update([item], 0)[0]["shadow_track_id"]
+    state = memory_state(memory.entries[identity], identity)
+    assert state["spatial_bev_descriptor"] is not None
+    # Current missing evidence is not silently filled from the previous frame.
+    following = region()
+    describe_regions([following], lab, np.zeros((16, 16)), spatial_features=features,
+        spatial_valid=np.zeros((16, 16), bool))
+    memory.update([following], 500000)
+    assert memory_state(memory.entries[identity], identity)["spatial_bev_descriptor"] is None
+
+
+def test_current_only_bev_disambiguates_only_geometrically_overlapping_regions():
+    def item(x=4, signature=(1., 0.)):
+        result = region(x)
+        result["spatial_bev_descriptor"] = np.asarray(signature)
+        result["spatial_bev_support"] = {"anchor_consistency": .9}
+        return result
+    memory = ShadowRegionMemory(.5)
+    identity = memory.update([item()], 0)[0]["shadow_track_id"]
+    linked = memory.update([item(signature=(0., 1.)), item()], 500000)
+    assert linked[1]["shadow_track_id"] == identity
+    assert linked[0]["shadow_track_id"] != identity
+    scores = []
+    for signature in ((1., 0.), (0., 1.)):
+        memory = ShadowRegionMemory(.5)
+        memory.update([item()], 0)
+        linked = memory.update([item(x=8, signature=signature)], 500000)
+        scores.append(linked[0]["temporal_consistency"])
+    assert scores[0] == scores[1]  # Similar road semantics cannot create a spatial match.

@@ -30,8 +30,8 @@ from shadow_occ.annotation.physics_motion import pair_evidence, project_world, s
 from shadow_occ.annotation.receiver_explanations import box_ray_evidence
 from shadow_occ.annotation.shadow_video import ENTITY_STATES, PHYSICAL_REFERENCE_SOURCES, ShadowRegionMemory, VideoShadowConfig, refine_regions, video_proposals
 from shadow_occ.annotation.shadow_projection import projection_coverage, reviewed_projection_coverage, summarize_signals
-from shadow_occ.annotation.video_correspondence import (CorrespondenceConfig, CrossSpaceGrowthConfig,
-    SPATIAL_MATCH_STATES, correspondence_summary, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
+from shadow_occ.annotation.video_correspondence import (CorrespondenceConfig, CrossSpaceGrowthConfig, FlowConfidenceConfig,
+    FLOW_STATES, SPATIAL_MATCH_STATES, correspondence_summary, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
 from shadow_occ.annotation.shadow_representation import describe_regions, memory_state, paste_region_image, project_region_memory, refine_image_region
 from shadow_occ.utils.io import write_json
 
@@ -262,17 +262,17 @@ def panel(image, context, slot, maps, regions, proposed, accepted):
         trail, _, valid = project_world(world, context["projection"])
         if valid.sum() >= 2:
             cv2.polylines(shadow_bev, [np.rint(trail[valid]).astype(np.int32)], False, (255, 255, 255), 1)
-    spatial_panel = "spatial_bev_feature_change" in maps
-    bev_change = maps["spatial_bev_feature_change"][interval]/2 if spatial_panel else maps["bev_feature_change"][interval]
-    metric_panel = "flow_bev_discrepancy_m" in maps
-    residual = maps["flow_bev_discrepancy_m"][interval]/.75 if metric_panel else maps["ground_motion_residual_px"][interval]/6
+    spatial_panel = "bev_anchor_consistency" in maps
+    bev_change = maps["bev_anchor_consistency"][interval] if spatial_panel else maps["bev_feature_change"][interval]
+    metric_panel = "m2_flow_quality" in maps
+    residual = maps["m2_flow_quality"][interval] if metric_panel else maps["ground_motion_residual_px"][interval]/6
     delta = np.where(maps["exposure_valid"][interval], context["delta_L"][interval], np.nan)
     projection = context.get("projection_review_mask", np.zeros_like(regions[0]["mask"]) if regions else np.zeros(bev.shape[:2], bool))
     tiles = [(image, "RGB"), (boxes, "3D GT / matched cores cyan"),
              (flow_panel, "flow: observed yellow / geometry blue"),
              (heat(.5+delta/24), "A: signed illumination change"),
-             (heat(residual), "B: Flow - BEV offset proxy" if metric_panel else "B: image flow residual"),
-             (heat(bev_change), "C: current-only BEV change" if spatial_panel else "C: temporal BEV context change"),
+             (heat(residual), "B: ground flow quality" if metric_panel else "B: image flow residual"),
+             (heat(bev_change), "C: same-world BEV anchor" if spatial_panel else "C: temporal BEV context change"),
              (heat(np.where(maps["entity_explanation_valid_map"][interval], maps["entity_explanation_map"][interval], np.nan)), "D: entity motion explanation"),
              (bev, "E: actual discrepancy proposals"),
              (heat(projection.astype(float)), "box/light coverage before scoring"),
@@ -311,11 +311,13 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     tick = perf_counter()
     maps = video_proposals(**inputs, caster_prior=prior, config=config, bev_role=bev_role)
     correspondence_config = CorrespondenceConfig()
+    flow_config = FlowConfidenceConfig()
     growth_config = CrossSpaceGrowthConfig()
     if discovery_mode == "cross-space" and "spatial_features" in context:
         original = maps["proposal_score_map"].copy()
         maps = cross_space_proposals(maps, context["spatial_features"], context["spatial_feature_valid"],
-            context["metric_flow"], context["metric_flow_valid"], context["grid"].resolution, correspondence_config)
+            context["metric_flow"], context["metric_flow_valid"], context["grid"].resolution, correspondence_config,
+            flow_config=flow_config)
         maps = grow_cross_space_regions(maps, inputs["lab"], context["grid"].resolution, config,
             timestamps=[frame["camera_timestamp"] for frame in context["frames"]], config=growth_config)
         maps["proposal_score_map"] = np.maximum(original,
@@ -365,9 +367,15 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         flow_slot = min(slot, len(chain)-1)
         flow = context.get("metric_flow")
         flow_valid = context.get("metric_flow_valid")
+        if flow_valid is not None and "m2_flow_reliable" in maps:
+            flow_valid = flow_valid & maps["m2_flow_reliable"]
+        spatial_region = "bev_anchor_consistency_by_frame" in maps
         describe_regions(regions, inputs["lab"][slot], maps["boundary_confidence"][slot],
                          flow[flow_slot] if flow is not None and slot < len(chain) else None,
-                         flow_valid[flow_slot] if flow_valid is not None and slot < len(chain) else None)
+                         flow_valid[flow_slot] if flow_valid is not None and slot < len(chain) else None,
+                         spatial_features=context["spatial_features"][slot] if spatial_region else None,
+                         spatial_valid=context["spatial_feature_valid"][slot] & maps["receiver_valid_by_frame"][slot] if spatial_region else None,
+                         anchor_consistency=maps["bev_anchor_consistency_by_frame"][slot] if spatial_region else None)
         image_shape = context["images"][slot].shape[:2]
         cell_indices = bev_image_cell_indices(frame["projection_world_to_image"], context["basis"], context["grid"], image_shape)
         image_cell_maps.append(cell_indices)
@@ -484,6 +492,9 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                     "image_mask_box_xyxy": region["image_mask_box_xyxy"],
                     "visibility_status": region["visibility_status"],
                     "boundary_descriptor": region["boundary_descriptor"].tolist(),
+                    "spatial_bev_descriptor": (region["spatial_bev_descriptor"].tolist()
+                                               if region["spatial_bev_descriptor"] is not None else None),
+                    "spatial_bev_support": region["spatial_bev_support"],
                     "flow_correspondence": region.get("flow_correspondence"),
                     "caster_candidates": region["caster_candidates"],
                     "complete_discrepancy_cells": int((mask & maps["discrepancy_evidence_complete"][slot]).sum()),
@@ -614,22 +625,24 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         "stage": stage, "bev_role": bev_role,
         "modules": ["M1_entity_decomposition", "M2_metric_BEV_flow_discovery", "M3_caster_light_reasoning", "M4_temporal_shadow_representation"],
         "discovery_mode": discovery_mode, "correspondence_config": asdict(correspondence_config),
-        "m2_correspondence": "geometry-anchored-v1",
+        "m2_correspondence": "anchor-first-reasoning-v1",
+        "m2_flow_config": asdict(flow_config), "m2_flow_states": FLOW_STATES,
         "cross_space_growth_config": asdict(growth_config), "spatial_match_states": SPATIAL_MATCH_STATES,
-        "spatial_match_contract": "world points mapped through each LIDAR_TOP transform before local refinement; local offsets are feature registration residuals, not physical motion; singleton/tied matches are ambiguous with NaN offsets; low-confidence distinct matches retain weighted evidence",
-        "residual_contract": "ground_flow_geometry_residual_px is observed minus geometric image flow; spatial_bev_local_residual_m is feature offset relative to the same-world anchor; flow_bev_discrepancy_m is only a legacy proxy, not shadow speed or truth",
+        "spatial_match_contract": "same-world anchor is primary; only reliable local offsets refine correspondence; low-confidence distinct matches remain diagnostic; singleton/tied matches are ambiguous with NaN offsets; none are ground or shadow motion",
+        "residual_contract": "ground_flow_geometry_residual_px includes finite low-confidence observations for diagnosis; spatial_bev_local_residual_m and Flow-minus-BEV proxy require reliable local refinement; residual magnitude never adds positive shadow evidence",
         "coverage_contract": "correspondence.json separates observable receiver pairs, geometry-anchored descriptors and reliable local matches; consistency diagnostics are not measured correctness",
         "cross_space_growth_contract": "bounded Lab-anchor and boundary constrained growth on currently observed ground; uniform interiors use measured seed-color agreement as appearance support; one-hop same-world temporal seeds require independent valid pairs and current appearance; no flow-as-shadow-speed or masks in missing frames",
         "spatial_feature_sources": context.get("spatial_feature_sources", []),
         "feature_roles": "current-only spatial features for BEV correspondence; temporal/context features for region identity; absent spatial cache is missing evidence",
         "flow_BEV_units": "horizontal anchor-grid x/y meters per actual camera interval; ground-ray lift in destination camera",
-        "proposal_source_bits": {"1": "appearance", "2": "ground-referenced illumination", "4": "caster-guided appearance", "8": "metric flow-BEV cross-space proposal"},
+        "proposal_source_bits": {"1": "appearance", "2": "ground-referenced illumination", "4": "caster-guided appearance", "8": "anchor-first cross-space proposal and observed growth"},
         "temporal_representation": "RGB-refined observed masks + boundary/Lab/BEV/material correspondence + alternative caster/light motion; missing tracks keep state but emit no masks",
         "image_label_contract": "weak positive image pixels require RGB region AND physical BEV support; grid and image masks are separate, not occupancy",
         "discovery_domain": context.get("discovery_domain", "receiver"),
         "domain_contract": "image-rays adds observed entity surfaces to candidate search only; physics, illumination events and positive targets remain on visible ground",
         "owner_scoring": owner_scoring, "owner_scoring_config": asdict(owner_config), "timing": timing,
-        "discrepancy_definition": "appearance plus confidence-weighted metric flow/BEV disagreement and current-only feature change; union with base/static/caster proposals",
+        "discrepancy_definition": "appearance * (1 + feature_weight * positive_same_world_anchor_cosine + flow_weight * reliable_ground_flow_quality), then known entity complement; unknown entity stays partial, local BEV refinement optional",
+        "region_identity_contract": "balanced current-only interior/boundary BEV descriptor can support region linking only with observed or caster-projected spatial overlap; it never assigns caster ownership",
         "base_discrepancy_definition": "registered illumination change * supported entity complement with validated ground or entity motion reference",
         "entity_state_legend": ENTITY_STATES,
         "entity_motion_config": context.get("entity_motion_config", asdict(EntityMotionConfig())),

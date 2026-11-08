@@ -14,7 +14,8 @@ def _appearance(values):
     return histogram/max(np.linalg.norm(histogram), 1e-8)
 
 
-def describe_regions(regions, lab, boundary, flow_m=None, flow_valid=None):
+def describe_regions(regions, lab, boundary, flow_m=None, flow_valid=None, *,
+                     spatial_features=None, spatial_valid=None, anchor_consistency=None):
     for region in regions:
         mask = region["mask"]
         values = lab[mask & np.isfinite(lab).all(axis=-1)]
@@ -27,6 +28,29 @@ def describe_regions(regions, lab, boundary, flow_m=None, flow_valid=None):
         shape = np.array([min(1., 4*np.pi*mask.sum()/max(perimeter**2, 1)),
                           min(aspect, 1/aspect), float(boundary[mask].mean())], np.float32)
         region["boundary_descriptor"] = shape/max(np.linalg.norm(shape), 1e-8)
+        region["spatial_bev_descriptor"] = None
+        region["spatial_bev_support"] = {"interior_cells": 0, "boundary_cells": 0, "anchor_consistency": None}
+        if spatial_features is not None:
+            valid = mask & spatial_valid & np.isfinite(spatial_features).all(axis=-1)
+            interior = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+            parts = []
+            for name, domain in (("interior", interior), ("boundary", mask & ~interior)):
+                supported = valid & domain
+                region["spatial_bev_support"][name+"_cells"] = int(supported.sum())
+                if supported.any():
+                    descriptor = spatial_features[supported].mean(axis=0).astype(np.float32)
+                    norm = np.linalg.norm(descriptor)
+                    if norm > 1e-6:
+                        parts.append(descriptor/norm)
+            if parts:
+                descriptor = np.mean(parts, axis=0)
+                norm = np.linalg.norm(descriptor)
+                if norm > 1e-6:
+                    region["spatial_bev_descriptor"] = descriptor/norm
+            if anchor_consistency is not None:
+                values = anchor_consistency[valid & np.isfinite(anchor_consistency)]
+                if len(values):
+                    region["spatial_bev_support"]["anchor_consistency"] = float(np.median(values))
         if flow_m is not None:
             observed = mask & flow_valid & np.isfinite(flow_m).all(axis=-1)
             region["flow_correspondence"] = {"valid_cells": int(observed.sum()),
@@ -116,6 +140,9 @@ def memory_state(entry, identity):
         "mask_frame_slot": entry.get("frame_slot"),
         "mask_lookup": "shadow_track_id in per-frame BEV NPZ; shadow_region_id_image in per-frame image NPZ",
         "bev_descriptor": None if entry.get("descriptor") is None else entry["descriptor"].tolist(),
+        "spatial_bev_descriptor": (entry["spatial_bev_descriptor"].tolist()
+                                   if entry.get("spatial_bev_descriptor") is not None else None),
+        "spatial_bev_support": entry.get("spatial_bev_support"),
         "boundary_descriptor": None if entry.get("boundary_descriptor") is None else entry["boundary_descriptor"].tolist(),
         "appearance_history": entry.get("appearance_history", []),
         "flow_correspondence": entry.get("flow_correspondence"),

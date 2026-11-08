@@ -55,25 +55,63 @@ changes native BEV coordinates, not the identity of the fixed world receiver.
 `flow_bev_displacement_m` and the legacy `spatial_bev_displacement_m` alias share
 units/axes, but the latter is a **feature-registration offset, not physical ground
 motion**. Its explicit name is now `spatial_bev_local_offset_m`.
-`spatial_bev_feature_change` retains raw
-`1-cosine`; ranking normalizes it to [0,1]. In v8, correspondence is explicitly
+`spatial_bev_feature_change` retains raw `1-cosine` for diagnosis, not as positive
+shadow evidence. In v8, correspondence is explicitly
 `0=missing`, `1=low_confidence`, `2=reliable`, or `3=ambiguous`. The existing cosine,
 uniqueness and reverse-cycle thresholds still define reliable matches. Distinct
 but low-margin matches retain small weights; repeated/tied and singleton matches
 are ambiguous, with zero motion weight and NaN offsets, not confident zero
 motion. Local search cannot replace a missing geometric anchor with a neighbour.
-Missing features
-remain missing. `spatial_bev_match_valid` and `flow_bev_discrepancy_valid` retain
-their reliable-only meaning; `*_match_usable` and
-`flow_bev_discrepancy_supported` include weighted low-confidence evidence.
+Missing features remain missing. Low-confidence local vectors are retained only
+in the legacy diagnostic field; `spatial_bev_local_offset_m` and
+`spatial_bev_local_residual_m` require reliable matching. The Flow-minus-BEV proxy
+also requires reliable flow and reliable local refinement; it no longer uses
+low-confidence matches or contributes to candidate scoring.
 
-The proposal channel combines existing observed appearance with confidence-
-weighted metric disagreement (weight 0.35) and normalized BEV change (0.25).
+The anchor-first proposal channel supports existing observed appearance with
+same-world BEV consistency (weight 0.25) and reliable ground-flow quality (0.35).
 It is a candidate score, not shadow truth. Unsupported entity explanation is
 reported as NaN and retained as partial evidence, not silently asserted absent.
 For physical acceptance, a proposed ground cell still needs observed appearance
 support (`minimum_observed_appearance=0.05`) and caster/light fit. Static
 appearance retains its own path, including when no temporal event is visible.
+
+### Anchor-First Reasoning (v8+)
+
+Protocol field `m2_correspondence=anchor-first-reasoning-v1` distinguishes this
+route from the previous `geometry-anchored-v1` replay. The primary correspondence
+is the known world receiver point, not a local feature argmax:
+
+```text
+C_anchor = max(cos(z_t(world_point), z_next(world_point)), 0)
+support = appearance * (1 + 0.25 * C_anchor + 0.35 * Q_flow_reliable)
+```
+
+`support` remains candidate evidence. Known entity explanations apply the existing
+entity complement; unknown explanations retain the partial channel. The previous
+appearance/static/caster proposal union is retained, so missing flow or missing
+BEV does not delete independent appearance candidates. A stable/smooth BEV can
+support illumination changes even when every local match is ambiguous. Neither
+feature-change magnitude nor a large motion residual earns a positive bonus.
+The numeric weights and local cosine/margin/cycle thresholds are not increased.
+
+`m2_flow_state` explicitly records `0=missing`, `1=low_confidence`, `2=reliable`.
+Reliable material correspondence requires finite visible geometry, FB consistency,
+texture support, FB confidence at least 0.5, and ground-flow residual at most 3 px.
+`m2_flow_quality = FB_quality * exp(-residual_px/3)` on textured observations;
+it is a score, not a calibrated probability. Low-confidence flow remains visible
+in diagnostics but cannot create a positive/negative vote or a motion link.
+Missing flow has NaN quality/residual, not an anomaly score. A reliable image-flow
+vote also needs a valid lifted ground endpoint. RGB/Lab evidence is independent.
+
+Region continuity additionally pools current-only BEV features separately over
+the observed interior and boundary, then balances their normalized descriptors.
+This avoids a large boundary or background dominating the region identity. The
+pooled descriptor is serialized in frame and region-memory records. Its link
+support is weighted by anchor consistency and enabled only when observed or
+caster-projected regions spatially overlap. It cannot associate distant roads
+merely because their semantic features look alike, and it never assigns caster
+ownership. Existing caster-memory features and M3 acceptance/owner rules remain.
 
 ### Geometry-Anchored Correspondence (v8 refinement)
 
@@ -97,9 +135,9 @@ Two different residuals are retained:
 `spatial_bev_anchor_cosine` records the descriptor agreement at the geometric
 anchor even if local feature matching is ambiguous. Geometry stays available
 when smooth semantic BEV descriptors cannot identify a unique offset. Normal
-ground flow plus changing Lab-L can still propose a shadow. The existing M2
-score weights and M3 acceptance are unchanged; the legacy Flow-minus-BEV field
-is only a comparison proxy, not a measurement of physical motion or shadow truth.
+ground flow plus changing Lab-L can still propose a shadow. The M2 formula now
+uses anchor/flow support as described above; the legacy Flow-minus-BEV field is
+only diagnostic, not a measurement of physical motion or shadow truth.
 
 Each cross-space clip additionally exports:
 
@@ -107,16 +145,17 @@ Each cross-space clip additionally exports:
   grids, range/interpolation support, metric resolutions, transforms and clocks.
 - `correspondence.mp4` and `pair_*_correspondence.jpg`: world grid on RGB, both
   native BEV grids and geometric anchors, world-aligned descriptors, local
-  offsets/confidence, image flow, geometric flow residual, Lab-L and proposals.
+  offsets/confidence, anchor consistency, image flow, geometric flow residual,
+  flow states/quality, Lab-L and proposals.
   First-three-channel BEV previews are normalized only for display, not matching.
 - `correspondence.json`: observable receiver-pair cells, geometry-anchored
-  descriptor cells and reliable local matches with their separate denominators.
+  descriptor cells, reliable local matches and three flow states with explicit denominators.
   Cosine, cycle error and residual medians describe consistency; they are not
   true matching accuracy. Independent review remains a later quality evaluation.
 
 Reuse existing current-only/temporal BEV, RGB, DIS and GT caches. No feature
 re-export, dataset rebuild or training is required. Use a new output directory,
-such as `outputs/shadow_mainline_v8_geometry`.
+such as `outputs/shadow_mainline_v8_anchor_first`.
 
 ### M2 Seed-to-Region Continuation (v8)
 
@@ -135,7 +174,8 @@ existing watershed/RGB refinement and unchanged caster/light acceptance:
 - Original seeds can support the immediately preceding/following frame at the
   same world receiver location, using an independently valid exposure/geometric
   pair, available current-only BEV observations, compatible color and current
-  appearance. Camera gaps above the existing 1.5 s limit do not propagate.
+  appearance. In v8+, their support is also weighted by same-anchor consistency,
+  not local-match uniqueness. Camera gaps above the existing 1.5 s limit do not propagate.
 - Temporal seeds are not recursively propagated. A missing frame does not clear
   other valid pairs, and neither material flow nor BEV correspondence is assumed
   to be shadow speed. M4's existing caster/light motion alternatives remain.
@@ -148,8 +188,9 @@ Per-frame NPZ separates `cross_space_direct_seed`, `cross_space_temporal_seed`,
 `cross_space_region_score`. Source bit 8 covers
 their cross-space provenance; it does not imply an independent seed at every
 pixel. Pair NPZ additionally retains candidate counts, match cosine/margins,
-cycle error, states and confidence. M1/M3/M4 and physical label thresholds are
-unchanged. Existing evidence caches are reusable; use a new output directory.
+cycle error, states and confidence. M1/M3 and physical label thresholds are
+unchanged; region linking consumes the current-only descriptor as described
+above. Existing evidence caches are reusable; use a new output directory.
 
 M3 retains projection/light and signed-transition fits in each caster token's
 `shadow_projection_history`. Local owner scoring combines projection coverage,
@@ -192,7 +233,7 @@ python -u scripts/discover_shadow_video.py \
   --clips "$SHADOW_VIDEO_CLIPS" \
   --stage full --discovery-mode cross-space \
   --owner-scoring geometry+appearance+bev \
-  --output-root outputs/shadow_mainline_v8_geometry
+  --output-root outputs/shadow_mainline_v8_anchor_first
 ```
 
 For Slurm, set `SHADOW_VIDEO_SPATIAL_FEATURES` in addition to the existing input
