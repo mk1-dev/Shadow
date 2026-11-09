@@ -54,6 +54,23 @@ def model_signatures(protocol):
     return signatures
 
 
+def context_signatures(sources, legacy_history_mode=None):
+    result = []
+    for source in sources:
+        signature = {key: source.get(key) for key in MODEL_FIELDS}
+        if signature["history_mode"] is None:
+            signature["history_mode"] = legacy_history_mode
+        if not signature["checkpoint_sha256"] or not signature["model_config_sha256"]:
+            raise ValueError("Context BEV model needs checkpoint and config hashes")
+        if signature["history_mode"] not in {"temporal", "current-only"}:
+            raise ValueError("Context history mode is unknown; supply verified --legacy-context-history-mode for legacy metadata")
+        if signature not in result:
+            result.append(signature)
+    if not result:
+        raise ValueError("Reference lacks context BEV provenance; supply --reference-context-root when freezing legacy runs")
+    return result
+
+
 def cli_options(config):
     discovery = config["discovery_config"]
     grid = config["grid"]
@@ -85,7 +102,7 @@ def cli_options(config):
     return [value for key, item in options.items() for value in ("--"+key, str(item))]
 
 
-def check_batch_cache(paths, clips, signatures):
+def check_batch_cache(paths, clips, signatures, context_models, legacy_history_mode=None):
     """Check only selected sample metadata; discovery verifies referenced NPZ hashes."""
     pairs = read_rows(paths["pairs"])
     lookup = {(row["scene_name"], row["camera"], row["sample_token"]): row for row in pairs}
@@ -104,6 +121,8 @@ def check_batch_cache(paths, clips, signatures):
                     signature = {field: meta.get(field) for field in MODEL_FIELDS}
                     if role == "spatial_feature_root" and signature not in signatures:
                         raise ValueError("New cache differs from the frozen current-only BEV model")
+                    if role == "feature_root" and any(value not in context_models for value in context_signatures([meta], legacy_history_mode)):
+                        raise ValueError("Context BEV extraction protocol differs from frozen reference")
                     if (signature["checkpoint_sha256"], signature["model_config_sha256"]) not in {
                             (item["checkpoint_sha256"], item["model_config_sha256"]) for item in signatures}:
                         raise ValueError("Temporal/context BEV cache uses a different mature model")
@@ -115,7 +134,8 @@ def check_batch_cache(paths, clips, signatures):
     return fingerprints
 
 
-def freeze(reference_root, development_roots, output_path, repo=None, development_pairs=()):
+def freeze(reference_root, development_roots, output_path, repo=None, development_pairs=(),
+           reference_context_root=None, legacy_context_history_mode=None):
     repo = Path(repo or Path(__file__).resolve().parents[1]).resolve()
     output = Path(output_path).resolve()
     if output.exists():
@@ -131,6 +151,19 @@ def freeze(reference_root, development_roots, output_path, repo=None, developmen
     signatures = model_signatures(entries[0][1])
     if any(model_signatures(entry[1]) != signatures for entry in entries[1:]):
         raise ValueError("Reference clips used different BEV extraction models")
+    context_models, context_metadata = None, {}
+    for _, protocol, _ in entries:
+        sources = protocol.get("context_feature_sources", [])
+        if reference_context_root:
+            sources = []
+            for source in protocol["spatial_feature_sources"]:
+                path = Path(reference_context_root).resolve()/f"{source['sample_token']}.json"
+                sources.append(json.loads(path.read_text(encoding="utf-8")))
+                context_metadata[str(path)] = digest(path)
+        current = context_signatures(sources, legacy_context_history_mode)
+        if context_models is not None and current != context_models:
+            raise ValueError("Reference clips used different context BEV extraction protocols")
+        context_models = current
     cli_options(configs[0])
     excluded, protocols = set(), {}
     for root in [reference_root, *development_roots]:
@@ -150,6 +183,8 @@ def freeze(reference_root, development_roots, output_path, repo=None, developmen
         "development_pair_manifest_sha256": development_manifests,
         "excluded_development_scenes": sorted(excluded), "settings": configs[0],
         "spatial_model_signatures": signatures, "discovery_cli_options": cli_options(configs[0]),
+        "context_model_signatures": context_models, "reference_context_metadata_sha256": context_metadata,
+        "legacy_context_history_mode": legacy_context_history_mode,
         "historical_reference_source_identity_verified": False,
         "note": "Source hashes freeze current algorithm files; old run provenance must be checked by the operator."}
     write_json(output, payload)
@@ -163,6 +198,8 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
         raise ValueError("Algorithm source differs from freeze lock")
     if cli_options(lock["settings"]) != lock["discovery_cli_options"]:
         raise ValueError("Frozen CLI settings changed")
+    if not lock.get("context_model_signatures"):
+        raise ValueError("Legacy freeze lock lacks context extraction provenance; create a new lock")
     batches_path = Path(batches_path).resolve()
     batches = read_rows(batches_path)
     if not batches or len({row["id"] for row in batches}) != len(batches):
@@ -199,7 +236,8 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
         for key in ("analysis_root", "feature_root", "spatial_feature_root"):
             if not paths[key].is_dir():
                 raise FileNotFoundError(paths[key])
-        manifest_hashes.update(check_batch_cache(paths, clips, lock["spatial_model_signatures"]))
+        manifest_hashes.update(check_batch_cache(paths, clips, lock["spatial_model_signatures"],
+            lock["context_model_signatures"], lock.get("legacy_context_history_mode")))
         prepared.append((row["id"], paths, clips, {**lock["settings"], "discovery_mode": mode}))
     output = Path(output_root).resolve()
     inputs = [path for _, paths, _, _ in prepared for key, path in paths.items() if key.endswith("root")]
@@ -246,6 +284,8 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
                     raise ValueError("Actual run settings differ from frozen reference")
                 if model_signatures(actual) != lock["spatial_model_signatures"]:
                     raise ValueError("New data used a different frozen BEV model/extraction protocol")
+                if context_signatures(actual.get("context_feature_sources", []), lock.get("legacy_context_history_mode")) != lock["context_model_signatures"]:
+                    raise ValueError("Actual context BEV extraction differs from frozen reference")
             if source_hashes(repo) != lock["source_sha256"] or any(digest(path) != sha for path, sha in manifest_hashes.items()):
                 raise ValueError("Frozen source or input manifests changed during execution")
         except Exception:
@@ -265,13 +305,16 @@ def main():
     lock.add_argument("--reference-root", required=True)
     lock.add_argument("--development-roots", nargs="*", default=[])
     lock.add_argument("--development-pairs", nargs="*", default=[], help="Pair manifests actually used in previous algorithm development, not future cache coverage")
+    lock.add_argument("--reference-context-root", help="Actual context cache used by a legacy reference lacking context provenance")
+    lock.add_argument("--legacy-context-history-mode", choices=["temporal", "current-only"], help="Explicit verified history protocol for legacy context metadata only")
     lock.add_argument("--output", required=True)
     run = sub.add_parser("run")
     run.add_argument("--lock", required=True)
     run.add_argument("--batches", required=True)
     run.add_argument("--output-root", required=True)
     args = parser.parse_args()
-    result = freeze(args.reference_root, args.development_roots, args.output, development_pairs=args.development_pairs) if args.command == "freeze" else run_frozen(args.lock, args.batches, args.output_root)
+    result = freeze(args.reference_root, args.development_roots, args.output, development_pairs=args.development_pairs,
+        reference_context_root=args.reference_context_root, legacy_context_history_mode=args.legacy_context_history_mode) if args.command == "freeze" else run_frozen(args.lock, args.batches, args.output_root)
     print(json.dumps(result), flush=True)
 
 

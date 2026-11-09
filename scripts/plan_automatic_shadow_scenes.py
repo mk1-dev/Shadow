@@ -74,6 +74,7 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
     if not sources:
         raise ValueError("Provide prepared pairs/flow/BEV catalogue rows")
     scene_splits, prepared, seen = {}, [], set()
+    input_hashes = {str(catalogue_path): digest(catalogue_path), str(Path(lock_path).resolve()): digest(lock_path)}
     for at, source in enumerate(sources):
         paths = {key: resolve_path(source[key], catalogue_path.parent) for key in
                  ("pairs", "analysis_root", "feature_root", "spatial_feature_root")}
@@ -81,6 +82,9 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
         parent_hashes = {"parent_pairs_sha256": digest(paths["pairs"]), "parent_protocol_sha256": digest(protocol_path),
                          "parent_metrics_sha256": digest(paths["analysis_root"]/"pair_metrics.jsonl")}
+        input_hashes.update({str(paths["pairs"]): parent_hashes["parent_pairs_sha256"],
+            str(protocol_path): parent_hashes["parent_protocol_sha256"],
+            str(paths["analysis_root"]/"pair_metrics.jsonl"): parent_hashes["parent_metrics_sha256"]})
         groups = defaultdict(list)
         for pair in pairs:
             scene, official = pair["scene_name"], pair["official_split"]
@@ -99,6 +103,8 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
     if len(training) < 2:
         raise ValueError("Automatic train/dev isolation needs at least two prepared train scenes")
     population = json.loads(Path(population_path).read_text(encoding="utf-8")) if population_path else None
+    if population_path:
+        input_hashes[str(Path(population_path).resolve())] = digest(population_path)
     official_training = population["official_train_scenes"] if population else training
     if population and (not set(training) <= set(official_training)
                        or not {scene for scene, role in scene_splits.items() if role == "eval"} <= set(population["official_eval_scenes"])):
@@ -109,7 +115,7 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
     assigned = {scene: next(fraction for fraction in (25, 50, 100) if scene in selected[fraction]) for scene in selected[100]}
     batches = {key: [] for key in ("shared", "stage_025", "stage_050", "stage_100")}
     export_rows = defaultdict(list)
-    diagnostics = []
+    diagnostics, usable_scenes = [], set()
     output.mkdir(parents=True)
     for source_id, paths, groups, stats, protocol, parent_hashes in prepared:
         for scene, rows in sorted(groups.items()):
@@ -119,9 +125,10 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
                 continue
             clips, counts = automatic_clips(rows, num_frames, stride, seed)
             if not clips:
-                diagnostics.append({"scene_name": scene, "reason": "no_contiguous_GT_windows", **counts})
+                diagnostics.append({"scene_name": scene, "split": split, "status": "no_valid_clip",
+                    "reason": "no_contiguous_GT_windows", **counts})
                 continue
-            tag = hashlib.sha256(f"{source_id}:{scene}".encode()).hexdigest()[:16]
+            tag = hashlib.sha256(f"{paths['pairs']}:{scene}".encode()).hexdigest()[:16]
             folder = output/"scene_inputs"/tag
             shard_rows, shard_stats = [], []
             for pair in rows:
@@ -146,7 +153,9 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
                     "feature_root": str(paths["feature_root"]), "spatial_feature_root": str(paths["spatial_feature_root"])})
                 export_rows[scene].append({"method": method, "split": split,
                     "run_root": str(annotations/stage/batch_id), "pairs": [str(folder/"pairs.jsonl")]})
-            diagnostics.append({"scene_name": scene, "split": split, "stage": stage, "source_catalogue_index": source_id, **counts})
+            usable_scenes.add(scene)
+            diagnostics.append({"scene_name": scene, "split": split, "stage": stage, "status": "ready",
+                "source_catalogue_index": source_id, **counts})
     for stage, rows in batches.items():
         write_rows(output/stage/"batches.jsonl", rows)
     for fraction in (25, 50, 100):
@@ -154,8 +163,17 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
                 if row["split"] != "train" or scene in selected[fraction]]
         write_rows(output/f"stage_{fraction:03d}"/"experiment_runs.jsonl", rows)
     write_rows(output/"scene_coverage.jsonl", diagnostics)
+    evaluation = (set(population["official_eval_scenes"]) if population else {scene for scene, role in scene_splits.items() if role == "eval"})-excluded
+    targets = {"shared": dev | evaluation,
+        **{f"stage_{fraction:03d}": selected[fraction] | dev | evaluation for fraction in selected}}
+    coverage = {stage: {"requested_scenes": sorted(target),
+        "missing_cache_scenes": sorted(target-set(scene_splits)),
+        "no_valid_clip_scenes": sorted((target & set(scene_splits))-usable_scenes),
+        "usable_scenes": sorted(target & usable_scenes),
+        "complete_clip_coverage": target <= usable_scenes} for stage, target in targets.items()}
     payload = {"protocol": "automatic-shadow-scene-plan-v1", "seed": seed, "dev_fraction": dev_fraction,
         "catalogue_sha256": digest(catalogue_path), "freeze_lock_sha256": digest(lock_path),
+        "catalogue_path": str(catalogue_path), "input_manifest_sha256": input_hashes,
         "population_scope": "prepared input catalogues, not an assertion of complete nuScenes coverage",
         "population_manifest_sha256": digest(population_path) if population_path else None,
         "official_train_population": len(official_training), "methods": list(methods),
@@ -164,13 +182,48 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
         "prepared_official_train_scenes": len(training), "dev_scenes": sorted(dev),
         "train_scene_stages": {str(fraction): sorted(selected[fraction]) for fraction in selected},
         "incremental_batch_counts": {stage: len(rows) for stage, rows in batches.items()},
+        "stage_coverage": coverage,
+        "coverage_contract": "cache presence, usable GT clips and exported label coverage are distinct; no-valid-clip scenes are explicit skips, not completed annotations",
         "annotation_output_root": str(annotations), "manual_shadow_selection": False,
         "raw_observations_recomputed": False, "dev_eval_annotations_reused_between_stages": True}
     write_json(output/"plan.json", payload)
     return payload
 
 
+def check_plan(plan_root, stage, lock_path=None):
+    root = Path(plan_root).resolve()
+    plan = json.loads((root/"plan.json").read_text(encoding="utf-8"))
+    if stage not in {"shared", "stage_025", "stage_050", "stage_100"}:
+        raise ValueError("Unknown automatic stage")
+    if lock_path and digest(lock_path) != plan["freeze_lock_sha256"]:
+        raise ValueError("Plan uses a different freeze lock; generate a new plan")
+    for path, expected in plan.get("input_manifest_sha256", {}).items():
+        if not Path(path).is_file() or digest(path) != expected:
+            raise ValueError(f"Prepared inputs changed: {path}; refresh matching flow evidence and generate a new plan")
+    if "stage_coverage" not in plan:
+        raise ValueError("Legacy plan lacks usable-clip coverage; generate a new plan")
+    coverage = plan["stage_coverage"][stage]
+    if coverage["missing_cache_scenes"]:
+        raise ValueError(f"{stage}: {len(coverage['missing_cache_scenes'])} target scenes lack prepared caches; prepare them and regenerate the plan")
+    shared = read_rows(root/"shared/batches.jsonl")
+    if not all(any(row["split"] == split for row in shared) for split in ("dev", "eval")):
+        raise ValueError("Shared stage requires usable dev AND eval clips; an empty shared stage is not complete")
+    if stage != "shared":
+        runs = read_rows(root/stage/"experiment_runs.jsonl")
+        if not any(row["split"] == "train" for row in runs):
+            raise ValueError("No usable training clips in the cumulative stage")
+    return {"stage": stage, **coverage, "no_valid_clip_policy": "explicitly skipped; never counted as annotated"}
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        parser = argparse.ArgumentParser("Check fresh inputs and effective annotation coverage")
+        parser.add_argument("--plan", required=True)
+        parser.add_argument("--stage", required=True)
+        parser.add_argument("--lock")
+        args = parser.parse_args(sys.argv[2:])
+        print(json.dumps(check_plan(args.plan, args.stage, args.lock)), flush=True)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalogue", required=True)
     parser.add_argument("--lock", required=True)

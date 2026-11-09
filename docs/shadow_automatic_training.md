@@ -11,6 +11,88 @@ supervision; it does not add a network or turn all unlabeled pixels into zeros.
 Student Shadow-BEV and OCC integration are later stages, not implemented or
 validated merely by running this annotation/training workflow.
 
+## Unified HPC Entry
+
+The new entry prepares missing per-scene caches as well as annotations. Existing
+official nuScenes RGB/LiDAR/tables are read in place, never copied as a dataset.
+Configure `configs/shadow_automatic_pipeline.example.json` with the actual train
+and val temporal-info files used by the mature model. The example uses paths
+verified in the existing HPC cache protocols. The BEV environment must load that model; the annotation/student
+environment is independent (`drivevla` and `shadow_annotator` on the current HPC).
+
+Create a fresh lock after updating this source. Context BEV now freezes history
+mode, layout, coordinates, grid shape/range and exporter hash as well as model
+hashes. For an old reference lacking `context_feature_sources`, supply
+`freeze --reference-context-root /actual/reference/context_bev`. Only if its
+history mode is missing and the original export protocol has been verified,
+also supply `--legacy-context-history-mode temporal`. This records an explicit
+legacy assertion, not an inferred history mode. Existing reference outputs are
+not rewritten.
+
+```bash
+python scripts/submit_automatic_shadow_pipeline.py prepare \
+  --config /absolute/path/pipeline.json \
+  --output-root /large/disk/shadow_run_025 --fraction 25
+
+# Inspect shadow_run_025/pipeline.json and jobs.json, then submit that exact plan:
+python scripts/submit_automatic_shadow_pipeline.py submit \
+  --job /large/disk/shadow_run_025/pipeline.json
+```
+
+`prepare` defaults to dry-run. `--submit` is an explicit immediate-submit option.
+The generated `afterok` dependency graph is:
+
+```text
+CPU scene array: canonical receivers + Pair RGB + bidirectional DIS
+  -> GPU scene array: temporal/context BEV + current-only BEV
+  -> CPU: fixed scene/track clip plan
+  -> CPU: shared dev/eval frozen annotations
+  -> CPU: 25% train annotations + deduplicated trimaps + paired suite
+  -> GPU: S0/S3 Segmenters + held-out teacher-agreement inference
+```
+
+The cache arrays have independent concurrency limits, defaulting to four CPU
+scenes and one single-GPU BEV scene. Each scene has its own pair budget (24 by
+default), rather than competing for a global cap consumed by early scenes.
+Metadata stamps permit completed cache reuse under the same request. Partial
+requests can reuse completed substeps; foreign/unstamped outputs require separate
+verification or a new cache root, not silent adoption. No existing cache is
+deleted. Re-submitting a pipeline with recorded job IDs is rejected.
+
+For expansion, set `previous_run` to the preceding generated `pipeline.json` and
+prepare a new output root with `--fraction 50`, then `100`. Scene population,
+teacher protocol and shared cache/annotation roots remain fixed. Expansion
+requires the preceding annotations and student evaluation to have completed;
+earlier shared and training annotations are reused. Source/config changes need
+a new protocol rather than being mixed into the old cumulative dataset.
+
+The legacy `submit_bev_flow_pipeline.sh` delegates to this entry when
+`SHADOW_AUTO_PIPELINE_CONFIG` is set. Its old VLM workflow now requires explicit
+`SHADOW_LEGACY_PIPELINE=1`; it is not the default automatic mainline.
+
+### Code-Level Architecture
+
+```text
+nuScenes RGB / calibration / Ego / LiDAR / GT tracks
+  -> frame-level canonical receiver geometry + DIS flow
+  -> frozen mature BEV: temporal context and current-only spatial anchors
+  -> M1: entity motion suppression + retained Caster Memory
+  -> M2: same-world anchor consistency + independent RGB/Lab and flow evidence
+  -> M3: caster/light projection and real/counterfactual trajectory competition
+  -> M4: current observed masks, separate historical memory, offline Shadow-BEV
+  -> physical lit negatives + positive/negative/IGNORE export and frame dedup
+  -> RGB DeepLabV3-MobileNetV3-Large student
+  -> held-out frozen-teacher agreement, including per-scene class metrics
+```
+
+M2 local feature matching is optional refinement; flow/BEV residual is not a
+direct shadow-positive score. M3 still uses the existing fixed 96 light
+hypotheses. Lit-negative mining still requires an accepted shadow core; this
+does not yet harvest independent all-negative scenes. S0 changes the proposal
+branch, not the shared physical processing. The student comparison is per-frame:
+temporal and receiver-pair losses remain zero without actual exported evidence.
+Unified VLM training, online student Shadow-BEV and OCC fusion are not launched.
+
 ## 1. Prepared Input Catalogue
 
 Prepare the existing nuScenes pairs, DIS analysis, temporal/context BEV and
@@ -107,6 +189,13 @@ With `--population`, roles and incremental subsets are fixed from the complete
 official population before caches are available. Partial caches never cause a
 new dev split or a smaller population denominator. Missing stage scenes are
 listed explicitly; the Slurm annotation entry waits for complete target coverage.
+`stage_coverage` separates missing caches, scenes with no usable GT clips and
+usable scenes. No-valid-clip scenes are explicit skips, not completed annotation
+coverage; shared batches must still contain usable dev AND eval clips. Before
+annotation, `plan_automatic_shadow_scenes.py check` verifies input manifest hashes
+so a plan cannot silently outlive changed Pair/flow catalogues. Regenerate the
+plan after updating those inputs. Stable scene IDs retain earlier annotation
+references across incremental plans.
 At 700 train scenes and dev fraction 0.15, dev has 105 scenes, the train pool has
 595, and its 25% stage has 149 scenes. Eval excludes prior teacher-development
 scenes listed in the lock.
@@ -193,7 +282,11 @@ The CPU stage prepares the actual methods in `plan.json` (S0/S3 when both were
 planned). `SHADOW_SEG_METHODS` can request additional actual exported methods.
 `method_availability.json` records absent or one-class arms instead of inventing
 labels. A remaining arm still needs two known classes after the paired-image
-intersection. Start with S0/S3 rather than waiting for historical methods.
+intersection. With `--skip-untrainable`, incompatible arms are removed and the
+intersection is recomputed, prioritizing the reference method, then requested
+order. Retained arms still use identical image IDs. `alignment_incompatible`
+means unavailable in this paired suite, not necessarily untrainable alone.
+Start with S0/S3 rather than waiting for historical methods.
 
 ```bash
 export SHADOW_SEG_SUITE="$SHADOW_AUTO_SUITE_ROOT/suite.json"
@@ -209,6 +302,11 @@ within each scene, with replacement and a fixed draw count per epoch. DDP ranks
 shard the same seeded global draw list; there is no class oversampling. Class
 loss weights account for this expected scene sampling distribution. Legacy
 single-model training retains ordinary image sampling unless requested.
+
+Epoch history now includes unscaled training BCE, Dice, temporal, receiver-pair
+and weighted total loss, averaged over images and all DDP ranks before gradient
+accumulation scaling. Evaluation targets are loaded one at a time rather than
+retained as full-resolution arrays throughout training.
 
 Exported weak negatives have `negative_weight=0.5` by default, configurable by
 `SHADOW_NEGATIVE_WEIGHT` or export `--negative-weight`. This is a fixed loss

@@ -2,6 +2,19 @@
 set -euo pipefail
 cd "${SHADOW_PROJECT_ROOT:-$(dirname "${BASH_SOURCE[0]}")/..}"
 export SHADOW_PROJECT_ROOT="$PWD"
+if [[ -n "${SHADOW_AUTO_PIPELINE_CONFIG:-}" ]]; then
+  EXTRA=()
+  if [[ "${SHADOW_AUTO_SUBMIT:-0}" == 1 ]]; then EXTRA+=(--submit); fi
+  exec python -u scripts/submit_automatic_shadow_pipeline.py prepare \
+    --config "$SHADOW_AUTO_PIPELINE_CONFIG" \
+    --output-root "${SHADOW_AUTO_PIPELINE_OUTPUT:?Set a new automatic pipeline directory}" \
+    --fraction "${SHADOW_AUTO_FRACTION:-25}" "${EXTRA[@]}"
+fi
+if [[ "${SHADOW_LEGACY_PIPELINE:-0}" != 1 ]]; then
+  echo "Use scripts/submit_automatic_shadow_pipeline.py for the frozen v8+ mainline." >&2
+  echo "The legacy teacher/VLM pipeline requires explicit SHADOW_LEGACY_PIPELINE=1." >&2
+  exit 2
+fi
 export SHADOW_ANNOTATION_ROOT="${SHADOW_ANNOTATION_ROOT:-$PWD/outputs/shadow_bev_flow_$(date +%Y%m%d_%H%M%S)}"
 export SHADOW_DATA_ROOT="$SHADOW_ANNOTATION_ROOT/data"
 export SHADOW_ANNOTATION_DATA_ROOT="$SHADOW_ANNOTATION_ROOT/joint"

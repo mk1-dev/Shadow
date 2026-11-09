@@ -38,12 +38,7 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
                 raise ValueError("Only independent manual eval masks may be used for final inference")
             if row["scene_name"] in exposed:
                 raise ValueError("Manual eval overlaps training or checkpoint-selection scenes")
-            target = load_array(row["target"], base)
-            if row.get("mask_encoding", "trimap") == "binary":
-                target = (target > 0).astype(np.uint8)
-            if not np.isin(target, [0, 1, 255]).all():
-                raise ValueError("Invalid manual target encoding")
-            evaluation.append((row, target, str(resolve_path(row["image"], base))))
+            evaluation.append((row, base))
         if not evaluation:
             raise ValueError("Manual evaluation manifest is empty")
     elif plan.get("weak_eval_reference"):
@@ -54,10 +49,9 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
         for row in read_rows(reference):
             if row["scene_name"] in exposed or row.get("split") != "eval" or row.get("label_source") not in {"temporal_weak", "geometry_weak"}:
                 raise ValueError("Weak agreement evaluation must use held-out physical teacher labels")
-            target = load_array(row["target"], reference.parent)
-            if not np.isin(target, [0, 1, 255]).all():
-                raise ValueError("Weak evaluation requires 0/1/255 trimaps")
-            evaluation.append((row, target, str(resolve_path(row["image"], reference.parent))))
+            evaluation.append((row, reference.parent))
+        if not evaluation:
+            raise ValueError("Frozen teacher evaluation manifest is empty")
     output = Path(output_root).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
@@ -65,10 +59,17 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
     eval_path = None
     if evaluation:
         normalized = []
-        for index, (row, target, image) in enumerate(evaluation):
+        for index, (row, base) in enumerate(evaluation):
+            target = load_array(row["target"], base)
+            if reference_kind == "manual" and row.get("mask_encoding", "trimap") == "binary":
+                target = (target > 0).astype(np.uint8)
+            if not np.isin(target, [0, 1, 255]).all():
+                raise ValueError("Evaluation requires 0/1/255 trimaps")
+            image = str(resolve_path(row["image"], base))
             path = output/("manual_eval_targets" if reference_kind == "manual" else "weak_eval_targets")/f"{index:07d}.png"
             checked_write_image(path, target)
             normalized.append({**row, "target": str(path), "image": image, "mask_encoding": "trimap"})
+            del target
         eval_path = output/("manual_eval.jsonl" if reference_kind == "manual" else "weak_eval.jsonl")
         write_rows(eval_path, normalized)
     status = {"suite_sha256": digest(plan_path), "gpus": gpus, "device": device, "arms": [],

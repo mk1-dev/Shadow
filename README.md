@@ -5,7 +5,10 @@
 The current main task is **continuous shadow discovery from 3D/BEV physical
 explanations versus 2D flow and appearance**, followed by physics-grounded weak
 annotation. Reuse the mature UniAD/OpenDriveVLA BEVFormer as a frozen encoder;
-do not train a new BEV, lighting, memory or VLM model for this proof of concept.
+The frozen v8+ teacher now feeds automatic weak-label expansion and RGB
+Segmenter training. No new BEV, lighting, memory or VLM network is introduced.
+Use [the automatic training workflow](docs/shadow_automatic_training.md) and
+`scripts/submit_automatic_shadow_pipeline.py` for the cache-to-student HPC entry.
 
 The executable video path has four connected modules: surface-motion entity
 decomposition, metric BEV/flow cross-space discovery, caster/light physical
@@ -21,7 +24,9 @@ spatial correspondence and temporal/context BEV features for region identity.
 Image flow is lifted through the destination camera onto the same metric grid
 before comparison. Supply `--spatial-feature-root` alongside `--feature-root`;
 export that cache with the existing mature model's `--history-mode current-only`.
-No new model training or RGB/DIS/GT dataset rebuild is needed. The pipeline
+Correspondence replay needs no new model training. Existing RGB/DIS/GT caches
+are reusable only with the matching frame-receiver and evidence protocol; the
+automatic expansion entry builds missing per-scene caches. The pipeline
 retains caster/light history, RGB-refined image masks, short-gap region memory
 and a separate Shadow-BEV instead of merging shadows into entity occupancy.
 
@@ -257,7 +262,7 @@ export UNIAD_CHECKPOINT=/path/to/uniad_base_track_map.pth
 export UNIAD_TRAIN_ANN_FILE=/path/to/nuscenes_infos_temporal_train.pkl
 export UNIAD_VAL_ANN_FILE=/path/to/nuscenes_infos_temporal_val.pkl
 export SHADOW_VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct
-bash scripts/submit_bev_flow_pipeline.sh
+SHADOW_LEGACY_PIPELINE=1 bash scripts/submit_bev_flow_pipeline.sh
 ```
 
 Submission order:

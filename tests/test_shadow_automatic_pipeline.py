@@ -91,6 +91,51 @@ def test_no_gt_track_cannot_be_fabricated_for_automatic_clip_selection():
     assert clips == [] and counts["without_three_frame_gt_track"] > 0
 
 
+def test_present_pairs_without_clips_are_explicitly_unusable_not_complete(tmp_path):
+    catalogue, lock, source = catalogue_fixture(tmp_path)
+    rows = read_rows(source/"pairs.jsonl")
+    for row in rows:
+        row["objects"] = []
+    write_rows(source/"pairs.jsonl", rows)
+    write_json(source/"analysis_protocol.json", {"flow_evidence_version": "receiver-support-v2", "manifest_sha256": digest(source/"pairs.jsonl")})
+    module = script("plan_automatic_shadow_scenes")
+    result = module.plan_scenes(catalogue, lock, tmp_path/"plan", tmp_path/"runs")
+    assert not result["stage_coverage"]["shared"]["missing_cache_scenes"]
+    assert result["stage_coverage"]["shared"]["no_valid_clip_scenes"]
+    assert not result["stage_coverage"]["shared"]["complete_clip_coverage"]
+    with pytest.raises(ValueError, match="usable dev AND eval"):
+        module.check_plan(tmp_path/"plan", "shared", lock)
+
+
+def test_plan_detects_changed_catalogue_instead_of_reusing_stale_batches(tmp_path):
+    catalogue, lock, _ = catalogue_fixture(tmp_path)
+    module = script("plan_automatic_shadow_scenes")
+    module.plan_scenes(catalogue, lock, tmp_path/"plan", tmp_path/"runs")
+    assert module.check_plan(tmp_path/"plan", "stage_025", lock)["complete_clip_coverage"]
+    catalogue.write_text(catalogue.read_text()+"\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="generate a new plan"):
+        module.check_plan(tmp_path/"plan", "stage_025", lock)
+
+
+def test_alignment_conflict_preserves_reference_arm_without_fabricating_labels(tmp_path):
+    runs, negatives = data_fixture(tmp_path)
+    module = script("build_shadow_mainline_experiments")
+    module.build_dataset(runs, tmp_path/"data", [negatives], (80, 80))
+    for split in ("train", "dev"):
+        for method, labels in (("appearance", [1, 0, None]), ("anchor", [None, 1, 0])):
+            for row, label in zip(read_rows(tmp_path/"data"/method/f"seg_{split}.jsonl"), labels):
+                target = np.full((80, 80), 255, np.uint8)
+                if label is not None:
+                    target[8:16, 8:16] = label
+                checked_write_image(Path(row["target"]), target)
+    result = module.prepare_suite(tmp_path/"data", ["appearance", "anchor"], tmp_path/"suite", (80, 80),
+        reference_method="anchor", skip_untrainable=True)
+    assert [arm["method"] for arm in result["arms"]] == ["anchor"]
+    assert result["alignment_dropped_methods"] == ["appearance"]
+    assert result["aligned_frames"]["train"] == 2
+    assert result["method_availability"][0]["status"] == "alignment_incompatible"
+
+
 def lit_fixture(tmp_path):
     _, after, pairs = frozen_runs(tmp_path)
     for slot in range(3):

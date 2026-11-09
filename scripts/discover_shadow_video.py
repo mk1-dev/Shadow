@@ -73,6 +73,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
     world = ground_grid(basis, anchor, grid)
     images, grounds, coordinates, visible, labs, occupied, features, feature_valid, in_image = ([] for _ in range(9))
     spatial_features, spatial_valid, spatial_sources, spatial_geometry = [], [], [], []
+    context_sources = []
     for item in observations:
         frame = item["frame"]
         image = cv2.imread(str(resolve_path(frame["image"], base)))
@@ -88,6 +89,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
         lab[..., 0] *= 100/255
         feature, supported, feature_source, geometry = sample_cached_bev(
             feature_root, item["sample_token"], world, return_geometry=True)
+        context_sources.append({**feature_source, "sample_token": item["sample_token"]})
         spatial, spatial_supported, spatial_source = feature, supported, feature_source
         if spatial_feature_root is not None and Path(spatial_feature_root).resolve() != Path(feature_root).resolve():
             spatial, spatial_supported, spatial_source, geometry = sample_cached_bev(
@@ -176,6 +178,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
         "entity_motion_config": asdict(entity_config), "entity_suppression_enabled": entity_suppression,
         "discovery_domain": discovery_domain,
         "spatial_feature_sources": spatial_sources,
+        "context_feature_sources": context_sources,
         "spatial_geometry": spatial_geometry,
         "spatial_features": np.stack(spatial_features), "spatial_feature_valid": np.stack(spatial_valid),
         "metric_flow": metric_flow["flow_bev_displacement_m"], "metric_flow_valid": metric_flow["flow_bev_valid"],
@@ -633,6 +636,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         "coverage_contract": "correspondence.json separates observable receiver pairs, geometry-anchored descriptors and reliable local matches; consistency diagnostics are not measured correctness",
         "cross_space_growth_contract": "bounded Lab-anchor and boundary constrained growth on currently observed ground; uniform interiors use measured seed-color agreement as appearance support; one-hop same-world temporal seeds require independent valid pairs and current appearance; no flow-as-shadow-speed or masks in missing frames",
         "spatial_feature_sources": context.get("spatial_feature_sources", []),
+        "context_feature_sources": context.get("context_feature_sources", []),
         "feature_roles": "current-only spatial features for BEV correspondence; temporal/context features for region identity; absent spatial cache is missing evidence",
         "flow_BEV_units": "horizontal anchor-grid x/y meters per actual camera interval; ground-ray lift in destination camera",
         "proposal_source_bits": {"1": "appearance", "2": "ground-referenced illumination", "4": "caster-guided appearance", "8": "anchor-first cross-space proposal and observed growth"},

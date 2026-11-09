@@ -11,7 +11,7 @@
 #SBATCH -e logs/shadow_E2_%j.err
 
 set -euo pipefail
-source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
+source "${SHADOW_CONDA_SH:-/public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh}"
 conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1

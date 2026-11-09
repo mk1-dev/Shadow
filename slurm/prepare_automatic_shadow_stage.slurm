@@ -9,7 +9,7 @@
 #SBATCH -e logs/shadow_auto_%j.err
 
 set -euo pipefail
-source /public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh
+source "${SHADOW_CONDA_SH:-/public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh}"
 conda activate "${SHADOW_CONDA_ENV:-shadow_annotator}"
 cd "${SHADOW_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?}}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
@@ -21,14 +21,7 @@ case "$STAGE" in
   shared|stage_025|stage_050|stage_100) ;;
   *) echo "Unknown automatic annotation stage: $STAGE" >&2; exit 1 ;;
 esac
-python - "$PLAN/plan.json" "$STAGE" <<'PY'
-import json, sys
-plan = json.load(open(sys.argv[1]))
-stage = sys.argv[2]
-missing = plan.get("missing_shared_scenes", []) if stage == "shared" else plan.get("missing_stage_scenes", {}).get(str(int(stage[-3:])), [])
-if missing:
-    raise SystemExit(f"Target official scene caches are incomplete for {stage}: {len(missing)} missing; prepare caches before annotation")
-PY
+python -u scripts/plan_automatic_shadow_scenes.py check --plan "$PLAN" --stage "$STAGE" --lock "$LOCK"
 ANNOTATIONS=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["annotation_output_root"])' "$PLAN/plan.json")
 if [[ -s "$PLAN/$STAGE/batches.jsonl" ]]; then
   python -u scripts/run_frozen_shadow_video.py run \

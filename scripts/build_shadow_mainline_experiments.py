@@ -375,8 +375,11 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
     methods = [simple_name(method) for method in methods]
     if not methods or len(set(methods)) != len(methods):
         raise ValueError("Choose unique existing method datasets; absent baselines are not synthesized")
-    availability = []
+    if min(*size, epochs, batch_size, accumulation) < 1:
+        raise ValueError("Training dimensions and budget must be positive")
+    availability = {method: {"method": method, "status": "available", "reasons": []} for method in methods}
     requested_methods = list(methods)
+    reference_method = reference_method or ("anchor_first_v8plus" if "anchor_first_v8plus" in methods else methods[-1])
     if skip_untrainable:
         available = []
         for method in methods:
@@ -392,59 +395,69 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
                     totals += [(mask == 0).sum(), (mask == 1).sum()]
                 if not totals.all():
                     reasons.append(split+": both known classes do not survive resize")
-            availability.append({"method": method, "status": "untrainable" if reasons else "available", "reasons": reasons})
+            availability[method].update(status="untrainable" if reasons else "available", reasons=reasons)
             if not reasons:
                 available.append(method)
         output.mkdir(parents=True)
-        write_json(output/"method_availability.json", availability)
+        write_json(output/"method_availability.json", list(availability.values()))
         methods = available
         if not methods:
             raise ValueError("No requested method has real two-class train/dev supervision")
-    if min(*size, epochs, batch_size, accumulation) < 1:
-        raise ValueError("Training dimensions and budget must be positive")
     if backbone_weights not in {"none", "imagenet"}:
         raise ValueError("Use an existing supported backbone initialization")
     initialization = str(Path(init_checkpoint).resolve()) if init_checkpoint else None
     initialization_sha = digest(initialization) if initialization else None
-    reference_method = reference_method or ("anchor_first_v8plus" if "anchor_first_v8plus" in requested_methods else methods[-1])
     if reference_method not in requested_methods:
         raise ValueError("Choose a reference teacher from the actual supplied methods")
     reference_path = root/reference_method/"seg_eval.jsonl"
     if not reference_path.is_file() or not read_rows(reference_path):
         raise ValueError("Held-out teacher evaluation needs an actual nonempty eval manifest")
-    aligned = {}
-    scene_sets = {}
+    indexed, class_pixels = {}, {}
     for split in ("train", "dev"):
-        by_method = {method: {row["id"]: row for row in read_rows(root/method/f"seg_{split}.jsonl")} for method in methods}
-        usable = []
-        for method, indexed in by_method.items():
-            available = set()
-            for identity, row in indexed.items():
+        for method in methods:
+            group = read_rows(root/method/f"seg_{split}.jsonl")
+            indexed[(method, split)] = {row["id"]: row for row in group}
+            if len(indexed[(method, split)]) != len(group):
+                raise ValueError("Duplicate observation IDs in a method dataset")
+            for identity, row in indexed[(method, split)].items():
                 if row["label_source"] != "temporal_weak":
                     raise ValueError("This weak-supervision suite never imports manual test labels")
                 mask = load_array(row["target"], root)
                 resized = cv2.resize(mask, (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
-                if (resized != 255).any():
-                    available.add(identity)
-            usable.append(available)
-        common = set.intersection(*usable)
-        if not common:
-            raise ValueError(f"No common supervised {split} frames across supplied methods")
-        for identity in common:
-            identities = {(by_method[method][identity]["scene_name"], by_method[method][identity]["frame_token"],
-                           by_method[method][identity]["image"]) for method in methods}
+                class_pixels[(method, split, identity)] = np.array([(resized == 0).sum(), (resized == 1).sum()])
+    priority = [reference_method]+[method for method in requested_methods if method != reference_method]
+    alignment_drops = []
+    while True:
+        common, failures = {}, []
+        for split in ("train", "dev"):
+            usable = [{identity for identity in indexed[(method, split)]
+                       if class_pixels[(method, split, identity)].sum()} for method in methods]
+            common[split] = set.intersection(*usable)
+            for method in methods:
+                totals = sum((class_pixels[(method, split, identity)] for identity in common[split]), np.zeros(2, np.int64))
+                if not totals.all():
+                    failures.append(f"{method}/{split} lacks reliable positive or negative supervision after paired-image alignment")
+        if not failures:
+            break
+        if not skip_untrainable or len(methods) == 1:
+            raise ValueError("; ".join(failures))
+        # Keep the reference teacher arm first; relax comparisons, never fabricate labels.
+        removed = max(methods, key=priority.index)
+        methods.remove(removed)
+        availability[removed].update(status="alignment_incompatible", reasons=failures,
+            scope="paired suite; this method may still be trainable independently")
+        alignment_drops.append(removed)
+        write_json(output/"method_availability.json", list(availability.values()))
+    aligned, scene_sets = {}, {}
+    for split in ("train", "dev"):
+        for identity in common[split]:
+            identities = {(indexed[(method, split)][identity]["scene_name"], indexed[(method, split)][identity]["frame_token"],
+                           indexed[(method, split)][identity]["image"]) for method in methods}
             if len(identities) != 1:
                 raise ValueError("Shared IDs do not identify the same RGB observations")
-        scene_sets[split] = {row["scene_name"] for method in methods for row in by_method[method].values() if row["id"] in common}
         for method in methods:
-            group = [by_method[method][identity] for identity in sorted(common)]
-            totals = np.zeros(2, np.int64)
-            for row in group:
-                target = cv2.resize(load_array(row["target"], root), (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
-                totals += [(target == 0).sum(), (target == 1).sum()]
-            if not totals.all():
-                raise ValueError(f"{method}/{split} lacks reliable positive or negative supervision after resize; provide physical negative evidence")
-            aligned[(method, split)] = group
+            aligned[(method, split)] = [indexed[(method, split)][identity] for identity in sorted(common[split])]
+        scene_sets[split] = {row["scene_name"] for row in aligned[(methods[0], split)]}
     if scene_sets["train"] & scene_sets["dev"]:
         raise ValueError("Training and dev scenes overlap")
     output.mkdir(parents=True, exist_ok=True)
@@ -458,7 +471,8 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
         "init_checkpoint": initialization, "init_checkpoint_sha256": initialization_sha,
         "temporal_weight": 0.0, "receiver_pair_weight": 0.0, "weak_weight": 1.0,
         "scene_sampling": scene_sampling, "pixel_balance": "loss", "dice_weight": 0.5,
-        "requested_methods": requested_methods, "method_availability": availability,
+        "requested_methods": requested_methods, "method_availability": list(availability.values()),
+        "alignment_dropped_methods": alignment_drops, "alignment_priority": priority,
         "scene_sets": {key: sorted(value) for key, value in scene_sets.items()},
         "aligned_frames": {split: len(aligned[(methods[0], split)]) for split in ("train", "dev")},
         "budget": "same eligible image IDs, scene sampler/draw count, size, epochs, batch/accumulation and seed; only weak trimaps differ",

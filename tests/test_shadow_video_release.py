@@ -127,7 +127,7 @@ def test_video_writer_preserves_irregular_camera_timing(tmp_path):
 
 def frozen_protocol():
     config = VideoShadowConfig()
-    return {"stage": "full", "bev_role": "context", "discovery_mode": "cross-space", "discovery_domain": "receiver",
+    protocol = {"stage": "full", "bev_role": "context", "discovery_mode": "cross-space", "discovery_domain": "receiver",
         "owner_scoring": "geometry+appearance+bev", "entity_suppression_enabled": True,
         "entity_motion_config": asdict(EntityMotionConfig()), "discovery_config": asdict(config),
         "physics_config": asdict(LabelConfig(minimum_area=config.minimum_area, minimum_change_pixels=1,
@@ -138,6 +138,8 @@ def frozen_protocol():
         "spatial_feature_sources": [{"checkpoint_sha256": "checkpoint", "model_config_sha256": "config",
             "history_mode": "current-only", "pc_range": [-40, -40, -5, 40, 40, 3],
             "shape_chw": [8, 80, 80], "coordinate_frame": "LIDAR_TOP", "layout": "C,H,W"}]}
+    protocol["context_feature_sources"] = [{**protocol["spatial_feature_sources"][0], "history_mode": "temporal"}]
+    return protocol
 
 
 def frozen_setup(tmp_path):
@@ -162,7 +164,7 @@ def frozen_setup(tmp_path):
         path.mkdir()
     for slot in range(3):
         for root in (feature, spatial):
-            write_json(root/f"s{slot}.json", protocol["spatial_feature_sources"][0])
+            write_json(root/f"s{slot}.json", protocol["context_feature_sources" if root == feature else "spatial_feature_sources"][0])
     write_json(flow/"analysis_protocol.json", {"manifest_sha256": digest(pairs)})
     write_rows(flow/"pair_metrics.jsonl", [])
     batches = data/"batches.jsonl"
@@ -178,6 +180,27 @@ def test_freeze_captures_algorithm_configs_model_and_development_scenes(tmp_path
     assert "shadow_occ/annotation/video_correspondence.py" in lock["source_sha256"]
     assert lock["spatial_model_signatures"][0]["checkpoint_sha256"] == "checkpoint"
     assert lock["settings"]["m2_correspondence"] == "anchor-first-reasoning-v1"
+
+
+def test_legacy_context_freeze_requires_actual_metadata_and_explicit_history_assertion(tmp_path):
+    module, _, batches, after = frozen_setup(tmp_path)
+    path = after/"clip/protocol.json"
+    protocol = json.loads(path.read_text())
+    protocol.pop("context_feature_sources")
+    protocol["spatial_feature_sources"][0]["sample_token"] = "s0"
+    write_json(path, protocol)
+    with pytest.raises(ValueError, match="lacks context"):
+        module.freeze(after, [], tmp_path/"new_lock.json")
+    context = batches.parent/"feature"
+    metadata = json.loads((context/"s0.json").read_text())
+    metadata.pop("history_mode")
+    write_json(context/"s0.json", metadata)
+    with pytest.raises(ValueError, match="history mode is unknown"):
+        module.freeze(after, [], tmp_path/"new_lock.json", reference_context_root=context)
+    result = module.freeze(after, [], tmp_path/"new_lock.json", reference_context_root=context,
+        legacy_context_history_mode="temporal")
+    assert result["context_model_signatures"][0]["history_mode"] == "temporal"
+    assert result["reference_context_metadata_sha256"][str((context/"s0.json").resolve())] == digest(context/"s0.json")
 
 
 def test_frozen_batch_runs_original_entry_and_verifies_output(tmp_path, monkeypatch):
@@ -255,6 +278,17 @@ def test_frozen_batch_rejects_changed_algorithm_or_model(tmp_path):
     meta["checkpoint_sha256"] = "different-model"
     write_json(meta_path, meta)
     with pytest.raises(ValueError, match="cache differs"):
+        module.run_frozen(lock, batches, tmp_path/"run")
+
+
+@pytest.mark.parametrize("field,value", [("history_mode", "current-only"), ("external_exporter_sha256", "different-exporter")])
+def test_frozen_context_requires_the_same_extraction_protocol(tmp_path, field, value):
+    module, lock, batches, _ = frozen_setup(tmp_path)
+    path = batches.parent/"feature/s0.json"
+    meta = json.loads(path.read_text())
+    meta[field] = value
+    write_json(path, meta)
+    with pytest.raises(ValueError, match="Context BEV extraction"):
         module.run_frozen(lock, batches, tmp_path/"run")
 
 

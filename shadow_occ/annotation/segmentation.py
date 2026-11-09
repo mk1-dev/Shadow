@@ -139,7 +139,7 @@ def build_segmenter(backbone_weights=None):
     return deeplabv3_mobilenet_v3_large(weights=None, weights_backbone=weights, num_classes=1, aux_loss=False)
 
 
-def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None):
+def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None, *, return_components=False):
     logits = logits[:, 0].float()
     valid = target != 255
     truth = (target == 1).to(logits.dtype)
@@ -154,10 +154,14 @@ def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, n
     probability = logits.sigmoid()*valid*reliability
     dice = 1-(2*(probability*truth).flatten(1).sum(1)+1)/(probability.flatten(1).sum(1)+(truth*valid).flatten(1).sum(1)+1)
     # Empty foreground images already have a BCE term; do not let their Dice dominate.
-    loss = (bce+dice_weight*dice*(truth.flatten(1).sum(1) > 0))*(count > 0)
+    scale = (count > 0).to(logits.dtype)
     if weights is not None:
-        loss = loss*weights
-    return loss.sum()/(count > 0).sum().clamp_min(1)
+        scale = scale*weights
+    denominator = (count > 0).sum().clamp_min(1)
+    bce = (bce*scale).sum()/denominator
+    dice = (dice*(truth.flatten(1).sum(1) > 0)*scale).sum()/denominator
+    loss = bce+dice_weight*dice
+    return (loss, {"bce": bce, "dice": dice}) if return_components else loss
 
 
 def temporal_loss(current, previous, grid, weight, sample_weight=None):
@@ -364,6 +368,7 @@ def train_main():
                 module.eval()
         optimizer.zero_grad(set_to_none=True)
         pair_weight_sum, pair_loss_sum, pair_batches = 0.0, 0.0, 0
+        train_totals = torch.zeros(6, device=device, dtype=torch.float64)
         for step, batch in enumerate(tqdm(loader, desc=f"segmenter epoch {epoch}", disable=rank != 0)):
             start = (step//args.accumulation)*args.accumulation
             window = min(args.accumulation, len(loader)-start)
@@ -384,20 +389,25 @@ def train_main():
                     logits = predictions[:images.shape[0]]
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
                     weights = weights*batch["sample_weight"].to(device)
-                    loss = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights,
-                                       batch["negative_weight"].to(device))
+                    loss, terms = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights,
+                                       batch["negative_weight"].to(device), return_components=True)
+                    temporal_value, pair_value = loss.new_zeros(()), loss.new_zeros(())
                     if use_temporal:
                         previous = predictions[images.shape[0]:2*images.shape[0]]
-                        loss = loss + args.temporal_weight*temporal_loss(logits, previous, batch["temporal_grid"].to(device), batch["temporal_weight"].to(device), weights)
+                        temporal_value = temporal_loss(logits, previous, batch["temporal_grid"].to(device), batch["temporal_weight"].to(device), weights)
+                        loss = loss + args.temporal_weight*temporal_value
                     if use_receiver:
                         offset = images.shape[0]*(2 if use_temporal else 1)
                         before, after = predictions[offset:].chunk(2)
                         pair_loss = receiver_order_loss(logits, before, after, batch["onset_weight"].to(device),
                             batch["recovery_weight"].to(device), weights, args.receiver_pair_margin)
                         loss = loss + args.receiver_pair_weight*pair_loss
+                        pair_value = pair_loss
                         pair_weight_sum += float((batch["onset_weight"]+batch["recovery_weight"]).sum())
                         pair_loss_sum += float(pair_loss.detach())
                         pair_batches += 1
+                    train_totals[:5] += torch.stack([loss, terms["bce"], terms["dice"], temporal_value, pair_value]).detach().double()*len(images)
+                    train_totals[5] += len(images)
                     loss = loss/window
                 scaler.scale(loss).backward()
             if boundary:
@@ -407,6 +417,14 @@ def train_main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         raw = model.module if world > 1 else model
+        if world > 1:
+            dist.all_reduce(train_totals)
+        totals = train_totals.cpu().tolist()
+        train_metrics = {name: totals[index]/totals[5] if totals[5] else None
+            for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
+        train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
+            temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
+            reduction="sample-mean before gradient accumulation scaling, across all DDP ranks")
         metrics, temporal_metrics = evaluate(raw, dev, args.size, device, rank, world)
         readiness = segmentation_readiness(metrics)
         preferred = [v["iou"] for k, v in metrics.items() if k in GT_SOURCES and v["iou"] is not None]
@@ -418,7 +436,7 @@ def train_main():
             if readiness["noncollapsed"] and score > best:
                 best = score
                 torch.save(state, output/"best.pth")
-            history.append({"epoch": epoch, "dev_metrics_by_source": metrics, "temporal": temporal_metrics, "readiness": readiness,
+            history.append({"epoch": epoch, "train_loss": train_metrics, "dev_metrics_by_source": metrics, "temporal": temporal_metrics, "readiness": readiness,
                 "receiver_pairs_rank0": {"active_transition_pixels": pair_weight_sum, "batches": pair_batches,
                     "mean_relative_loss": pair_loss_sum/pair_batches if pair_batches else None}})
             write_json(output/"history.json", history)
@@ -426,7 +444,7 @@ def train_main():
                 "last": readiness, "approved_for_relabeling": False})
             compact = {source: {key: value for key, value in result.items() if key != "score_diagnostics"}
                        for source, result in metrics.items()}
-            print({"epoch": epoch, "dev_metrics_by_source": compact, "temporal": temporal_metrics,
+            print({"epoch": epoch, "train_loss": train_metrics, "dev_metrics_by_source": compact, "temporal": temporal_metrics,
                    "noncollapsed": readiness["noncollapsed"], "reasons": readiness["reasons"]}, flush=True)
     usable_best = torch.tensor(int(best >= 0), device=device)
     if world > 1:

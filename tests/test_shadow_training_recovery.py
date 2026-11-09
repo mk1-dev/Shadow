@@ -98,6 +98,60 @@ def test_negative_reliability_changes_only_known_negative_bce_gradient():
     assert float(logits.grad[0, 0, 0, 2]) == 0
 
 
+def test_segmentation_loss_components_reconstruct_the_unscaled_training_loss():
+    torch = pytest.importorskip("torch")
+    from shadow_occ.annotation.segmentation import masked_loss
+    logits = torch.zeros((2, 1, 1, 3), requires_grad=True)
+    target = torch.tensor([[[1, 0, 255]], [[0, 0, 255]]])
+    total, terms = masked_loss(logits, target, .5, weights=torch.tensor([.25, 1.]),
+        class_weights=[1., 2.], negative_weights=torch.tensor([.5, 1.]), return_components=True)
+    assert torch.allclose(total, terms["bce"]+.5*terms["dice"])
+    assert torch.allclose(total, masked_loss(logits, target, .5, weights=torch.tensor([.25, 1.]),
+        class_weights=[1., 2.], negative_weights=torch.tensor([.5, 1.])))
+    total.backward()
+    assert not logits.grad[:, :, :, 2].any()
+
+
+def test_cpu_training_records_unscaled_epoch_loss_components(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from shadow_occ.annotation import segmentation
+    from shadow_occ.annotation.data import write_rows
+
+    class TinySegmenter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Conv2d(3, 1, 1)
+            with torch.no_grad():
+                self.layer.weight.zero_()
+                self.layer.weight[:, 0].fill_(2.)
+                self.layer.bias.zero_()
+
+        def forward(self, image):
+            return {"out": self.layer(image)}
+
+    monkeypatch.setattr(segmentation, "build_segmenter", lambda *args: TinySegmenter())
+    image = np.zeros((8, 8, 3), np.uint8)
+    image[:, 4:] = 255
+    target = np.zeros((8, 8), np.uint8)
+    target[:, 4:] = 1
+    for split in ("train", "dev"):
+        image_path, target_path = tmp_path/(split+".png"), tmp_path/(split+"_mask.png")
+        checked_write_image(image_path, image)
+        checked_write_image(target_path, target)
+        write_rows(tmp_path/(split+".jsonl"), [{"id": split, "scene_name": split, "split": split,
+            "image": str(image_path), "target": str(target_path), "label_source": "temporal_weak"}])
+    output = tmp_path/"trained"
+    monkeypatch.setattr("sys.argv", ["train", "--train", str(tmp_path/"train.jsonl"), "--dev", str(tmp_path/"dev.jsonl"),
+        "--output-root", str(output), "--device", "cpu", "--size", "8", "8", "--epochs", "1",
+        "--batch-size", "1", "--accumulation", "4", "--workers", "0", "--temporal-weight", "0", "--allow-weak-labels"])
+    segmentation.train_main()
+    record = json.loads((output/"history.json").read_text())[0]["train_loss"]
+    assert record["images"] == 1
+    assert record["total"] == pytest.approx(record["bce"]+.5*record["dice"])
+    assert record["total"] > 0 and record["temporal"] == record["receiver_pair"] == 0
+    assert (output/"best.pth").is_file()
+
+
 def test_receiver_order_loss_has_signal_at_collapsed_equal_predictions():
     torch = pytest.importorskip("torch")
     from shadow_occ.annotation.segmentation import receiver_order_loss
