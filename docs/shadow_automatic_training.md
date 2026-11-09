@@ -316,10 +316,15 @@ before this reliability coefficient so it does not cancel the discount. All
 compared arms must use the same setting. Set a shared `SHADOW_SEG_INIT_CHECKPOINT` before preparing the CPU suite
 to use a local pretrained segmenter. A checkpoint previously trained with manual
 shadow masks is not part of the no-manual-shadow-supervision main result; record
-its source as an explicit pretraining control. Default initialization and an
-ImageNet-only backbone do not add shadow-mask supervision. Offline ImageNet initialization requires
-already-cached torchvision weights. No target-domain manual shadow mask enters
-this default path.
+its source as an explicit pretraining control. The default uses an ImageNet-only
+MobileNetV3 backbone, with its pretrained BatchNorm statistics retained. The new
+segmentation head learns its own BatchNorm statistics; only singleton ASPP pooled
+features fall back to running statistics. Explicit `--backbone-weights none`
+trains backbone statistics as well, rather than freezing an uninitialized
+normalization chain. This policy preserves checkpoint state-dict compatibility.
+Offline ImageNet initialization requires already-cached torchvision weights.
+No target-domain manual shadow mask enters this default path. Epoch histories
+also record gradient norms, successful optimizer updates and AMP-skipped updates.
 
 The current bridge does not create new temporal-loss evidence. Temporal and
 receiver-pair loss stay zero in the first same-supervision comparison unless real

@@ -50,7 +50,7 @@ def prepare_pipeline(config_path, output_root, fraction=25):
         "methods": ["appearance_only", "anchor_first_v8plus"],
         "cpu_partition": "AMD", "gpu_partition": "NV_RTX4090", "cpu_parallel": 4, "bev_parallel": 1,
         "annotation_env": "shadow_annotator", "bev_env": "drivevla", "student_gpus": 1,
-        "epochs": 10, "batch_size": 2, "accumulation": 4, "backbone_weights": "none", "negative_weight": .5,
+        "epochs": 10, "batch_size": 2, "accumulation": 4, "backbone_weights": "imagenet", "negative_weight": .5,
         "conda_sh": "/public/home/eng_zhihongli/anaconda3/etc/profile.d/conda.sh"}
     config = {**defaults, **config}
     config["config_source"] = str(config_path)

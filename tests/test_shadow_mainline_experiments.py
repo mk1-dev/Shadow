@@ -108,6 +108,7 @@ def test_suite_aligns_same_images_budget_and_scene_sets(tmp_path):
     module = script("build_shadow_mainline_experiments")
     module.build_dataset(runs, tmp_path/"data", [negatives], (80, 80))
     plan = module.prepare_suite(tmp_path/"data", ["appearance", "anchor"], tmp_path/"suite", (80, 80), epochs=2)
+    assert plan["backbone_weights"] == "imagenet"
     assert plan["aligned_frames"] == {"train": 1, "dev": 1}  # Other synthetic frames are all IGNORE.
     assert plan["epochs"] == 2 and plan["weak_weight"] == 1
     assert plan["temporal_weight"] == plan["receiver_pair_weight"] == 0

@@ -131,12 +131,40 @@ class ShadowDataset(Dataset):
                 "onset_weight": torch.from_numpy(onset_weight), "recovery_weight": torch.from_numpy(recovery_weight)}
 
 
+class SingletonSafeBatchNorm2d(nn.BatchNorm2d):
+    def forward(self, inputs):
+        # ASPP pooling can leave just one value per channel on a local DDP rank.
+        if self.training and inputs.numel() // inputs.shape[1] == 1:
+            return F.batch_norm(inputs, self.running_mean, self.running_var,
+                                self.weight, self.bias, False, 0.0, self.eps)
+        return super().forward(inputs)
+
+
 def build_segmenter(backbone_weights=None):
     from torchvision.models import MobileNet_V3_Large_Weights
     from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
+    from torchvision.models.segmentation.deeplabv3 import ASPPPooling
 
     weights = MobileNet_V3_Large_Weights.DEFAULT if backbone_weights == "imagenet" else None
-    return deeplabv3_mobilenet_v3_large(weights=None, weights_backbone=weights, num_classes=1, aux_loss=False)
+    model = deeplabv3_mobilenet_v3_large(weights=None, weights_backbone=weights, num_classes=1, aux_loss=False)
+    for module in model.classifier.modules():
+        if isinstance(module, ASPPPooling):
+            for name, child in list(module.named_children()):
+                if isinstance(child, nn.BatchNorm2d):
+                    replacement = SingletonSafeBatchNorm2d(child.num_features, eps=child.eps,
+                        momentum=child.momentum, affine=child.affine, track_running_stats=child.track_running_stats)
+                    replacement.load_state_dict(child.state_dict())
+                    module.add_module(name, replacement)
+    return model
+
+
+def set_segmenter_train_mode(model, freeze_backbone_stats=False):
+    model.train()
+    raw = model.module if isinstance(model, DistributedDataParallel) else model
+    if freeze_backbone_stats and hasattr(raw, "backbone"):
+        for module in raw.backbone.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
 
 
 def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None, *, return_components=False):
@@ -251,7 +279,7 @@ def train_main():
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--allow-weak-labels", action="store_true")
     parser.add_argument("--weak-weight", type=float, default=0.25)
-    parser.add_argument("--backbone-weights", choices=["none", "imagenet"], default="none")
+    parser.add_argument("--backbone-weights", choices=["none", "imagenet"], default="imagenet")
     parser.add_argument("--init-checkpoint", help="Optional segmenter checkpoint for pretraining -> adaptation")
     args = parser.parse_args()
     if min(args.epochs, args.batch_size, args.accumulation, *args.size) < 1:
@@ -339,6 +367,8 @@ def train_main():
         write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": "uniform scene then uniform image with replacement; no class sampling" if args.scene_sampling == "uniform" else "ordinary shuffled/distributed; no class oversampling", "approved_for_relabeling": False,
             "expected_scene_sample_fraction": {scene: float(sum(probabilities[index] for index, row in enumerate(train) if row["scene_name"] == scene)) for scene in sorted({row["scene_name"] for row in train})},
             "negative_weight_contract": "per-row weak-negative loss coefficient, not calibrated confidence; class balancing computed before reliability weighting",
+            "batchnorm_policy": {"backbone": "frozen_imagenet_statistics" if args.backbone_weights == "imagenet" else "train_batch_statistics",
+                "head": "train_batch_statistics", "aspp_singleton": "running_statistics_only_for_single_value_per_channel"},
             "code_sha256": {name: digest(Path(__file__).with_name(name)) for name in ("segmentation.py", "readiness.py", "scene_sampling.py")},
             "initialization_sha256": digest(args.init_checkpoint) if args.init_checkpoint else None})
         print({"train_resized_pixels": resized_counts.tolist(), "effective_class_mass": effective_mass.tolist(),
@@ -348,7 +378,7 @@ def train_main():
     sampler = (SceneBalancedSampler(train, args.seed, rank, world) if args.scene_sampling == "uniform"
                else DistributedSampler(ShadowDataset(train, args.size), seed=args.seed) if world > 1 else None)
     loader = DataLoader(ShadowDataset(train, args.size, augment=True, receiver_pairs=args.receiver_pair_weight > 0), batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=device.type == "cuda")
-    model = build_segmenter(args.backbone_weights).to(device)
+    model = build_segmenter(None if initial_checkpoint is not None else args.backbone_weights).to(device)
     if initial_checkpoint is not None:
         model.load_state_dict(initial_checkpoint["model"])
         del initial_checkpoint
@@ -361,14 +391,11 @@ def train_main():
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        model.train()
-        # Freeze running statistics, including ASPP's 1x1 pooled BatchNorm at batch size 1.
-        for module in model.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                module.eval()
+        set_segmenter_train_mode(model, freeze_backbone_stats=args.backbone_weights == "imagenet")
         optimizer.zero_grad(set_to_none=True)
         pair_weight_sum, pair_loss_sum, pair_batches = 0.0, 0.0, 0
         train_totals = torch.zeros(6, device=device, dtype=torch.float64)
+        optimizer_totals = torch.zeros(3, device=device, dtype=torch.float64)
         for step, batch in enumerate(tqdm(loader, desc=f"segmenter epoch {epoch}", disable=rank != 0)):
             start = (step//args.accumulation)*args.accumulation
             window = min(args.accumulation, len(loader)-start)
@@ -412,19 +439,27 @@ def train_main():
                 scaler.scale(loss).backward()
             if boundary:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                skipped = scaler.get_scale() < previous_scale
+                optimizer_totals += torch.stack([gradient_norm.detach().double(),
+                    gradient_norm.new_tensor(1.0), gradient_norm.new_tensor(float(skipped))])
                 optimizer.zero_grad(set_to_none=True)
         raw = model.module if world > 1 else model
         if world > 1:
             dist.all_reduce(train_totals)
+            dist.all_reduce(optimizer_totals)
         totals = train_totals.cpu().tolist()
         train_metrics = {name: totals[index]/totals[5] if totals[5] else None
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
         train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
             reduction="sample-mean before gradient accumulation scaling, across all DDP ranks")
+        gradient_sum, attempted, skipped = optimizer_totals.cpu().tolist()
+        train_metrics.update(mean_gradient_norm=gradient_sum/attempted if attempted else None,
+            optimizer_steps=int((attempted-skipped)/world), skipped_optimizer_steps=int(skipped/world))
         metrics, temporal_metrics = evaluate(raw, dev, args.size, device, rank, world)
         readiness = segmentation_readiness(metrics)
         preferred = [v["iou"] for k, v in metrics.items() if k in GT_SOURCES and v["iou"] is not None]

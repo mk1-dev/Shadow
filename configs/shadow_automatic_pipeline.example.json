@@ -23,6 +23,6 @@
   "epochs": 10,
   "batch_size": 2,
   "accumulation": 4,
-  "backbone_weights": "none",
+  "backbone_weights": "imagenet",
   "negative_weight": 0.5
 }

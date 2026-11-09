@@ -366,7 +366,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
 
 
 def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10, batch_size=2, accumulation=4, seed=0,
-                  backbone_weights="none", init_checkpoint=None, reference_method=None, scene_sampling="uniform", skip_untrainable=False):
+                  backbone_weights="imagenet", init_checkpoint=None, reference_method=None, scene_sampling="uniform", skip_untrainable=False):
     if scene_sampling not in {"image", "uniform"}:
         raise ValueError("Choose image or uniform scene sampling")
     root, output = Path(dataset_root).resolve(), Path(output_root).resolve()
@@ -508,7 +508,7 @@ def main():
     suite.add_argument("--batch-size", type=int, default=2)
     suite.add_argument("--accumulation", type=int, default=4)
     suite.add_argument("--seed", type=int, default=0)
-    suite.add_argument("--backbone-weights", choices=["none", "imagenet"], default="none")
+    suite.add_argument("--backbone-weights", choices=["none", "imagenet"], default="imagenet")
     suite.add_argument("--init-checkpoint")
     suite.add_argument("--reference-method", help="One frozen teacher reference shared by all held-out agreement evaluations")
     suite.add_argument("--scene-sampling", choices=["uniform", "image"], default="uniform")

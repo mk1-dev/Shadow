@@ -149,6 +149,8 @@ def test_cpu_training_records_unscaled_epoch_loss_components(tmp_path, monkeypat
     assert record["images"] == 1
     assert record["total"] == pytest.approx(record["bce"]+.5*record["dice"])
     assert record["total"] > 0 and record["temporal"] == record["receiver_pair"] == 0
+    assert record["optimizer_steps"] == 1 and record["skipped_optimizer_steps"] == 0
+    assert record["mean_gradient_norm"] > 0
     assert (output/"best.pth").is_file()
 
 
