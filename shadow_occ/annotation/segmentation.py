@@ -451,6 +451,9 @@ def train_main():
         if world > 1:
             dist.all_reduce(train_totals)
             dist.all_reduce(optimizer_totals)
+            # Validation bypasses DDP, so every shard must use rank 0's BN state.
+            for buffer in raw.buffers():
+                dist.broadcast(buffer, src=0)
         totals = train_totals.cpu().tolist()
         train_metrics = {name: totals[index]/totals[5] if totals[5] else None
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
@@ -458,7 +461,7 @@ def train_main():
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
             reduction="sample-mean before gradient accumulation scaling, across all DDP ranks")
         gradient_sum, attempted, skipped = optimizer_totals.cpu().tolist()
-        train_metrics.update(mean_gradient_norm=gradient_sum/attempted if attempted else None,
+        train_metrics.update(mean_gradient_norm=gradient_sum/attempted if attempted and np.isfinite(gradient_sum) else None,
             optimizer_steps=int((attempted-skipped)/world), skipped_optimizer_steps=int(skipped/world))
         metrics, temporal_metrics = evaluate(raw, dev, args.size, device, rank, world)
         readiness = segmentation_readiness(metrics)
