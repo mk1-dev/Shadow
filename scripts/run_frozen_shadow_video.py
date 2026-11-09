@@ -115,7 +115,7 @@ def check_batch_cache(paths, clips, signatures):
     return fingerprints
 
 
-def freeze(reference_root, development_roots, output_path, repo=None):
+def freeze(reference_root, development_roots, output_path, repo=None, development_pairs=()):
     repo = Path(repo or Path(__file__).resolve().parents[1]).resolve()
     output = Path(output_path).resolve()
     if output.exists():
@@ -137,8 +137,17 @@ def freeze(reference_root, development_roots, output_path, repo=None):
         for folder, protocol, _ in find_clips(root).values():
             excluded.add(protocol["clip"]["scene_name"])
             protocols[str(folder/"protocol.json")] = digest(folder/"protocol.json")
+    development_manifests = {}
+    for path in development_pairs:
+        path = Path(path).resolve()
+        rows = read_rows(path)
+        if not rows or any(not row.get("scene_name") for row in rows):
+            raise ValueError("Development pair manifests must identify actual previously used scenes")
+        excluded.update(row["scene_name"] for row in rows)
+        development_manifests[str(path)] = digest(path)
     payload = {"protocol": "frozen-anchor-first-generalization-v1", "source_commit": git_revision(repo),
         "source_sha256": source_hashes(repo), "reference_protocol_sha256": protocols,
+        "development_pair_manifest_sha256": development_manifests,
         "excluded_development_scenes": sorted(excluded), "settings": configs[0],
         "spatial_model_signatures": signatures, "discovery_cli_options": cli_options(configs[0]),
         "historical_reference_source_identity_verified": False,
@@ -177,8 +186,11 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
             raise ValueError(f"New-scene batch overlaps development scenes: {sorted(overlap)}")
         if split in {"train", "dev"} and any(pair.get("official_split") not in {"train", "mini_train"} for pair in read_rows(paths["pairs"])):
             raise ValueError("Only official training scenes may be annotated as train/dev")
+        mode = row.get("discovery_mode", lock["settings"]["discovery_mode"])
+        if mode not in {lock["settings"]["discovery_mode"], "appearance"}:
+            raise ValueError("Only the explicit appearance proposal ablation may differ from the frozen teacher")
         for clip in clips:
-            key = (clip["scene_name"], clip["camera"], clip["start_sample_token"], clip["track_id"], clip["num_frames"])
+            key = (mode, clip["scene_name"], clip["camera"], clip["start_sample_token"], clip["track_id"], clip["num_frames"])
             if key in seen_clips:
                 raise ValueError("Duplicate clip across batches")
             seen_clips.add(key)
@@ -188,28 +200,30 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
             if not paths[key].is_dir():
                 raise FileNotFoundError(paths[key])
         manifest_hashes.update(check_batch_cache(paths, clips, lock["spatial_model_signatures"]))
-        prepared.append((row["id"], paths, clips))
+        prepared.append((row["id"], paths, clips, {**lock["settings"], "discovery_mode": mode}))
     output = Path(output_root).resolve()
-    inputs = [path for _, paths, _ in prepared for key, path in paths.items() if key.endswith("root")]
+    inputs = [path for _, paths, _, _ in prepared for key, path in paths.items() if key.endswith("root")]
     if any(output == path or path in output.parents for path in inputs):
         raise ValueError("Use a separate output directory outside frozen inputs/manifests")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
     output.mkdir(parents=True, exist_ok=True)
     write_json(output/"freeze_lock.json", lock)
-    write_rows(output/"batches_submitted.jsonl", [{"id": identity, **{key: str(path) for key, path in paths.items()}}
-                                                 for identity, paths, _ in prepared])
+    write_rows(output/"batches_submitted.jsonl", [{"id": identity, "discovery_mode": config["discovery_mode"], **{key: str(path) for key, path in paths.items()}}
+                                                 for identity, paths, _, config in prepared])
     protocol = {"freeze_lock_sha256": digest(lock_path), "batch_manifest_sha256": digest(batches_path),
         "input_manifest_sha256": manifest_hashes, "excluded_development_scenes": sorted(excluded),
-        "algorithm_settings_overridden": False, "training_performed": False, "batches": []}
+        "algorithm_settings_overridden": any(config != lock["settings"] for _, _, _, config in prepared),
+        "ablation_contract": "appearance-only proposal ablation retains frozen receiver, physics, caster and memory; not a geometry-free pipeline",
+        "training_performed": False, "batches": []}
     protocol["batch_splits"] = {row["id"]: row.get("split", "eval") for row in batches}
     protocol["development_scene_policy"] = "prior teacher-development scenes may be training data, never held-out eval"
     write_json(output/"frozen_run.json", protocol)
-    for identity, paths, clips in prepared:
+    for identity, paths, clips, config in prepared:
         command = [sys.executable, "-u", str(repo/"scripts/discover_shadow_video.py")]
         for key, path in paths.items():
             command.extend(["--"+key.replace("_", "-"), str(path)])
-        command.extend(["--output-root", str(output/identity), *lock["discovery_cli_options"]])
+        command.extend(["--output-root", str(output/identity), *cli_options(config)])
         record = {"id": identity, "command": command, "status": "running"}
         protocol["batches"].append(record)
         write_json(output/"frozen_run.json", protocol)
@@ -228,7 +242,7 @@ def run_frozen(lock_path, batches_path, output_root, repo=None):
             for _, actual, rows in actual_entries:
                 if actual["clip"] != expected_clips[actual["clip"]["id"]] or len(rows) != actual["clip"]["num_frames"]:
                     raise ValueError("Discovery clip identity or frame count differs from submitted manifest")
-                if settings(actual) != lock["settings"]:
+                if settings(actual) != config:
                     raise ValueError("Actual run settings differ from frozen reference")
                 if model_signatures(actual) != lock["spatial_model_signatures"]:
                     raise ValueError("New data used a different frozen BEV model/extraction protocol")
@@ -250,13 +264,14 @@ def main():
     lock = sub.add_parser("freeze")
     lock.add_argument("--reference-root", required=True)
     lock.add_argument("--development-roots", nargs="*", default=[])
+    lock.add_argument("--development-pairs", nargs="*", default=[], help="Pair manifests actually used in previous algorithm development, not future cache coverage")
     lock.add_argument("--output", required=True)
     run = sub.add_parser("run")
     run.add_argument("--lock", required=True)
     run.add_argument("--batches", required=True)
     run.add_argument("--output-root", required=True)
     args = parser.parse_args()
-    result = freeze(args.reference_root, args.development_roots, args.output) if args.command == "freeze" else run_frozen(args.lock, args.batches, args.output_root)
+    result = freeze(args.reference_root, args.development_roots, args.output, development_pairs=args.development_pairs) if args.command == "freeze" else run_frozen(args.lock, args.batches, args.output_root)
     print(json.dumps(result), flush=True)
 
 

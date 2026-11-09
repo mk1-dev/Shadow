@@ -13,7 +13,7 @@ from torch import distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from tqdm import tqdm
 
 from shadow_occ.annotation.data import (
@@ -23,8 +23,23 @@ from shadow_occ.annotation.metrics import BinaryMetrics, pixel_score_diagnostics
 from shadow_occ.annotation.temporal import sampling_grid
 from shadow_occ.annotation.readiness import binary_risk_weights, require_segmenter_checkpoint, segmentation_readiness
 from shadow_occ.annotation.teacher_provenance import extend_scene_history
+from shadow_occ.annotation.scene_sampling import scene_epoch_indices, scene_probabilities
 from shadow_occ.utils.io import write_json
 from shadow_occ.utils.seed import seed_everything, seed_worker
+
+
+class SceneBalancedSampler(Sampler):
+    def __init__(self, rows, seed, rank=0, world=1):
+        self.rows, self.seed, self.rank, self.world, self.epoch = rows, seed, rank, world, 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return (len(self.rows)+self.world-1)//self.world
+
+    def __iter__(self):
+        return iter(scene_epoch_indices(self.rows, self.seed, self.epoch, self.rank, self.world))
 
 
 class ShadowDataset(Dataset):
@@ -107,7 +122,11 @@ class ShadowDataset(Dataset):
         sample_weight = float(row.get("sample_weight", 1.0))
         if not np.isfinite(sample_weight) or not 0 < sample_weight <= 1:
             raise ValueError("sample_weight must be in (0, 1]")
+        negative_weight = float(row.get("negative_weight", 1.0))
+        if not np.isfinite(negative_weight) or not 0 < negative_weight <= 1:
+            raise ValueError("negative_weight must be in (0, 1]")
         return {"image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"], "sample_weight": sample_weight,
+                "negative_weight": negative_weight,
                 "receiver_previous": tensor(receiver_previous), "receiver_next": tensor(receiver_next),
                 "onset_weight": torch.from_numpy(onset_weight), "recovery_weight": torch.from_numpy(recovery_weight)}
 
@@ -120,7 +139,7 @@ def build_segmenter(backbone_weights=None):
     return deeplabv3_mobilenet_v3_large(weights=None, weights_backbone=weights, num_classes=1, aux_loss=False)
 
 
-def masked_loss(logits, target, dice_weight, weights=None, class_weights=None):
+def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None):
     logits = logits[:, 0].float()
     valid = target != 255
     truth = (target == 1).to(logits.dtype)
@@ -128,8 +147,11 @@ def masked_loss(logits, target, dice_weight, weights=None, class_weights=None):
     pixel_weights = torch.ones_like(logits)
     if class_weights is not None:
         pixel_weights = torch.where(target == 1, float(class_weights[1]), float(class_weights[0]))
-    bce = (F.binary_cross_entropy_with_logits(logits, truth, reduction="none")*valid*pixel_weights).flatten(1).sum(1)/count.clamp_min(1)
-    probability = logits.sigmoid()*valid
+    reliability = torch.ones_like(logits)
+    if negative_weights is not None:
+        reliability = torch.where(target == 0, negative_weights.to(logits).reshape(-1, 1, 1), reliability)
+    bce = (F.binary_cross_entropy_with_logits(logits, truth, reduction="none")*valid*pixel_weights*reliability).flatten(1).sum(1)/count.clamp_min(1)
+    probability = logits.sigmoid()*valid*reliability
     dice = 1-(2*(probability*truth).flatten(1).sum(1)+1)/(probability.flatten(1).sum(1)+(truth*valid).flatten(1).sum(1)+1)
     # Empty foreground images already have a BCE term; do not let their Dice dominate.
     loss = (bce+dice_weight*dice*(truth.flatten(1).sum(1) > 0))*(count > 0)
@@ -213,6 +235,7 @@ def train_main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--pixel-balance", choices=["loss", "none"], default="loss")
+    parser.add_argument("--scene-sampling", choices=["image", "uniform"], default="image")
     parser.add_argument("--positive-only-ablation", action="store_true",
                         help="Run the positive-only training control against unchanged two-class dev labels")
     parser.add_argument("--max-pixel-weight", type=float, default=50.0)
@@ -246,7 +269,7 @@ def train_main():
     effective_mass = np.zeros(2, dtype=np.float64)
     resized_counts = np.zeros(2, dtype=np.int64)
     receiver_pair_rows = 0
-    usable = []
+    usable, row_mass = [], []
     for row in train:
         mask = cv2.imread(row["target"], cv2.IMREAD_GRAYSCALE)
         if mask is None:
@@ -262,10 +285,14 @@ def train_main():
             base = (args.weak_weight if row["label_source"] in WEAK_SOURCES else 1.0)*float(row.get("sample_weight", 1.0))
             if not np.isfinite(base) or base <= 0:
                 raise ValueError("Invalid effective segmentation sample weight")
-            effective_mass += base*resized/resized.sum()
+            row_mass.append(base*resized/resized.sum())
             receiver_pair_rows += int(bool(row.get("physics_transition")) and resized[1] > 0)
             usable.append(row)
     train = usable
+    if not train:
+        raise ValueError("No known training pixels survive resize")
+    probabilities = scene_probabilities(train, args.scene_sampling)
+    effective_mass = (np.asarray(row_mass)*probabilities[:, None]).sum(axis=0)*len(train)
     positive_only = args.positive_only_ablation and resized_counts[0] == 0 and resized_counts[1] > 0
     if (resized_counts == 0).any() and not positive_only:
         raise ValueError("Both known classes must survive the actual training resize; increase resolution or fix labels")
@@ -305,14 +332,17 @@ def train_main():
         dist.barrier()
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": "ordinary shuffled/distributed; no class oversampling", "approved_for_relabeling": False,
-            "code_sha256": {name: digest(Path(__file__).with_name(name)) for name in ("segmentation.py", "readiness.py")},
+        write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": "uniform scene then uniform image with replacement; no class sampling" if args.scene_sampling == "uniform" else "ordinary shuffled/distributed; no class oversampling", "approved_for_relabeling": False,
+            "expected_scene_sample_fraction": {scene: float(sum(probabilities[index] for index, row in enumerate(train) if row["scene_name"] == scene)) for scene in sorted({row["scene_name"] for row in train})},
+            "negative_weight_contract": "per-row weak-negative loss coefficient, not calibrated confidence; class balancing computed before reliability weighting",
+            "code_sha256": {name: digest(Path(__file__).with_name(name)) for name in ("segmentation.py", "readiness.py", "scene_sampling.py")},
             "initialization_sha256": digest(args.init_checkpoint) if args.init_checkpoint else None})
         print({"train_resized_pixels": resized_counts.tolist(), "effective_class_mass": effective_mass.tolist(),
                "pixel_loss_weights": pixel_weights, "receiver_pair_rows": receiver_pair_rows}, flush=True)
     if world > 1:
         dist.barrier()
-    sampler = DistributedSampler(ShadowDataset(train, args.size), seed=args.seed) if world > 1 else None
+    sampler = (SceneBalancedSampler(train, args.seed, rank, world) if args.scene_sampling == "uniform"
+               else DistributedSampler(ShadowDataset(train, args.size), seed=args.seed) if world > 1 else None)
     loader = DataLoader(ShadowDataset(train, args.size, augment=True, receiver_pairs=args.receiver_pair_weight > 0), batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=device.type == "cuda")
     model = build_segmenter(args.backbone_weights).to(device)
     if initial_checkpoint is not None:
@@ -354,7 +384,8 @@ def train_main():
                     logits = predictions[:images.shape[0]]
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
                     weights = weights*batch["sample_weight"].to(device)
-                    loss = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights)
+                    loss = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights,
+                                       batch["negative_weight"].to(device))
                     if use_temporal:
                         previous = predictions[images.shape[0]:2*images.shape[0]]
                         loss = loss + args.temporal_weight*temporal_loss(logits, previous, batch["temporal_grid"].to(device), batch["temporal_weight"].to(device), weights)

@@ -201,6 +201,27 @@ def test_frozen_batch_runs_original_entry_and_verifies_output(tmp_path, monkeypa
     assert not result["algorithm_settings_overridden"] and not result["training_performed"]
 
 
+def test_appearance_ablation_changes_only_the_declared_discovery_mode(tmp_path, monkeypatch):
+    module, lock, batches, after = frozen_setup(tmp_path)
+    rows = read_rows(batches)
+    rows[0]["discovery_mode"] = "appearance"
+    write_rows(batches, rows)
+    def fake_run(command, **kwargs):
+        assert command[command.index("--discovery-mode")+1] == "appearance"
+        output = Path(command[command.index("--output-root")+1])/"new-clip"
+        output.mkdir(parents=True)
+        protocol = json.loads((after/"clip/protocol.json").read_text())
+        protocol["clip"] = read_rows(batches.parent/"clips.jsonl")[0]
+        protocol["discovery_mode"] = "appearance"
+        write_json(output/"protocol.json", protocol)
+        write_rows(output/"frames.jsonl", read_rows(after/"clip/frames.jsonl"))
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = module.run_frozen(lock, batches, tmp_path/"run")
+    assert result["algorithm_settings_overridden"]
+    assert json.loads(lock.read_text())["settings"]["discovery_mode"] == "cross-space"
+
+
 def test_frozen_batch_excludes_development_scene_before_running(tmp_path):
     module, lock, batches, _ = frozen_setup(tmp_path)
     clips_path = batches.parent/"clips.jsonl"
@@ -210,6 +231,15 @@ def test_frozen_batch_excludes_development_scene_before_running(tmp_path):
     with pytest.raises(ValueError, match="overlaps development"):
         module.run_frozen(lock, batches, tmp_path/"run")
     assert not (tmp_path/"run").exists()
+
+
+def test_freeze_records_earlier_pair_development_scenes_not_only_final_demo_clips(tmp_path):
+    module, _, _, after = frozen_setup(tmp_path)
+    pairs = tmp_path/"old_development_pairs.jsonl"
+    write_rows(pairs, [{"scene_name": "old-eval-development"}])
+    result = module.freeze(after, [], tmp_path/"expanded_lock.json", development_pairs=[pairs])
+    assert "old-eval-development" in result["excluded_development_scenes"]
+    assert result["development_pair_manifest_sha256"][str(pairs.resolve())] == digest(pairs)
 
 
 def test_frozen_batch_rejects_changed_algorithm_or_model(tmp_path):

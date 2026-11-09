@@ -5,13 +5,13 @@ import argparse
 from collections import Counter, defaultdict
 import hashlib
 import json
-import math
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shadow_occ.annotation.data import digest, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.physics_io import load_motion_analysis
+from shadow_occ.annotation.scene_sampling import partition_scenes as scene_partition
 from shadow_occ.utils.io import write_json
 
 
@@ -58,13 +58,16 @@ def automatic_clips(pairs, num_frames=7, stride=3, seed=0):
 
 
 def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0, dev_fraction=.15,
-                num_frames=7, stride=3, expected_train_scenes=None):
+                num_frames=7, stride=3, expected_train_scenes=None, population_path=None,
+                methods=("anchor_first_v8plus",)):
     catalogue_path = Path(catalogue_path).resolve()
     output, annotations = Path(output_root).resolve(), Path(annotation_root).resolve()
     lock = json.loads(Path(lock_path).read_text(encoding="utf-8"))
     excluded = set(lock["excluded_development_scenes"])
     if not 0 < dev_fraction < 1 or not 3 <= num_frames <= 31 or stride < 1:
         raise ValueError("Invalid automatic scene/window plan")
+    if not methods or len(set(methods)) != len(methods) or not set(methods) <= {"appearance_only", "anchor_first_v8plus"}:
+        raise ValueError("Only implemented discovery modes can be planned; historical baselines need their own frozen runs")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
     sources = read_rows(catalogue_path)
@@ -95,14 +98,15 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
     training = sorted(scene for scene, role in scene_splits.items() if role == "train")
     if len(training) < 2:
         raise ValueError("Automatic train/dev isolation needs at least two prepared train scenes")
-    if expected_train_scenes is not None and len(training) != expected_train_scenes:
+    population = json.loads(Path(population_path).read_text(encoding="utf-8")) if population_path else None
+    official_training = population["official_train_scenes"] if population else training
+    if population and (not set(training) <= set(official_training)
+                       or not {scene for scene, role in scene_splits.items() if role == "eval"} <= set(population["official_eval_scenes"])):
+        raise ValueError("Prepared scenes are outside the declared official population")
+    if expected_train_scenes is not None and len(official_training) != expected_train_scenes:
         raise ValueError(f"Prepared catalogue has {len(training)} train scenes, expected {expected_train_scenes}; do not call a small cache full-data")
-    ordered = sorted(training, key=lambda scene: rank(scene, seed, "dev"))
-    dev_count = max(1, min(len(ordered)-1, round(len(ordered)*dev_fraction)))
-    dev = set(ordered[:dev_count])
-    train_order = sorted(set(training)-dev, key=lambda scene: rank(scene, seed, "train"))
-    selected = {fraction: set(train_order[:math.ceil(len(train_order)*fraction/100)]) for fraction in (25, 50, 100)}
-    assigned = {scene: next(fraction for fraction in (25, 50, 100) if scene in selected[fraction]) for scene in train_order}
+    dev, selected = scene_partition(official_training, seed, dev_fraction)
+    assigned = {scene: next(fraction for fraction in (25, 50, 100) if scene in selected[fraction]) for scene in selected[100]}
     batches = {key: [] for key in ("shared", "stage_025", "stage_050", "stage_100")}
     export_rows = defaultdict(list)
     diagnostics = []
@@ -134,12 +138,14 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
                 **parent_hashes})
             write_rows(folder/"clips.jsonl", clips)
             stage = "shared" if split in {"dev", "eval"} else f"stage_{assigned[scene]:03d}"
-            batch_id = split+"_"+tag
-            batches[stage].append({"id": batch_id, "split": split, "pairs": str(folder/"pairs.jsonl"),
-                "analysis_root": str(folder/"flow"), "clips": str(folder/"clips.jsonl"),
-                "feature_root": str(paths["feature_root"]), "spatial_feature_root": str(paths["spatial_feature_root"])})
-            export_rows[scene].append({"method": "anchor_first_v8plus", "split": split,
-                "run_root": str(annotations/stage/batch_id), "pairs": [str(folder/"pairs.jsonl")]})
+            for method in methods:
+                batch_id = split+"_"+tag+("_appearance" if method == "appearance_only" else "")
+                batches[stage].append({"id": batch_id, "split": split, "method": method,
+                    "discovery_mode": "appearance" if method == "appearance_only" else "cross-space",
+                    "pairs": str(folder/"pairs.jsonl"), "analysis_root": str(folder/"flow"), "clips": str(folder/"clips.jsonl"),
+                    "feature_root": str(paths["feature_root"]), "spatial_feature_root": str(paths["spatial_feature_root"])})
+                export_rows[scene].append({"method": method, "split": split,
+                    "run_root": str(annotations/stage/batch_id), "pairs": [str(folder/"pairs.jsonl")]})
             diagnostics.append({"scene_name": scene, "split": split, "stage": stage, "source_catalogue_index": source_id, **counts})
     for stage, rows in batches.items():
         write_rows(output/stage/"batches.jsonl", rows)
@@ -151,6 +157,10 @@ def plan_scenes(catalogue_path, lock_path, output_root, annotation_root, seed=0,
     payload = {"protocol": "automatic-shadow-scene-plan-v1", "seed": seed, "dev_fraction": dev_fraction,
         "catalogue_sha256": digest(catalogue_path), "freeze_lock_sha256": digest(lock_path),
         "population_scope": "prepared input catalogues, not an assertion of complete nuScenes coverage",
+        "population_manifest_sha256": digest(population_path) if population_path else None,
+        "official_train_population": len(official_training), "methods": list(methods),
+        "missing_stage_scenes": {str(fraction): sorted((selected[fraction] | dev | (set(population["official_eval_scenes"])-excluded if population else set()))-set(scene_splits)) for fraction in selected},
+        "missing_shared_scenes": sorted((dev | (set(population["official_eval_scenes"])-excluded if population else set()))-set(scene_splits)),
         "prepared_official_train_scenes": len(training), "dev_scenes": sorted(dev),
         "train_scene_stages": {str(fraction): sorted(selected[fraction]) for fraction in selected},
         "incremental_batch_counts": {stage: len(rows) for stage, rows in batches.items()},
@@ -171,9 +181,11 @@ def main():
     parser.add_argument("--num-frames", type=int, default=7)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--expected-train-scenes", type=int)
+    parser.add_argument("--population", help="Official scene population, fixed before partial cache preparation")
+    parser.add_argument("--methods", nargs="+", choices=["appearance_only", "anchor_first_v8plus"], default=["anchor_first_v8plus"])
     args = parser.parse_args()
     print(json.dumps(plan_scenes(args.catalogue, args.lock, args.output_root, args.annotation_root,
-        args.seed, args.dev_fraction, args.num_frames, args.stride, args.expected_train_scenes)), flush=True)
+        args.seed, args.dev_fraction, args.num_frames, args.stride, args.expected_train_scenes, args.population, args.methods)), flush=True)
 
 
 if __name__ == "__main__":

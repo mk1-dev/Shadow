@@ -147,7 +147,9 @@ def automatic_lit_negatives(clip, camera_frames):
 
 
 def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704), freeze_lock=None, auto_negatives=False,
-                  write_manual_template=False):
+                  write_manual_template=False, negative_weight=0.5):
+    if not np.isfinite(negative_weight) or not 0 < negative_weight <= 1:
+        raise ValueError("Weak-negative loss coefficient must be in (0, 1]")
     runs_path = Path(runs_path).resolve()
     runs = read_rows(runs_path)
     if not runs:
@@ -278,7 +280,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             "official_split": record["official_split"],
             "split": split, "label_source": "temporal_weak", "mask_encoding": "trimap",
             "method": method, "sources": record["sources"], "negative_evidence": provenance,
-            "conflicting_pixels_ignored": int(conflict.sum())}
+            "conflicting_pixels_ignored": int(conflict.sum()), "negative_weight": negative_weight}
         rows[(method, split)].append(row)
         if automatic_negative.any():
             automatic_path = output/method/"automatic_negative_targets"/f"{name}.png"
@@ -302,10 +304,15 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             "score_support": {"path": str(frozen_prediction), "key": "score_support"},
             "prediction_sha256": digest(frozen_prediction), "scores_are_probabilities": False})
         resized = cv2.resize(target, (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
+        row["resized_class_pixels"] = {label: int((resized == value).sum())
+            for value, label in ((0, "negative"), (1, "positive"), (255, "ignore"))}
+        row["resized_positive_image_fraction"] = float((resized == 1).mean())
+        row["resized_ignore_image_fraction"] = float((resized == 255).mean())
         for value, label in ((0, "negative"), (1, "positive"), (255, "ignore")):
             counts[(method, split)][label+"_pixels"] += int((target == value).sum())
             counts[(method, split)]["resized_"+label+"_pixels"] += int((resized == value).sum())
             scene_counts[(method, split, scene)][label+"_pixels"] += int((target == value).sum())
+            scene_counts[(method, split, scene)]["resized_"+label+"_pixels"] += int((resized == value).sum())
         scene_counts[(method, split, scene)]["frames"] += 1
         scene_counts[(method, split, scene)]["frames_with_positive"] += int((target == 1).any())
         scene_counts[(method, split, scene)]["frames_with_negative"] += int((target == 0).any())
@@ -319,6 +326,8 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         "scene_roles": scene_roles, "training_performed": False, "unlabeled_is_background": False,
         "development_scenes": sorted(development), "freeze_lock_sha256": digest(freeze_lock) if freeze_lock else None,
         "automatic_negative_rule": "existing_lit_receiver_negative_mask" if auto_negatives else None,
+        "negative_loss_weight": negative_weight,
+        "negative_weight_contract": "fixed weak-negative loss coefficient, not calibrated confidence; no change to teacher acceptance",
         "overlapping_clip_merge": "union of positive observations per camera frame; conflicting negative evidence -> IGNORE"}
     for method in sorted({key[0] for key in rows}):
         write_rows(output/method/"automatic_negatives.jsonl", automatic_manifests[method])
@@ -342,6 +351,14 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             "label_source": "manual_shadow_gt", "split": "eval", "independent": False, "annotation_status": "unannotated"}
             for _, row in sorted(evaluation_frames.items())))
     write_json(output/"dataset_summary.json", summary)
+    write_json(output/"annotation_summary.json", summary)
+    write_json(output/"class_distribution.json", {"size_hw": list(size), "methods": summary["methods"],
+        "per_scene": [{"method": method, "split": split, "scene_name": scene, **dict(values)}
+            for (method, split, scene), values in sorted(scene_counts.items())]})
+    write_json(output/"dataset_manifest.json", {"scene_roles": scene_roles, "deduplication": "method/split/scene/camera/frame_token",
+        "input_fingerprints": input_hashes, "freeze_lock_sha256": summary["freeze_lock_sha256"],
+        "manifests": {str(output/method/f"seg_{split}.jsonl"): digest(output/method/f"seg_{split}.jsonl")
+            for method in summary["methods"] for split in ("train", "dev", "eval")}})
     write_rows(output/"scene_dataset_counts.jsonl", ({"method": method, "split": split, "scene_name": scene, **dict(values)}
         for (method, split, scene), values in sorted(scene_counts.items())))
     write_json(output/"input_fingerprints.json", input_hashes)
@@ -349,22 +366,52 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
 
 
 def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10, batch_size=2, accumulation=4, seed=0,
-                  backbone_weights="none", init_checkpoint=None, reference_method=None):
+                  backbone_weights="none", init_checkpoint=None, reference_method=None, scene_sampling="uniform", skip_untrainable=False):
+    if scene_sampling not in {"image", "uniform"}:
+        raise ValueError("Choose image or uniform scene sampling")
     root, output = Path(dataset_root).resolve(), Path(output_root).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
     methods = [simple_name(method) for method in methods]
     if not methods or len(set(methods)) != len(methods):
         raise ValueError("Choose unique existing method datasets; absent baselines are not synthesized")
+    availability = []
+    requested_methods = list(methods)
+    if skip_untrainable:
+        available = []
+        for method in methods:
+            reasons = []
+            for split in ("train", "dev"):
+                path = root/method/f"seg_{split}.jsonl"
+                if not path.is_file():
+                    reasons.append(split+": missing actual method manifest")
+                    continue
+                totals = np.zeros(2, np.int64)
+                for row in read_rows(path):
+                    mask = cv2.resize(load_array(row["target"], root), (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
+                    totals += [(mask == 0).sum(), (mask == 1).sum()]
+                if not totals.all():
+                    reasons.append(split+": both known classes do not survive resize")
+            availability.append({"method": method, "status": "untrainable" if reasons else "available", "reasons": reasons})
+            if not reasons:
+                available.append(method)
+        output.mkdir(parents=True)
+        write_json(output/"method_availability.json", availability)
+        methods = available
+        if not methods:
+            raise ValueError("No requested method has real two-class train/dev supervision")
     if min(*size, epochs, batch_size, accumulation) < 1:
         raise ValueError("Training dimensions and budget must be positive")
     if backbone_weights not in {"none", "imagenet"}:
         raise ValueError("Use an existing supported backbone initialization")
     initialization = str(Path(init_checkpoint).resolve()) if init_checkpoint else None
     initialization_sha = digest(initialization) if initialization else None
-    reference_method = reference_method or ("anchor_first_v8plus" if "anchor_first_v8plus" in methods else methods[-1])
-    if reference_method not in methods:
+    reference_method = reference_method or ("anchor_first_v8plus" if "anchor_first_v8plus" in requested_methods else methods[-1])
+    if reference_method not in requested_methods:
         raise ValueError("Choose a reference teacher from the actual supplied methods")
+    reference_path = root/reference_method/"seg_eval.jsonl"
+    if not reference_path.is_file() or not read_rows(reference_path):
+        raise ValueError("Held-out teacher evaluation needs an actual nonempty eval manifest")
     aligned = {}
     scene_sets = {}
     for split in ("train", "dev"):
@@ -400,7 +447,7 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
             aligned[(method, split)] = group
     if scene_sets["train"] & scene_sets["dev"]:
         raise ValueError("Training and dev scenes overlap")
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=True)
     arms = []
     for method in methods:
         for split in ("train", "dev"):
@@ -410,9 +457,11 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
         "accumulation": accumulation, "seed": seed, "lr": 1e-4, "backbone_weights": backbone_weights,
         "init_checkpoint": initialization, "init_checkpoint_sha256": initialization_sha,
         "temporal_weight": 0.0, "receiver_pair_weight": 0.0, "weak_weight": 1.0,
+        "scene_sampling": scene_sampling, "pixel_balance": "loss", "dice_weight": 0.5,
+        "requested_methods": requested_methods, "method_availability": availability,
         "scene_sets": {key: sorted(value) for key, value in scene_sets.items()},
         "aligned_frames": {split: len(aligned[(methods[0], split)]) for split in ("train", "dev")},
-        "budget": "same image IDs, size, epochs, batch/accumulation and seed; only weak trimaps differ",
+        "budget": "same eligible image IDs, scene sampler/draw count, size, epochs, batch/accumulation and seed; only weak trimaps differ",
         "architecture": "DeepLabV3-MobileNetV3", "evaluation_gt_used_for_training": False,
         "weak_eval_reference": str(root/reference_method/"seg_eval.jsonl"),
         "weak_eval_reference_sha256": digest(root/reference_method/"seg_eval.jsonl"),
@@ -434,6 +483,7 @@ def main():
     export.add_argument("--size", nargs=2, type=int, default=[384, 704])
     export.add_argument("--freeze-lock")
     export.add_argument("--auto-negatives", action="store_true", help="Generate physical weak negatives automatically from saved observations")
+    export.add_argument("--negative-weight", type=float, default=0.5, help="Weak-negative loss coefficient, not a probability")
     export.add_argument("--manual-eval-template", action="store_true", help="Optional separate manual-evaluation task list; never required for training")
     suite = sub.add_parser("suite")
     suite.add_argument("--dataset-root", required=True)
@@ -447,14 +497,16 @@ def main():
     suite.add_argument("--backbone-weights", choices=["none", "imagenet"], default="none")
     suite.add_argument("--init-checkpoint")
     suite.add_argument("--reference-method", help="One frozen teacher reference shared by all held-out agreement evaluations")
+    suite.add_argument("--scene-sampling", choices=["uniform", "image"], default="uniform")
+    suite.add_argument("--skip-untrainable", action="store_true", help="Report absent/one-class arms without fabricating labels")
     args = parser.parse_args()
     if min(args.size) < 1:
         raise ValueError("Image size must be positive")
     if args.command == "export":
-        result = build_dataset(args.runs, args.output_root, args.negative_manifests, args.size, args.freeze_lock, args.auto_negatives, args.manual_eval_template)
+        result = build_dataset(args.runs, args.output_root, args.negative_manifests, args.size, args.freeze_lock, args.auto_negatives, args.manual_eval_template, args.negative_weight)
     else:
         result = prepare_suite(args.dataset_root, args.methods, args.output_root, args.size, args.epochs, args.batch_size, args.accumulation, args.seed,
-                               args.backbone_weights, args.init_checkpoint, args.reference_method)
+                               args.backbone_weights, args.init_checkpoint, args.reference_method, args.scene_sampling, args.skip_untrainable)
     print(json.dumps(result), flush=True)
 
 

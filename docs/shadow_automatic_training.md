@@ -29,10 +29,33 @@ complete dataset. Optional `--expected-train-scenes` checks the expected officia
 train scene count before any plan is written. It does not infer completeness
 from the presence of a trainval database directory.
 
+Before expanding caches, estimate disk using existing files, without submitting
+training or changing discovery:
+
+```bash
+python scripts/estimate_shadow_pipeline_storage.py \
+  --catalogue /data/automatic_inputs.jsonl --lock outputs/v8plus_freeze/lock.json \
+  --destination /data/new_shadow_cache --output-root outputs/shadow_storage_025 \
+  --reference-run /data/frozen_v8plus_run --fraction 25 --methods 2
+```
+
+This writes `population.json`, `cache_requirements.jsonl` and
+`storage_estimate.json`. Without `--population`, official scene names come from
+the installed nuScenes SDK. No raw nuScenes tables are loaded. The estimate
+measures actual Pair/Flow/native BEV file sizes and reference teacher outputs;
+it includes overlapping seven-frame/stride-three windows, two student checkpoints
+per method, deduplicated targets and held-out predictions. Missing measurements
+remain unknown. A 30% headroom is a planning allowance, not a disk reservation.
+It does not delete old files, export caches or submit jobs.
+
 ## 2. Automatic Scene and Clip Planning
 
 Use the existing v8+ freeze lock. Include all previous teacher-development scenes
 in its exclusion registry; these can be training data but not held-out eval.
+When creating a lock, `run_frozen_shadow_video.py freeze --development-pairs ...`
+registers actual Pair manifests from earlier development/threshold experiments,
+including scenes not present in the final twelve demonstration clips. Do not
+pass future, never-used cache catalogues as development evidence.
 
 ```bash
 python -u scripts/plan_automatic_shadow_scenes.py \
@@ -40,7 +63,9 @@ python -u scripts/plan_automatic_shadow_scenes.py \
   --lock outputs/v8plus_freeze/lock.json \
   --output-root outputs/shadow_auto_plan \
   --annotation-root /public/home/eng_zhihongli/project/.shadow_auto_annotations \
-  --seed 0 --dev-fraction 0.15 --num-frames 7 --stride 3
+  --seed 0 --dev-fraction 0.15 --num-frames 7 --stride 3 \
+  --population outputs/shadow_storage_025/population.json --expected-train-scenes 700 \
+  --methods appearance_only anchor_first_v8plus
 ```
 
 The plan uses only existing scene identities, timestamps and GT track continuity:
@@ -78,6 +103,19 @@ The 50% and 100% steps do not rerun earlier training scenes. Dev/eval annotation
 outputs are reused, keeping the reference teacher and split fixed across stages.
 Train subset percentages refer to the scene pool after the train-derived dev
 holdout, not percentages of all official train+val scenes.
+With `--population`, roles and incremental subsets are fixed from the complete
+official population before caches are available. Partial caches never cause a
+new dev split or a smaller population denominator. Missing stage scenes are
+listed explicitly; the Slurm annotation entry waits for complete target coverage.
+At 700 train scenes and dev fraction 0.15, dev has 105 scenes, the train pool has
+595, and its 25% stage has 149 scenes. Eval excludes prior teacher-development
+scenes listed in the lock.
+
+`appearance_only` switches only the existing proposal discovery mode. Receiver,
+physics acceptance, caster association and memory remain identical to v8+.
+This is an appearance-proposal ablation, not a geometry-free shadow system.
+Geometry/Flow and historical v7 comparisons require their real frozen outputs;
+the planner does not simulate those methods using renamed v8+ results.
 
 ## 3. CPU Annotation and Automatic Dataset Construction
 
@@ -138,6 +176,8 @@ field is silently promoted into a training target. Outputs include:
 
 - Per-method `seg_train/dev/eval.jsonl` and trimaps.
 - `dataset_summary.json` and `scene_dataset_counts.jsonl`.
+- Stable delivery names `annotation_summary.json`, `dataset_manifest.json`,
+  `class_distribution.json`, including resized per-image and per-scene counts.
 - Per-method `automatic_negatives.jsonl`, usable as a common frozen negative pool
   in later supervision comparisons.
 - Saved discovery predictions/scores, separately from training targets.
@@ -149,8 +189,11 @@ does not start on fabricated labels.
 
 ## 4. Segmenter Training Without Manual GT
 
-The CPU stage also prepares a single `anchor_first_v8plus` suite. Start with the
-actual current teacher rather than waiting for all four historical methods.
+The CPU stage prepares the actual methods in `plan.json` (S0/S3 when both were
+planned). `SHADOW_SEG_METHODS` can request additional actual exported methods.
+`method_availability.json` records absent or one-class arms instead of inventing
+labels. A remaining arm still needs two known classes after the paired-image
+intersection. Start with S0/S3 rather than waiting for historical methods.
 
 ```bash
 export SHADOW_SEG_SUITE="$SHADOW_AUTO_SUITE_ROOT/suite.json"
@@ -161,7 +204,18 @@ sbatch --dependency=afterok:$DATA slurm/run_shadow_segmenter_suite.slurm
 
 This uses the existing DeepLabV3-MobileNetV3-Large balanced BCE/Dice training on
 known pixels only. Sample scale, initialization, scene split and budget are
-recorded. Set a shared `SHADOW_SEG_INIT_CHECKPOINT` before preparing the CPU suite
+recorded. The suite uses uniform scene sampling, then uniform image sampling
+within each scene, with replacement and a fixed draw count per epoch. DDP ranks
+shard the same seeded global draw list; there is no class oversampling. Class
+loss weights account for this expected scene sampling distribution. Legacy
+single-model training retains ordinary image sampling unless requested.
+
+Exported weak negatives have `negative_weight=0.5` by default, configurable by
+`SHADOW_NEGATIVE_WEIGHT` or export `--negative-weight`. This is a fixed loss
+coefficient, not a calibrated probability, and affects only known negatives in
+BCE/Dice. Positive evidence and IGNORE do not change. Class balancing is computed
+before this reliability coefficient so it does not cancel the discount. All
+compared arms must use the same setting. Set a shared `SHADOW_SEG_INIT_CHECKPOINT` before preparing the CPU suite
 to use a local pretrained segmenter. A checkpoint previously trained with manual
 shadow masks is not part of the no-manual-shadow-supervision main result; record
 its source as an explicit pretraining control. Default initialization and an
@@ -183,6 +237,10 @@ Outputs are deliberately named:
 ```text
 metrics/table_teacher_agreement.csv
 metrics/metrics.json               # reference_kind=frozen-teacher
+metrics/teacher_agreement.csv
+metrics/cross_scene_summary.json
+<method>/segmenter_history.json
+<method>/checkpoint_best.pth        # hardlink to noncollapsed best.pth on HPC
 training_status.csv
 suite_status.json
 ```
@@ -192,6 +250,10 @@ student imitation on known teacher pixels, **not true shadow IoU/Precision/Recal
 The JSON records `is_true_shadow_accuracy=false`. No Table E1/E2 manual-GT accuracy
 table is silently generated from pseudo-labels. Optional future independent GT
 evaluation uses the separate `--ground-truth` path.
+The agreement table includes teacher-positive recall, teacher-negative recall,
+training resized weak-positive count and train/eval scene counts. Per-scene
+confusions and negative recall are saved separately. A failed/collapsed arm has
+its status and history, but no fabricated best-checkpoint alias or agreement row.
 
 Collapsed checkpoints remain failures and are not reused for inference or pseudo
 label cleaning. Training success, teacher agreement and downstream benefit are

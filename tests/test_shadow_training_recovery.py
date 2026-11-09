@@ -88,6 +88,16 @@ def test_ignore_pixels_never_receive_segmentation_gradient():
     assert not logits.grad[0, 0, 1].any()
 
 
+def test_negative_reliability_changes_only_known_negative_bce_gradient():
+    torch = pytest.importorskip("torch")
+    from shadow_occ.annotation.segmentation import masked_loss
+    target = torch.tensor([[[1, 0, 255]]])
+    logits = torch.zeros((1, 1, 1, 3), requires_grad=True)
+    masked_loss(logits, target, 0, negative_weights=torch.tensor([.25])).backward()
+    assert float(logits.grad[0, 0, 0, 1]) == pytest.approx(-float(logits.grad[0, 0, 0, 0])*.25)
+    assert float(logits.grad[0, 0, 0, 2]) == 0
+
+
 def test_receiver_order_loss_has_signal_at_collapsed_equal_predictions():
     torch = pytest.importorskip("torch")
     from shadow_occ.annotation.segmentation import receiver_order_loss

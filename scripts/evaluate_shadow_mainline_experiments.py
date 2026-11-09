@@ -93,6 +93,7 @@ def evaluate_experiments(gt_path, methods_path, dataset_summary, output_root, fr
             raise ValueError("Duplicate prediction frames; merge overlapping clips before evaluation")
         if not {observation_key(row) for row in truth_rows} <= predictions.keys():
             raise ValueError("Every method must predict every GT frame; missing frames cannot be silently dropped")
+        trained = None
         if method.get("training_protocol"):
             trained = json.loads(resolve_path(method["training_protocol"], methods_path.parent).read_text(encoding="utf-8"))
             overlap = (set(trained["train_scenes"]) | set(trained["dev_scenes"])) & {row["scene_name"] for row in truth_rows}
@@ -156,10 +157,18 @@ def evaluate_experiments(gt_path, methods_path, dataset_summary, output_root, fr
                 operating.append({"fpr_limit": fpr, "recall": float(descending[1, at]/positives) if at is not None and positives else (0.0 if positives and negatives else None),
                     "threshold": (bins-1-at)/bins if at is not None else None,
                     "scope": "descriptive test-curve comparison, not a selected deployment threshold"})
+        scene_results = {}
+        for scene, value in per_scene.items():
+            item = value.summary()
+            item["negative_recall"] = item["tn"]/(item["tn"]+item["fp"]) if item["tn"]+item["fp"] else None
+            scene_results[scene] = item
         results.append({"experiment": method["experiment"], "method": method["method"], "frames": len(truth_rows),
             "reference_kind": reference_kind, "is_true_shadow_accuracy": not weak,
             "metric_scope": "student agreement with frozen weak teacher on known pixels" if weak else "independent manual shadow masks",
             "scenes": len(per_scene), **metrics,
+            "training_resized_weak_positive_pixels": trained.get("resized_pixel_counts", [None, None])[1] if trained else None,
+            "training_scene_count": len(trained["train_scenes"]) if trained else None,
+            "negative_recall": metrics["tn"]/(metrics["tn"]+metrics["fp"]) if metrics["tn"]+metrics["fp"] else None,
             "fpr": metrics["fp"]/(metrics["fp"]+metrics["tn"]) if metrics["fp"]+metrics["tn"] else None,
             "positive_coverage": (metrics["tp"]+metrics["fp"])/known_count if known_count else None,
             "score_support_coverage": support_count/known_count if all_scores and known_count else None,
@@ -167,7 +176,7 @@ def evaluate_experiments(gt_path, methods_path, dataset_summary, output_root, fr
             "average_precision_binned": diagnostics["approximate_average_precision"] if diagnostics else None,
             "pr_auc_is_quantized": True, "score_bins": bins,
             "score_diagnostics": diagnostics, "recall_at_fpr": operating,
-            "per_scene": {scene: value.summary() for scene, value in per_scene.items()},
+            "per_scene": scene_results,
             "prediction_manifest_sha256": digest(path), "operating_mask": "saved prediction when supplied, otherwise frozen probability threshold"})
     output.mkdir(parents=True)
     write_json(output/"metrics.json", {"ground_truth_manifest_sha256": digest(gt_path),
@@ -176,16 +185,22 @@ def evaluate_experiments(gt_path, methods_path, dataset_summary, output_root, fr
         "manual_gt_used_for_training": False, "threshold_selected_on_eval": False,
         "reference_kind": reference_kind, "is_true_shadow_accuracy": not weak,
         "missing_scores": "lowest rank (zero); missing prediction frames are errors", "results": results})
-    columns = ["method", "frames", "scenes", "precision", "recall", "f1", "iou", "fpr", "positive_coverage", "average_precision_binned", "boundary_f1"]
+    write_json(output/"cross_scene_summary.json", {"reference_kind": reference_kind,
+        "is_true_shadow_accuracy": not weak,
+        "methods": {row["method"]: {"scene_count": row["scenes"], "per_scene": row["per_scene"]} for row in results}})
+    columns = ["method", "frames", "scenes", "training_resized_weak_positive_pixels", "training_scene_count", "accuracy", "precision", "recall", "negative_recall", "f1", "iou", "fpr", "positive_coverage", "average_precision_binned", "boundary_f1"]
     for experiment in sorted({row["experiment"] for row in results}):
         filename = "table_teacher_agreement.csv" if weak else f"table_{experiment}.csv"
         with (output/filename).open("w", newline="", encoding="utf-8") as handle:
-            names = {key: "teacher_agreement_"+key if weak and key not in {"method", "frames", "scenes"} else key for key in columns}
+            names = {key: "teacher_agreement_"+key if weak and key not in {"method", "frames", "scenes", "training_resized_weak_positive_pixels", "training_scene_count"} else key for key in columns}
             writer = csv.DictWriter(handle, fieldnames=[names[key] for key in columns])
             writer.writeheader()
             for row in results:
                 if row["experiment"] == experiment:
                     writer.writerow({names[key]: row["boundary"]["f1"] if key == "boundary_f1" else row[key] for key in columns})
+        if weak:
+            import shutil
+            shutil.copy2(output/filename, output/"teacher_agreement.csv")
     return {"methods": len(results), "frames_per_method": len(truth_rows), "tables": sorted({row["experiment"] for row in results})}
 
 

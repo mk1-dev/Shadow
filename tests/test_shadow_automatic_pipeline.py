@@ -14,6 +14,7 @@ from shadow_occ.utils.io import write_json
 from tests.test_bev_flow_ablations import script
 from tests.test_shadow_video_review import frozen_runs
 from tests.test_shadow_mainline_experiments import data_fixture, evaluation_fixture
+from shadow_occ.annotation.scene_sampling import scene_epoch_indices, scene_probabilities
 
 
 def catalogue_fixture(tmp_path):
@@ -198,3 +199,61 @@ def test_without_manual_gt_suite_still_runs_heldout_teacher_inference(tmp_path, 
     assert calls[-1][-2:] == ["--reference-kind", "frozen-teacher"]
     methods = read_rows(tmp_path/"training/evaluation_methods.jsonl")
     assert all(row["experiment"] == "TeacherAgreement" for row in methods)
+
+
+def test_scene_sampling_is_class_independent_balanced_and_distributed():
+    rows = [{"scene_name": "large", "target": "ignored"} for _ in range(90)]+[{"scene_name": "small"} for _ in range(10)]
+    probabilities = scene_probabilities(rows, "uniform")
+    assert probabilities[:90].sum() == pytest.approx(.5)
+    assert probabilities[90:].sum() == pytest.approx(.5)
+    shards = [scene_epoch_indices(rows, 3, 7, rank, 3) for rank in range(3)]
+    assert {len(shard) for shard in shards} == {34}
+    assert shards[0] == scene_epoch_indices(rows, 3, 7, 0, 3)
+    assert shards[0] != scene_epoch_indices(rows, 3, 8, 0, 3)
+    assert np.allclose(scene_probabilities(rows), .01)
+
+
+def test_export_writes_resized_per_image_scene_and_delivery_artifacts(tmp_path):
+    runs, negatives = data_fixture(tmp_path)
+    builder = script("build_shadow_mainline_experiments")
+    root = tmp_path/"data"
+    builder.build_dataset(runs, root, [negatives], (80, 80))
+    row = read_rows(root/"anchor/seg_train.jsonl")[1]
+    assert sum(row["resized_class_pixels"].values()) == 80*80
+    assert row["negative_weight"] == .5
+    assert row["resized_positive_image_fraction"] == row["resized_class_pixels"]["positive"]/6400
+    for name in ["annotation_summary.json", "dataset_manifest.json", "class_distribution.json"]:
+        assert (root/name).is_file()
+    builder.prepare_suite(root, ["absent_baseline", "anchor"], tmp_path/"suite", (80, 80), skip_untrainable=True)
+    availability = json.loads((tmp_path/"suite/method_availability.json").read_text())
+    assert availability[0]["status"] == "untrainable"
+    plan = json.loads((tmp_path/"suite/suite.json").read_text())
+    assert plan["scene_sampling"] == "uniform" and len(plan["arms"]) == 1
+
+
+def test_full_population_split_does_not_change_when_only_a_cache_subset_is_present(tmp_path):
+    catalogue, lock, _ = catalogue_fixture(tmp_path)
+    population = tmp_path/"population.json"
+    write_json(population, {"official_train_scenes": [f"scene-{index:04d}" for index in range(8)]+[f"extra-{index}" for index in range(20)],
+        "official_eval_scenes": ["scene-0008", "scene-0009"]})
+    module = script("plan_automatic_shadow_scenes")
+    result = module.plan_scenes(catalogue, lock, tmp_path/"plan", tmp_path/"runs",
+        expected_train_scenes=28, population_path=population, methods=("appearance_only", "anchor_first_v8plus"))
+    dev, stages = module.scene_partition(json.loads(population.read_text())["official_train_scenes"])
+    assert result["dev_scenes"] == sorted(dev)
+    assert result["train_scene_stages"]["25"] == sorted(stages[25])
+    assert result["missing_stage_scenes"]["25"]
+    batches = [row for stage in ("shared", "stage_025", "stage_050", "stage_100") for row in read_rows(tmp_path/"plan"/stage/"batches.jsonl")]
+    assert {row["discovery_mode"] for row in batches} == {"appearance", "cross-space"}
+
+
+def test_storage_estimate_uses_real_file_sizes_and_marks_missing_measurements(tmp_path):
+    catalogue, lock, _ = catalogue_fixture(tmp_path)
+    population = {"official_train_scenes": [f"scene-{index:04d}" for index in range(8)],
+        "official_eval_scenes": ["scene-0008", "scene-0009"]}
+    # The synthetic catalogue does not contain native BEV NPZs: no invented size.
+    result = script("estimate_shadow_pipeline_storage").estimate(population, catalogue, lock,
+        tmp_path/"estimate", tmp_path)
+    assert result["selected_train_scenes"] == 2 and not result["jobs_submitted"]
+    assert not result["estimated_total_is_complete"]
+    assert result["components"]["current_bev"]["typical_bytes"] is None

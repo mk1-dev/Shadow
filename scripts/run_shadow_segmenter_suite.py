@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -86,6 +88,9 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
                     "--output-root", str(folder), "--allow-weak-labels", "--device", device]
         for field in ("epochs", "batch_size", "accumulation", "seed", "lr", "backbone_weights", "temporal_weight", "receiver_pair_weight", "weak_weight"):
             command += ["--"+field.replace("_", "-"), str(plan[field])]
+        for field in ("scene_sampling", "pixel_balance", "dice_weight"):
+            if field in plan:
+                command += ["--"+field.replace("_", "-"), str(plan[field])]
         command += ["--size", *map(str, plan["size_hw"])]
         if plan.get("init_checkpoint"):
             command += ["--init-checkpoint", plan["init_checkpoint"]]
@@ -94,11 +99,17 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
         write_json(output/"suite_status.json", status)
         result = subprocess.run(command, cwd=str(repo))
         record["train_exit_code"] = result.returncode
+        if (folder/"history.json").is_file():
+            shutil.copy2(folder/"history.json", folder/"segmenter_history.json")
         if result.returncode or not (folder/"best.pth").is_file():
             record["status"] = "training_failed_or_collapsed"
             write_json(output/"suite_status.json", status)
             continue
         record["status"] = "trained"
+        try:
+            os.link(folder/"best.pth", folder/"checkpoint_best.pth")
+        except OSError:
+            shutil.copy2(folder/"best.pth", folder/"checkpoint_best.pth")
         if eval_path:
             prediction_root = output/(method+"_eval")
             predict = [sys.executable, str(repo/"scripts/evaluate_shadow_segmenter.py"),
