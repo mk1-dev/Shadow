@@ -1,5 +1,8 @@
 # Frozen Video Change Review
 
+For clean-video blind review followed by result reveal, complete mainline MP4
+exports and frozen new-scene replay, see [shadow_video_release.md](shadow_video_release.md).
+
 This tool reads two completed video runs. It does not run M1-M4, change masks,
 rescore hypotheses, train models, or turn reviews into pseudo-labels. Geometry
 calculations only display frozen grid cells and already-selected caster/light

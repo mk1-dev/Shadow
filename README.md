@@ -872,6 +872,16 @@ target or report Occupancy mIoU, RayIoU, and Semantic mIoU.
 
 ## Continuous BEV / Flow Shadow Discovery
 
+Current priority is [automatic weak-label scene expansion and Segmenter
+training](docs/shadow_automatic_training.md), without manual shadow masks or
+human sample selection. The 25/50/100% scene plan reuses frozen v8+, generates
+physical weak negatives and separates held-out teacher agreement from optional
+[independent manual-GT evaluation](docs/shadow_mainline_experiments.md).
+
+The frozen v8+ workflow supports [blind video review, complete mainline video
+exports and scene-disjoint frozen replay](docs/shadow_video_release.md), without
+changing M1-M4 or starting model training.
+
 The track-centric video path is documented in
 [docs/shadow_video_discovery.md](docs/shadow_video_discovery.md).
 Use `--stage signal`, `--stage projection`, then `--stage full` on the same
