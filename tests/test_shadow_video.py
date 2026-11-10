@@ -316,7 +316,8 @@ def test_all_frame_count_box_motion_support():
 
 @pytest.mark.parametrize("stage", ["signal", "projection", "full"])
 @pytest.mark.parametrize("entity_search", [False, True])
-def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monkeypatch, stage, entity_search):
+@pytest.mark.parametrize("prior_enabled", [False, True])
+def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monkeypatch, stage, entity_search, prior_enabled):
     from tests.test_bev_flow_ablations import script
     from shadow_occ.annotation.bev_flow import BEVFlowConfig, bev_projection, ground_grid
     from shadow_occ.annotation.physics_motion import plane_basis
@@ -357,8 +358,17 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
             pytest.fail("Signal/projection stages must not run physical acceptance")
         monkeypatch.setattr(module, "rank_hypotheses", forbidden)
         monkeypatch.setattr(module, "factorized_shadow_decision", forbidden)
-    result = module.run_clip({"id": "test", "track_id": "car", "scene_name": "scene1"}, pairs,
+    class Prior:
+        provenance = {"test_fixture": True}
+        def load(self, frame, scene, camera, path):
+            return np.full((64, 64), .8, np.float32)
+    if prior_enabled:
+        pytest.importorskip("maxflow")
+        for frame in frames:
+            frame["image"] = "mock_rgb.png"
+    result = module.run_clip({"id": "test", "track_id": "car", "scene_name": "scene1", "camera": "CAM_FRONT"}, pairs,
         inputs, context, tmp_path/"clip", VideoShadowConfig(), stage=stage,
+        shadow_prior=Prior() if prior_enabled else None,
         reviews={"cam1": [{"region_type": "shadow", "mask": np.ones((64, 64), bool)}]})
     assert result["frames"] == 3 and result["regions"] > 0
     with np.load(tmp_path/"clip/001.npz", allow_pickle=False) as archive:
@@ -384,7 +394,14 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     assert len((tmp_path/"clip/region_memory.jsonl").read_text().splitlines()) == 3
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
-    assert protocol["protocol"] == "entity-shadow-disentangled-video-v8"
+    assert protocol["protocol"] == ("discrepancy-guided-shadow-completion-v9" if prior_enabled else "entity-shadow-disentangled-video-v8")
+    if prior_enabled:
+        with np.load(tmp_path/"clip/001_image.npz", allow_pickle=False) as archive:
+            assert "shadow_core_image" in archive.files
+            assert "shadow_expanded_image" in archive.files
+            assert "shadow_confidence_image" in archive.files
+            if entity_search:
+                assert (archive["shadow_target_image"] == 255).all()
     assert protocol["spatial_match_states"] == {"0": "missing", "1": "low_confidence", "2": "reliable", "3": "ambiguous"}
     correspondence = json.loads((tmp_path/"clip/correspondence.json").read_text())
     assert correspondence["totals"]["observable_receiver_cells"] == (0 if entity_search else 512)

@@ -92,6 +92,9 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
         for field in ("scene_sampling", "pixel_balance", "dice_weight", "loss_mode", "selection_metric"):
             if field in plan:
                 command += ["--"+field.replace("_", "-"), str(plan[field])]
+        for field in ("expansion_warmup_epochs", "expansion_ramp_epochs"):
+            if field in plan:
+                command += ["--"+field.replace("_", "-"), str(plan[field])]
         command += ["--size", *map(str, plan["size_hw"])]
         if plan.get("init_checkpoint"):
             command += ["--init-checkpoint", plan["init_checkpoint"]]

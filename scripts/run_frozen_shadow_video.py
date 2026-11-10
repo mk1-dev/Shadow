@@ -143,6 +143,8 @@ def freeze(reference_root, development_roots, output_path, repo=None, developmen
     if any(Path(root).resolve() in output.parents for root in [reference_root, *development_roots]):
         raise ValueError("Store freeze lock outside frozen reference runs")
     entries = list(find_clips(reference_root).values())
+    if any(entry[1].get("shadow_prior") is not None for entry in entries):
+        raise ValueError("v9 completion has a new teacher/prior protocol; do not freeze it as v8+")
     configs = [settings(entry[1]) for entry in entries]
     if any(row != configs[0] for row in configs[1:]):
         raise ValueError("Reference clips used different settings")

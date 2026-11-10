@@ -33,6 +33,8 @@ from shadow_occ.annotation.shadow_projection import projection_coverage, reviewe
 from shadow_occ.annotation.video_correspondence import (CorrespondenceConfig, CrossSpaceGrowthConfig, FlowConfidenceConfig,
     FLOW_STATES, SPATIAL_MATCH_STATES, correspondence_summary, cross_space_proposals, grow_cross_space_regions, lift_flow_to_bev)
 from shadow_occ.annotation.shadow_representation import describe_regions, memory_state, paste_region_image, project_region_memory, refine_image_region
+from shadow_occ.annotation.shadow_completion import (CompletionConfig, ShadowPriorCache,
+    complete_visible_shadow, fuse_prior_proposals, native_illumination_evidence, plausible_projection_envelope)
 from shadow_occ.utils.io import write_json
 
 
@@ -172,6 +174,7 @@ def sample_clip(chain, index, base, stats, analysis, feature_root, config, *,
         "fb_error_px": np.stack(fb_error),
         "occlusion_mask": volumes["physical_ray_volume_support"][:-1] | volumes["physical_ray_volume_support"][1:]}, {
         "frames": frames, "images": images, "grounds": grounds, "world": world,
+        "image_paths": [str(resolve_path(frame["image"], base)) for frame in frames],
         "plane": plane, "basis": basis, "anchor": anchor, "grid": grid,
         "projection": bev_projection(anchor, grid), "exposures": fits, "coordinates": coordinates,
         "entity_maps": entity_maps, "caster_memory": caster_memory,
@@ -294,7 +297,7 @@ def panel(image, context, slot, maps, regions, proposed, accepted):
 
 
 def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_role="context", reviews=None,
-             owner_scoring="physical", owner_config=None, discovery_mode="cross-space"):
+             owner_scoring="physical", owner_config=None, discovery_mode="cross-space", shadow_prior=None):
     if stage not in {"signal", "projection", "full"}:
         raise ValueError("Video stage must be signal, projection or full")
     if owner_scoring not in {"physical", "geometry", "geometry+appearance+bev"}:
@@ -303,6 +306,12 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         raise ValueError("Unknown video discovery mode")
     owner_config = owner_config or OwnerScoringConfig()
     owner_config.validate()
+    completion_config = CompletionConfig()
+    responses = None
+    if shadow_prior is not None:
+        responses = [shadow_prior.load(frame, clip["scene_name"], clip["camera"],
+                     context["image_paths"][slot] if "image_paths" in context else frame["image"])
+                     for slot, frame in enumerate(context["frames"])]
     started = perf_counter()
     timing = {"proposal_seconds": 0., "region_seconds": 0., "physics_seconds": 0., "owner_seconds": 0.}
     output.mkdir(parents=True, exist_ok=False)
@@ -329,6 +338,8 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         maps["proposal_source_bits"][(maps["cross_space_discovery_score"] >= config.seed_score)
                                      | maps["cross_space_region_support"]] |= 8
     timing["proposal_seconds"] = perf_counter()-tick
+    if responses is not None:
+        maps = fuse_prior_proposals(maps, responses, context["coordinates"], completion_config)
     if "bev_flow_matchable_pair" in maps:
         write_json(output/"correspondence.json", correspondence_summary(maps))
     if context.get("spatial_geometry"):
@@ -346,8 +357,14 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                                           for source in context["spatial_feature_sources"]]))
     maps.update(context.get("entity_maps", {}))
     context["delta_L"] = inputs["delta_L"]
-    regions_by_frame, pool, region_memory_rows = [], [], []
+    regions_by_frame, pool, region_memory_rows, amodal_by_frame = [], [], [], []
     image_cell_maps = []
+    receiver_images = []
+    if responses is not None:
+        for slot, frame in enumerate(context["frames"]):
+            receiver_images.append(bev_mask_to_image(maps["receiver_valid_by_frame"][slot],
+                frame["projection_world_to_image"], context["basis"], context["grid"],
+                context["images"][slot].shape[:2]) & context["grounds"][slot])
     memory = ShadowRegionMemory(context["grid"].resolution, config)
     physical_config = LabelConfig(minimum_area=config.minimum_area, minimum_change_pixels=1,
                                  allow_static_existence=True, allow_partial_temporal=True)
@@ -355,6 +372,10 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         # Memory can seed current weak observed evidence, never empty/unseen cells.
         remembered = np.zeros(context["grid"].shape, bool)
         projection_masks = project_region_memory(memory.entries, caster_memory, slot, context["plane"], directions, context["projection"])
+        hidden = np.zeros(context["grid"].shape, bool)
+        for projected in projection_masks.values():
+            hidden |= projected & maps["entity_occlusion_mask"][slot]
+        amodal_by_frame.append(hidden)
         for identity, entry in memory.entries.items():
             if ((frame["camera_timestamp"]-entry["timestamp"])/1e6 <= config.maximum_gap_seconds
                     and entry["missed"] < config.memory_frames):
@@ -393,7 +414,10 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 appearance_support = maps["appearance_score_map"][slot]
                 if "cross_space_region_appearance_support" in maps:
                     appearance_support = np.maximum(appearance_support, maps["cross_space_region_appearance_support"][slot])
-                region["receiver_mask"] &= appearance_support >= config.minimum_observed_appearance
+                observed_support = appearance_support >= config.minimum_observed_appearance
+                if responses is not None:
+                    observed_support |= maps["shadow_prior_response"][slot] >= completion_config.prior_seed
+                region["receiver_mask"] &= observed_support
             seed = bev_mask_to_image(region["receiver_mask"], frame["projection_world_to_image"],
                 context["basis"], context["grid"], image_domain.shape, cell_indices=cell_indices)
             region.update(refine_image_region(context["images"][slot], seed, image_domain))
@@ -446,6 +470,7 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             confidence = np.zeros(context["grid"].shape, np.float32)
             moving = np.full(context["grid"].shape, -1, np.int8)
             association_status = np.zeros(context["grid"].shape, np.uint8)
+            plausible_image = np.zeros(image.shape[:2], bool)
             frame_rows = []
             image_regions = np.zeros(image.shape[:2], np.int32)
             for region in regions:
@@ -478,6 +503,9 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                     confidence[supported_mask] = region["rank_score"]
                     moving[supported_mask] = int(hypothesis["motion_supported"])
                     association_status[supported_mask] = 1
+                    if responses is not None:
+                        plausible_image |= plausible_projection_envelope(decision, caster_memory.states, slot,
+                            context["plane"], directions, frame["projection_world_to_image"], image.shape[:2])
                     if decision["association"] is not None:
                         association = decision["association"]
                         owner_state = caster_memory.states(association["instance_token"])[slot]
@@ -548,6 +576,36 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             image_positive = to_image(positive) & refined_image_proposal & context["grounds"][slot]
             image_target = np.full(image.shape[:2], 255, np.uint8)
             image_target[image_positive] = 1
+            dense_payload = {}
+            if responses is not None:
+                receiver_image = receiver_images[slot]
+                def image_score(value):
+                    cell_map = image_cell_maps[slot]
+                    result = np.zeros(image.shape[:2], np.float32)
+                    good = cell_map >= 0
+                    result[good] = np.asarray(value).reshape(-1)[cell_map[good]]
+                    return result
+                appearance = maps["appearance_score_map"][slot].copy()
+                if "cross_space_region_appearance_support" in maps:
+                    appearance = np.maximum(appearance, maps["cross_space_region_appearance_support"][slot])
+                cross = maps.get("cross_space_discovery_score", np.zeros_like(maps["appearance_score_map"]))[slot]
+                native_appearance, native_support = native_illumination_evidence(context["images"], receiver_images,
+                    context["frames"], context["basis"], context["exposures"], slot)
+                image_appearance = np.maximum(image_score(appearance), native_appearance)
+                completed = complete_visible_shadow(image, image_positive, receiver_image, responses[slot],
+                    image_score(cross), image_appearance, plausible_image, config=completion_config)
+                image_target = completed["target"]
+                image_proposal = refined_image_proposal | completed["visible_mask"]
+                dense_payload = {"shadow_core_image": completed["core_mask"],
+                    "shadow_expanded_image": completed["expanded_mask"],
+                    "shadow_visible_completed_image": completed["visible_mask"],
+                    "shadow_amodal_hypothesis_image": completed["visible_mask"] | to_image(amodal_by_frame[slot]),
+                    "shadow_confidence_image": completed["confidence"], "shadow_tier_image": completed["tier"],
+                    "shadow_prior_response_image": responses[slot],
+                    "shadow_plausible_projection_image": plausible_image,
+                    "shadow_native_illumination_image": native_appearance,
+                    "shadow_native_correspondence_valid_image": native_support,
+                    "shadow_candidate_source_bits_image": completed["candidate_source_bits"]}
             path = output/f"{slot:03d}.npz"
             np.savez_compressed(path, shadow_receiver_mask_bev=positive, shadow_proposal_bev=proposal,
                 shadow_continuous_proposal_bev=continuous_bev,
@@ -556,11 +614,13 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
                 resolved_or_unresolved=association_status,
                 receiver_world_xyz=context["world"], bev_world_to_grid=context["projection"],
                 best_cover_projection_bev=best_projection,
+                **({"shadow_amodal_hypothesis_bev": amodal_by_frame[slot]} if responses is not None else {}),
                 projection_union_bev=bank.any(axis=0) if len(bank) else np.zeros_like(proposal),
                 **{key: value[slot] for key, value in maps.items() if value.shape[0] == len(context["frames"])})
             image_path = output/f"{slot:03d}_image.npz"
-            np.savez_compressed(image_path, shadow_proposal_image=refined_image_proposal,
+            np.savez_compressed(image_path, shadow_proposal_image=image_proposal,
                 shadow_target_image=image_target, shadow_region_id_image=image_regions,
+                **dense_payload,
                 coordinate_frame="calibrated camera pixels; RGB-refined observed regions")
             checked_write_image(output/f"{slot:03d}_target.png", image_target)
             checked_write_image(output/f"{slot:03d}_proposal.png", image_proposal.astype(np.uint8)*255)
@@ -587,6 +647,10 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
             rows.append({"frame_token": frame["sample_data_token"], "timestamp": frame["camera_timestamp"],
                 "evidence": str(path), "regions": frame_rows, "positive_cells": int(positive.sum()),
                 "image_representation": str(image_path), "shadow_bev_is_separate_from_caster_geometry": True,
+                **({"image_core_pixels": int(completed["core_mask"].sum()),
+                    "image_expanded_pixels": int(completed["expanded_mask"].sum()),
+                    "image_completed_candidate_pixels": int(completed["visible_mask"].sum()),
+                    "amodal_hypothesis_cells": int(amodal_by_frame[slot].sum())} if responses is not None else {}),
                 "candidate_cells": int(proposal.sum()),
                 "receiver_candidate_cells": int((proposal & maps["receiver_valid_by_frame"][slot]).sum()),
                 "entity_candidate_cells": int((proposal & maps["entity_occlusion_mask"][slot]).sum()),
@@ -624,7 +688,10 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
     write_rows(output/"region_memory.jsonl", region_memory_rows)
     write_rows(output/"reviewed_signals.jsonl", reviewed_rows)
     timing["total_seconds"] = perf_counter()-started
-    write_json(output/"protocol.json", {"protocol": "entity-shadow-disentangled-video-v8", "clip": clip,
+    write_json(output/"protocol.json", {"protocol": "discrepancy-guided-shadow-completion-v9" if responses is not None else "entity-shadow-disentangled-video-v8", "clip": clip,
+        **({"completion_config": asdict(completion_config), "shadow_prior": shadow_prior.provenance,
+            "dense_label_contract": "strict core acceptance rules unchanged; graph-cut visible candidates; independently observed expansion within near-feasible physical envelope; no inferred owner on expansion",
+            "amodal_contract": "caster-projected historical region under current entity occlusion, hypothesis only, excluded from image labels"} if responses is not None else {}),
         "stage": stage, "bev_role": bev_role,
         "modules": ["M1_entity_decomposition", "M2_metric_BEV_flow_discovery", "M3_caster_light_reasoning", "M4_temporal_shadow_representation"],
         "discovery_mode": discovery_mode, "correspondence_config": asdict(correspondence_config),
@@ -639,9 +706,11 @@ def run_clip(clip, chain, inputs, context, output, config, *, stage="full", bev_
         "context_feature_sources": context.get("context_feature_sources", []),
         "feature_roles": "current-only spatial features for BEV correspondence; temporal/context features for region identity; absent spatial cache is missing evidence",
         "flow_BEV_units": "horizontal anchor-grid x/y meters per actual camera interval; ground-ray lift in destination camera",
-        "proposal_source_bits": {"1": "appearance", "2": "ground-referenced illumination", "4": "caster-guided appearance", "8": "anchor-first cross-space proposal and observed growth"},
+        "proposal_source_bits": {"1": "appearance", "2": "ground-referenced illumination", "4": "caster-guided appearance", "8": "anchor-first cross-space proposal and observed growth",
+            **({"16": "external FSD semantic proposal, not physical acceptance",
+                "32": "image completion with independently observed illumination connected to a physical core"} if responses is not None else {})},
         "temporal_representation": "RGB-refined observed masks + boundary/Lab/BEV/material correspondence + alternative caster/light motion; missing tracks keep state but emit no masks",
-        "image_label_contract": "weak positive image pixels require RGB region AND physical BEV support; grid and image masks are separate, not occupancy",
+        "image_label_contract": "core + confidence-weighted visible extension; BEV target/owner remain strict" if responses is not None else "weak positive image pixels require RGB region AND physical BEV support; grid and image masks are separate, not occupancy",
         "discovery_domain": context.get("discovery_domain", "receiver"),
         "domain_contract": "image-rays adds observed entity surfaces to candidate search only; physics, illumination events and positive targets remain on visible ground",
         "owner_scoring": owner_scoring, "owner_scoring_config": asdict(owner_config), "timing": timing,
@@ -708,6 +777,7 @@ def main():
     parser.add_argument("--entity-max-residual-px", type=float, default=2.0)
     parser.add_argument("--entity-max-fb-error-px", type=float, default=1.5)
     parser.add_argument("--review-regions", help="Optional independent image masks: clip_id,frame_token,region_type,mask")
+    parser.add_argument("--shadow-prior-manifest", help="Opt-in v9 FSD response cache; v8+ is unchanged when absent")
     args = parser.parse_args()
     config = VideoShadowConfig(seed_score=args.seed_score, grow_score=args.grow_score)
     config.validate()
@@ -725,6 +795,7 @@ def main():
         raise ValueError("Choose nonempty uniquely identified clips")
     summaries = []
     reviews = read_rows(args.review_regions) if args.review_regions else []
+    shadow_prior = ShadowPriorCache(args.shadow_prior_manifest) if args.shadow_prior_manifest else None
     if not {row["clip_id"] for row in reviews} <= {clip["id"] for clip in clips}:
         raise ValueError("Independent review refers to a clip outside this run")
     review_base = Path(args.review_regions).resolve().parent if args.review_regions else None
@@ -753,7 +824,7 @@ def main():
             raise ValueError("Reviewed frame does not belong to the selected clip")
         summary = run_clip(clip, chain, inputs, context, output/clip["id"], config,
                            stage=args.stage, bev_role=args.bev_role, reviews=clip_reviews, owner_scoring=args.owner_scoring,
-                           discovery_mode=args.discovery_mode)
+                           discovery_mode=args.discovery_mode, shadow_prior=shadow_prior)
         summaries.append(summary)
         print(json.dumps(summary), flush=True)
     write_json(output/"summary.json", {"clips": summaries, "pair_manifest_sha256": digest(args.pairs),

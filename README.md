@@ -905,3 +905,9 @@ search, and a separate geometry-plus-descriptor owner arm. Candidate search may
 observe entity surfaces; physical weak labels still require visible ground.
 The comparison reports candidate counts, stage runtime, weak positives and
 owner assignments. Shadow preservation requires independent review masks.
+
+The opt-in [v9 discrepancy-guided completion path](docs/shadow_v9_completion.md)
+adds a pinned external FSD shadow prior in parallel with BEV/flow discovery,
+visible-ground graph-cut completion, separate hidden-state hypotheses, and
+confidence-tiered student supervision. It does not replace the frozen v8+
+baseline or change its physical acceptance/owner thresholds.

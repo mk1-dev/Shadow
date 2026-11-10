@@ -64,6 +64,20 @@ class ShadowDataset(Dataset):
             raise ValueError(f"Image-target mismatch for {row['id']}")
         if not np.isin(target, [0, 1, 255]).all():
             raise ValueError("Segmentation targets must be 0/1/255 trimaps")
+        tier = np.where(target == 1, 1, np.where(target == 0, 3, 0)).astype(np.uint8)
+        confidence = (target != 255).astype(np.float32)
+        supervision = row.get("pixel_supervision")
+        if supervision:
+            if digest(supervision["path"]) != supervision["sha256"]:
+                raise ValueError("Pixel supervision changed since dataset export")
+            with np.load(supervision["path"], allow_pickle=False) as archive:
+                tier, confidence = archive["tier"].copy(), archive["confidence"].astype(np.float32)
+            if (tier.shape != target.shape or confidence.shape != target.shape or not np.isin(tier, [0, 1, 2, 3]).all()
+                    or not np.isfinite(confidence).all() or ((confidence < 0) | (confidence > 1)).any()
+                    or not np.array_equal((tier == 1) | (tier == 2), target == 1)
+                    or not np.array_equal(tier == 3, target == 0)
+                    or ((target != 255) & (confidence <= 0)).any()):
+                raise ValueError("Invalid pixel confidence/tier trimap")
         original_shape = image.shape[:2]
         height, width = self.size
         previous = image
@@ -83,6 +97,8 @@ class ShadowDataset(Dataset):
         image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
         previous = cv2.resize(previous, (width, height), interpolation=cv2.INTER_LINEAR)
         target = cv2.resize(target, (width, height), interpolation=cv2.INTER_NEAREST)
+        tier = cv2.resize(tier, (width, height), interpolation=cv2.INTER_NEAREST)
+        confidence = cv2.resize(confidence, (width, height), interpolation=cv2.INTER_NEAREST)
         receiver_previous, receiver_next = image, image
         onset_weight = np.zeros((height, width), np.float32)
         recovery_weight = onset_weight.copy()
@@ -112,6 +128,7 @@ class ShadowDataset(Dataset):
                 onset_weight, recovery_weight = values
         if self.augment and np.random.random() < 0.5:
             image, target = image[:, ::-1].copy(), target[:, ::-1].copy()
+            tier, confidence = tier[:, ::-1].copy(), confidence[:, ::-1].copy()
             previous, weight = previous[:, ::-1].copy(), weight[:, ::-1].copy()
             grid = grid[:, ::-1].copy()
             grid[..., 0] *= -1
@@ -131,6 +148,7 @@ class ShadowDataset(Dataset):
             raise ValueError("negative_weight must be in (0, 1]")
         return {"image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"], "sample_weight": sample_weight,
                 "negative_weight": negative_weight,
+                "supervision_tier": torch.from_numpy(tier), "pixel_confidence": torch.from_numpy(confidence),
                 "receiver_previous": tensor(receiver_previous), "receiver_next": tensor(receiver_next),
                 "onset_weight": torch.from_numpy(onset_weight), "recovery_weight": torch.from_numpy(recovery_weight)}
 
@@ -232,6 +250,30 @@ def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, n
     return (loss, {"bce": bce, "dice": dice}) if return_components else loss
 
 
+def layered_masked_loss(logits, target, tier, confidence, dice_weight, weights=None, class_weights=None,
+                        negative_weights=None, *, expansion_scale=1., objective="class-balanced"):
+    """Keep expansion out of core Dice and preserve its absolute low weight.
+
+    Normalizing by confidence mass would cancel a uniform 0.25 expansion weight.
+    Here the auxiliary BCE uses the unweighted expansion pixel count instead.
+    """
+    core_target = torch.where(tier == 2, 255, target)
+    loss, terms = masked_loss(logits, core_target, dice_weight, weights, class_weights,
+        negative_weights, return_components=True, objective=objective)
+    active = (tier == 2) & (target == 1)
+    coefficient = confidence.to(device=logits.device, dtype=torch.float32)*active
+    if weights is not None:
+        coefficient = coefficient*weights.to(coefficient).reshape(-1, 1, 1)
+    pixel_bce = F.binary_cross_entropy_with_logits(logits[:, 0].float(), torch.ones_like(target, dtype=torch.float32), reduction="none")
+    totals = torch.stack([(pixel_bce*coefficient).sum(), active.sum().to(dtype=torch.float32)])
+    if dist.is_available() and dist.is_initialized():
+        global_values = totals.detach().clone()
+        dist.all_reduce(global_values)
+        totals = totals*dist.get_world_size()+(global_values-totals.detach()*dist.get_world_size())
+    expansion = totals[0]/totals[1].clamp_min(1)
+    return loss+expansion_scale*expansion, {**terms, "expansion": expansion}
+
+
 def temporal_loss(current, previous, grid, weight, sample_weight=None):
     previous_probability = F.grid_sample(previous.sigmoid().detach().float(), grid.float(), mode="bilinear", padding_mode="zeros", align_corners=False)[:, 0]
     error = (current[:, 0].sigmoid().float()-previous_probability).abs()
@@ -306,6 +348,8 @@ def train_main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--expansion-warmup-epochs", type=int, default=2)
+    parser.add_argument("--expansion-ramp-epochs", type=int, default=3)
     parser.add_argument("--pixel-balance", choices=["loss", "none"], default="loss",
                         help="Inverse-frequency weighting for the legacy objective only")
     parser.add_argument("--scene-sampling", choices=["image", "uniform", "supervision"], default="image")
@@ -327,6 +371,8 @@ def train_main():
     args = parser.parse_args()
     if min(args.epochs, args.batch_size, args.accumulation, *args.size) < 1:
         raise ValueError("epochs, batch-size and accumulation must be positive")
+    if args.expansion_warmup_epochs < 0 or args.expansion_ramp_epochs < 1:
+        raise ValueError("Invalid expansion curriculum")
     if (not 0 < args.weak_weight <= 1 or args.workers < 0 or args.temporal_weight < 0
             or not np.isfinite([args.dice_weight, args.max_pixel_weight, args.receiver_pair_weight, args.receiver_pair_margin]).all()
             or args.dice_weight < 0 or args.max_pixel_weight < 1 or args.receiver_pair_weight < 0 or args.receiver_pair_margin <= 0):
@@ -443,7 +489,8 @@ def train_main():
         set_segmenter_train_mode(model, freeze_backbone_stats=args.backbone_weights == "imagenet")
         optimizer.zero_grad(set_to_none=True)
         pair_weight_sum, pair_loss_sum, pair_batches = 0.0, 0.0, 0
-        train_totals = torch.zeros(6, device=device, dtype=torch.float64)
+        train_totals = torch.zeros(7, device=device, dtype=torch.float64)
+        expansion_scale = min(1., max(0., (epoch-args.expansion_warmup_epochs+1)/args.expansion_ramp_epochs))
         optimizer_totals = torch.zeros(3, device=device, dtype=torch.float64)
         for step, batch in enumerate(tqdm(loader, desc=f"segmenter epoch {epoch}", disable=rank != 0)):
             start = (step//args.accumulation)*args.accumulation
@@ -465,8 +512,9 @@ def train_main():
                     logits = predictions[:images.shape[0]]
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
                     weights = weights*batch["sample_weight"].to(device)
-                    loss, terms = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights,
-                                       batch["negative_weight"].to(device), return_components=True, objective=args.loss_mode)
+                    loss, terms = layered_masked_loss(logits, batch["target"].to(device), batch["supervision_tier"].to(device),
+                        batch["pixel_confidence"].to(device), args.dice_weight, weights, pixel_weights,
+                        batch["negative_weight"].to(device), expansion_scale=expansion_scale, objective=args.loss_mode)
                     temporal_value, pair_value = loss.new_zeros(()), loss.new_zeros(())
                     if use_temporal:
                         previous = predictions[images.shape[0]:2*images.shape[0]]
@@ -484,6 +532,7 @@ def train_main():
                         pair_batches += 1
                     train_totals[:5] += torch.stack([loss, terms["bce"], terms["dice"], temporal_value, pair_value]).detach().double()*len(images)
                     train_totals[5] += len(images)
+                    train_totals[6] += terms["expansion"].detach().double()*len(images)
                     loss = loss/window
                 scaler.scale(loss).backward()
             if boundary:
@@ -507,6 +556,7 @@ def train_main():
         train_metrics = {name: totals[index]/totals[5] if totals[5] else None
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
         train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
+            expansion_loss=totals[6]/max(totals[5], 1), expansion_scale=expansion_scale,
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
             reduction="global supervised class means per microbatch; epoch mean weighted by images before accumulation scaling" if args.loss_mode == "class-balanced"
                 else "sample-mean before gradient accumulation scaling, across all DDP ranks")

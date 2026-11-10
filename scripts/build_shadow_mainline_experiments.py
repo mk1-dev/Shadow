@@ -147,6 +147,8 @@ def automatic_lit_negatives(clip, camera_frames):
         ground = load_array(frame["ground_support"], base) > 0
         projected &= ground & ~clip["images"][slot]["shadow_proposal_image"].astype(bool)
         projected &= clip["images"][slot]["shadow_target_image"] != 1
+        if "shadow_prior_response_image" in clip["images"][slot]:
+            projected &= clip["images"][slot]["shadow_prior_response_image"] < .25
         masks[slot] = projected
         details[str(slot)] = {**detail, "image_negative_pixels": int(projected.sum()),
             "source": "observed_lit_receiver_union_v2", "weak_not_shadow_gt": True,
@@ -177,6 +179,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
     staging = output/".merge"
     staging.mkdir()
     records, scene_roles, input_hashes = {}, {}, {str(runs_path): digest(runs_path)}
+    external_priors = []
     for run in runs:
         method, split = simple_name(run["method"]), run["split"]
         if split not in {"train", "dev", "eval"}:
@@ -203,6 +206,10 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             if scene_roles.setdefault(scene, split) != split:
                 raise ValueError(f"Scene leaks across dataset roles: {scene}")
             clip = load_clip(entry)
+            if clip["protocol"].get("shadow_prior") is not None:
+                if freeze_lock:
+                    raise ValueError("An old v8+ freeze lock cannot authorize the v9 external-prior teacher")
+                external_priors.append(clip["protocol"]["shadow_prior"])
             input_hashes.update(clip["fingerprints"])
             automatic, automatic_details = ({}, {"frames": {}})
             if auto_negatives:
@@ -212,6 +219,14 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                 if frame["camera_timestamp"] != clip["rows"][slot]["timestamp"]:
                     raise ValueError("Camera timestamps differ from frozen outputs")
                 saved = clip["images"][slot]["shadow_target_image"]
+                image_evidence = clip["images"][slot]
+                layered = "shadow_confidence_image" in image_evidence
+                core = image_evidence.get("shadow_core_image", saved == 1).astype(bool)
+                reliability = image_evidence.get("shadow_confidence_image", (saved == 1).astype(np.float32))
+                if (core.shape != saved.shape or reliability.shape != saved.shape
+                        or not np.isfinite(reliability).all() or ((reliability < 0) | (reliability > 1)).any()
+                        or (core & (saved != 1)).any() or ((saved == 1) & (reliability <= 0)).any()):
+                    raise ValueError("Invalid layered image supervision")
                 if not np.isin(saved, [1, 255]).all():
                     raise ValueError("Video teacher contract is positive/IGNORE; use explicit negative evidence")
                 score, score_info = projected_score(clip["arrays"][slot], frame, clip["protocol"]["ground_plane_world"])
@@ -233,11 +248,12 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                     "automatic_negative_evidence": automatic_details["frames"].get(str(slot), {"reason": automatic_details.get("reason", "disabled")})}
                 frame_negative = automatic.get(slot, np.zeros(shape, bool))
                 if identity not in records:
-                    merged = {"positive": saved == 1, "score": score if score is not None else np.zeros(shape, np.float32),
+                    merged = {"positive": saved == 1, "core": core, "confidence": reliability,
+                              "score": score if score is not None else np.zeros(shape, np.float32),
                               "score_support": score_info["support"] if score_info else np.zeros(shape, bool), "negative": frame_negative}
                     records[identity] = {"image": image,
                         "timestamp": frame["camera_timestamp"], "sources": [source], "all_scores_available": score is not None,
-                        "official_split": official_split,
+                        "official_split": official_split, "layered": layered,
                         "staging": staging/(hashlib.sha256(json.dumps(identity).encode()).hexdigest()+".npz")}
                 else:
                     previous = records[identity]
@@ -246,6 +262,9 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                     with np.load(previous["staging"], allow_pickle=False) as archive:
                         merged = {key: archive[key] for key in archive.files}
                     merged["positive"] |= saved == 1
+                    merged["core"] |= core
+                    merged["confidence"] = np.maximum(merged["confidence"], reliability)
+                    previous["layered"] |= layered
                     merged["negative"] |= frame_negative
                     previous["all_scores_available"] &= score is not None
                     if score is not None:
@@ -291,6 +310,20 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             "split": split, "label_source": "temporal_weak", "mask_encoding": "trimap",
             "method": method, "sources": record["sources"], "negative_evidence": provenance,
             "conflicting_pixels_ignored": int(conflict.sum()), "negative_weight": negative_weight}
+        if record["layered"]:
+            tier = np.zeros(target.shape, np.uint8)
+            tier[(target == 1) & ~merged["core"]] = 2
+            tier[(target == 1) & merged["core"]] = 1
+            tier[target == 0] = 3
+            reliability = np.where(target == 1, merged["confidence"], (target == 0).astype(np.float32))
+            reliability[tier == 1] = 1.
+            supervision = output/method/"supervision"/f"{name}.npz"
+            supervision.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(supervision, confidence=reliability, tier=tier)
+            row["pixel_supervision"] = {"path": str(supervision), "sha256": digest(supervision)}
+            row["supervision_tiers"] = {str(value): int((tier == value).sum()) for value in range(4)}
+            counts[(method, split)]["core_positive_pixels"] += int((tier == 1).sum())
+            counts[(method, split)]["expanded_positive_pixels"] += int((tier == 2).sum())
         rows[(method, split)].append(row)
         if automatic_negative.any():
             automatic_path = output/method/"automatic_negative_targets"/f"{name}.png"
@@ -334,6 +367,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         record["staging"].unlink()
     staging.rmdir()
     summary = {"runs_manifest_sha256": digest(runs_path), "size_hw": list(size), "methods": {},
+        "external_supervised_shadow_priors": external_priors,
         "data_adapter_sha256": digest(__file__),
         "negative_rule_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/bev_teacher.py"),
         "scene_roles": scene_roles, "training_performed": False, "unlabeled_is_background": False,
@@ -381,7 +415,8 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
 
 
 def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10, batch_size=2, accumulation=4, seed=0,
-                  backbone_weights="imagenet", init_checkpoint=None, reference_method=None, scene_sampling="supervision", skip_untrainable=False):
+                  backbone_weights="imagenet", init_checkpoint=None, reference_method=None, scene_sampling="supervision", skip_untrainable=False,
+                  expansion_warmup_epochs=2, expansion_ramp_epochs=3):
     if scene_sampling not in {"image", "uniform", "supervision"}:
         raise ValueError("Choose image, uniform or supervision scene sampling")
     root, output = Path(dataset_root).resolve(), Path(output_root).resolve()
@@ -487,6 +522,7 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
         "temporal_weight": 0.0, "receiver_pair_weight": 0.0, "weak_weight": 1.0,
         "scene_sampling": scene_sampling, "pixel_balance": "loss", "dice_weight": 0.5,
         "loss_mode": "class-balanced", "selection_metric": "balanced_accuracy",
+        "expansion_warmup_epochs": expansion_warmup_epochs, "expansion_ramp_epochs": expansion_ramp_epochs,
         "requested_methods": requested_methods, "method_availability": list(availability.values()),
         "alignment_dropped_methods": alignment_drops, "alignment_priority": priority,
         "scene_sets": {key: sorted(value) for key, value in scene_sets.items()},
@@ -529,6 +565,8 @@ def main():
     suite.add_argument("--reference-method", help="One frozen teacher reference shared by all held-out agreement evaluations")
     suite.add_argument("--scene-sampling", choices=["uniform", "image", "supervision"], default="supervision")
     suite.add_argument("--skip-untrainable", action="store_true", help="Report absent/one-class arms without fabricating labels")
+    suite.add_argument("--expansion-warmup-epochs", type=int, default=2)
+    suite.add_argument("--expansion-ramp-epochs", type=int, default=3)
     args = parser.parse_args()
     if min(args.size) < 1:
         raise ValueError("Image size must be positive")
@@ -536,7 +574,8 @@ def main():
         result = build_dataset(args.runs, args.output_root, args.negative_manifests, args.size, args.freeze_lock, args.auto_negatives, args.manual_eval_template, args.negative_weight)
     else:
         result = prepare_suite(args.dataset_root, args.methods, args.output_root, args.size, args.epochs, args.batch_size, args.accumulation, args.seed,
-                               args.backbone_weights, args.init_checkpoint, args.reference_method, args.scene_sampling, args.skip_untrainable)
+                               args.backbone_weights, args.init_checkpoint, args.reference_method, args.scene_sampling, args.skip_untrainable,
+                               args.expansion_warmup_epochs, args.expansion_ramp_epochs)
     print(json.dumps(result), flush=True)
 
 
