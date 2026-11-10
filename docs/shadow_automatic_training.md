@@ -237,20 +237,26 @@ python scripts/build_shadow_mainline_experiments.py export \
   --auto-negatives --output-root outputs/shadow_auto_025_data
 ```
 
-The adapter generates zero pixels automatically only when the existing physical
-lit-receiver rule is supported by actual saved observations:
+The adapter combines two explicit negative sources. The original neighbour rule
+retains its accepted shadow core, light hypothesis, three observations, BEV and
+ground-motion support. A separate independent lit-receiver rule no longer needs
+an accepted shadow or selected light in that frame:
 
-- A physically accepted positive core and saved light hypothesis exist.
-- The same receiver is visible in all three local observations.
-- Real BEV descriptor support and saved ground-motion support are present.
-- Raw sampled Lab-L stays locally lit across those observations, with current
-  contrast relative to the accepted shadow core.
-- The negative patch is outside plausible shadows of all available annotated
-  object volumes and outside current observed shadow proposals.
+- The same world receiver is visible in three observations, with BEV support.
+- Current Lab-L is at least 30 and in the receiver's upper brightness quantile;
+  the observed context has at least 6 Lab-L units of contrast.
+- Local brightness ratios stay at least 0.98, and exposure-normalized temporal
+  log-brightness range is at most 0.12.
+- Positives, proposals, occlusion and plausible shadow projections of all
+  available annotated object volumes under the fixed 96-direction bank are
+  excluded, with a one-cell boundary margin.
+- At most 64 cells and 10% of supported receivers (rounded up) are retained per frame,
+  independently of accepted positive area. No valid DIS chain is required when
+  the geometric world correspondence itself is available.
 
-The existing defaults for lit ratio, contrast, radius and area budget are reused.
-This is weak evidence, not absolute exclusion of every unannotated tree/building
-shadow. Missing prerequisites yield no negative; they do not become default zeros.
+Each source's evidence and thresholds are recorded. These are weak negatives,
+not absolute exclusion of every unannotated tree/building shadow. Missing
+prerequisites yield no negative; they do not become default zeros.
 Boundary frames without three observations remain IGNORE unless another real
 window supplies evidence. Frozen positive discovery NPZs are never changed.
 
@@ -288,6 +294,21 @@ order. Retained arms still use identical image IDs. `alignment_incompatible`
 means unavailable in this paired suite, not necessarily untrainable alone.
 Start with S0/S3 rather than waiting for historical methods.
 
+To rebuild trimaps after a negative-mining or student-training change, reuse the
+existing frozen outputs instead of submitting the full teacher stage again:
+
+```bash
+export SHADOW_AUTO_RUNS="$SHADOW_AUTO_PLAN/stage_025/experiment_runs.jsonl"
+export SHADOW_AUTO_DATA_ROOT="$PWD/outputs/shadow_data_balanced"
+export SHADOW_AUTO_SUITE_ROOT="$PWD/outputs/shadow_suite_balanced"
+DATA=$(sbatch --parsable slurm/prepare_shadow_segmenter_data.slurm)
+```
+
+This CPU-only job reads the original freeze lock and cached observations; it does
+not rebuild nuScenes, BEV, optical flow, or accepted shadow positives. Use fresh
+dataset, suite and training directories. The updated eval reference has the new
+explicit negative evidence and remains common to both student arms.
+
 ```bash
 export SHADOW_SEG_SUITE="$SHADOW_AUTO_SUITE_ROOT/suite.json"
 export SHADOW_SEG_SUITE_OUTPUT="$PWD/outputs/shadow_auto_025_segmenter"
@@ -295,13 +316,27 @@ unset SHADOW_EVAL_GT
 sbatch --dependency=afterok:$DATA slurm/run_shadow_segmenter_suite.slurm
 ```
 
-This uses the existing DeepLabV3-MobileNetV3-Large balanced BCE/Dice training on
-known pixels only. Sample scale, initialization, scene split and budget are
-recorded. The suite uses uniform scene sampling, then uniform image sampling
-within each scene, with replacement and a fixed draw count per epoch. DDP ranks
-shard the same seeded global draw list; there is no class oversampling. Class
-loss weights account for this expected scene sampling distribution. Legacy
-single-model training retains ordinary image sampling unless requested.
+This uses DeepLabV3-MobileNetV3-Large on known pixels only. The new suite defaults
+to `--scene-sampling supervision`: each local pair draws a positive-support and
+a negative-support image, uniformly over scenes and images inside each support
+pool. DDP ranks share one deterministic global draw plan. Methods share eligible
+image IDs and draw counts, but their actual draws can differ when trimaps differ.
+The sampler records support counts from the actual training resize, not stale
+manifest counts. Explicit `uniform` and `image` policies remain available.
+
+The default `--loss-mode class-balanced` computes BCE separately for known
+positive and negative pixels, averages the two class means, and uses a symmetric
+Dice term over that same class-balanced population. DDP combines class sums
+before normalization, including when a local rank has only one known class.
+IGNORE receives no gradient. A batch with only one global class contributes BCE
+but no Dice. No additional inverse-frequency loss weights are applied. The
+legacy objective remains available with `--loss-mode legacy`.
+
+Checkpoint selection defaults to `--selection-metric balanced_accuracy`;
+`mean_iou` and legacy foreground `iou` are explicit alternatives. Reports include
+both class recalls, balanced accuracy, both class IoUs, mean IoU, binned AUROC and
+the all-foreground IoU baseline. A high foreground IoU alone no longer determines
+the default best checkpoint.
 
 Epoch history now includes unscaled training BCE, Dice, temporal, receiver-pair
 and weighted total loss, averaged over images and all DDP ranks before gradient
@@ -309,11 +344,13 @@ accumulation scaling. Evaluation targets are loaded one at a time rather than
 retained as full-resolution arrays throughout training.
 
 Exported weak negatives have `negative_weight=0.5` by default, configurable by
-`SHADOW_NEGATIVE_WEIGHT` or export `--negative-weight`. This is a fixed loss
-coefficient, not a calibrated probability, and affects only known negatives in
-BCE/Dice. Positive evidence and IGNORE do not change. Class balancing is computed
-before this reliability coefficient so it does not cancel the discount. All
-compared arms must use the same setting. Set a shared `SHADOW_SEG_INIT_CHECKPOINT` before preparing the CPU suite
+`SHADOW_NEGATIVE_WEIGHT` or export `--negative-weight`. In the class-balanced
+objective this is relative reliability within the negative class, not a prior
+making negatives half as important. A constant coefficient cancels in the
+class mean by design; different per-row reliabilities still affect contributions.
+The legacy objective retains the old absolute discount. This is not a calibrated
+probability. Positive evidence and IGNORE do not change. All compared arms must
+use the same objective. Set a shared `SHADOW_SEG_INIT_CHECKPOINT` before preparing the CPU suite
 to use a local pretrained segmenter. A checkpoint previously trained with manual
 shadow masks is not part of the no-manual-shadow-supervision main result; record
 its source as an explicit pretraining control. The default uses an ImageNet-only

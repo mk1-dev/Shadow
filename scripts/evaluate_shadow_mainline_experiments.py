@@ -188,7 +188,7 @@ def evaluate_experiments(gt_path, methods_path, dataset_summary, output_root, fr
     write_json(output/"cross_scene_summary.json", {"reference_kind": reference_kind,
         "is_true_shadow_accuracy": not weak,
         "methods": {row["method"]: {"scene_count": row["scenes"], "per_scene": row["per_scene"]} for row in results}})
-    columns = ["method", "frames", "scenes", "training_resized_weak_positive_pixels", "training_scene_count", "accuracy", "precision", "recall", "negative_recall", "f1", "iou", "fpr", "positive_coverage", "average_precision_binned", "boundary_f1"]
+    columns = ["method", "frames", "scenes", "training_resized_weak_positive_pixels", "training_scene_count", "accuracy", "balanced_accuracy", "precision", "recall", "negative_recall", "f1", "iou", "negative_iou", "mean_iou", "all_foreground_iou", "fpr", "positive_coverage", "average_precision_binned", "boundary_f1"]
     for experiment in sorted({row["experiment"] for row in results}):
         filename = "table_teacher_agreement.csv" if weak else f"table_{experiment}.csv"
         with (output/filename).open("w", newline="", encoding="utf-8") as handle:

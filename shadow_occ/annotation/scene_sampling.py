@@ -1,4 +1,4 @@
-"""Deterministic scene-balanced sampling, independent of class labels and torch."""
+"""Deterministic scene and supervision-support sampling, independent of torch."""
 from collections import Counter
 import hashlib
 import math
@@ -21,11 +21,41 @@ def partition_scenes(training, seed=0, dev_fraction=.15):
 
 
 def scene_probabilities(rows, mode="image"):
-    if not rows or mode not in {"image", "uniform"}:
-        raise ValueError("Choose nonempty training rows and image/uniform scene sampling")
+    if not rows or mode not in {"image", "uniform", "supervision"}:
+        raise ValueError("Choose nonempty training rows and image/uniform/supervision sampling")
+    if mode == "supervision":
+        groups = _supervision_groups(rows)
+        result = np.zeros(len(rows))
+        for indices in groups:
+            result[indices] += .5*scene_probabilities([rows[index] for index in indices], "uniform")
+        return result
     counts = Counter(row["scene_name"] for row in rows)
     weights = np.array([1.0/counts[row["scene_name"]] if mode == "uniform" else 1.0 for row in rows])
     return weights/weights.sum()
+
+
+def _supervision_groups(rows):
+    groups = [[index for index, row in enumerate(rows) if row["sampling_class_pixels"][label] > 0]
+              for label in (0, 1)]
+    if not all(groups):
+        raise ValueError("Supervision sampling needs both classes after the actual training resize")
+    return groups
+
+
+def supervision_epoch_indices(rows, seed, epoch, rank=0, world=1):
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError("Invalid distributed sampler shard")
+    groups = _supervision_groups(rows)
+    count = math.ceil(len(rows)/(2*world))*2*world
+    generator = np.random.default_rng(np.random.SeedSequence([seed, epoch]))
+    positions = np.arange(count)
+    # Each local pair draws a negative-support and a positive-support image.
+    kinds = (positions//world+positions % world) % 2
+    indices = np.zeros(count, dtype=np.int64)
+    for kind, group in enumerate(groups):
+        indices[kinds == kind] = generator.choice(group, size=int((kinds == kind).sum()), replace=True,
+            p=scene_probabilities([rows[index] for index in group], "uniform"))
+    return indices[rank::world].tolist()
 
 
 def scene_epoch_indices(rows, seed, epoch, rank=0, world=1):

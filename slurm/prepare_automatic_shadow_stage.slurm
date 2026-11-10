@@ -48,5 +48,5 @@ python -u scripts/build_shadow_mainline_experiments.py suite \
   --epochs "${SHADOW_SEG_EPOCHS:-10}" --batch-size "${SHADOW_SEG_BATCH_SIZE:-2}" \
   --accumulation "${SHADOW_SEG_ACCUMULATION:-4}" --seed "${SHADOW_SEED:-0}" \
   --backbone-weights "${SHADOW_SEG_BACKBONE_WEIGHTS:-imagenet}" \
-  --scene-sampling uniform \
+  --scene-sampling supervision \
   --output-root "$SUITE" "${INIT[@]}"

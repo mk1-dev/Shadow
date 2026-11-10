@@ -18,7 +18,15 @@ class BinaryMetrics:
     def summary(self) -> dict:
         tn, fp, fn, tp = [int(value) for value in self.confusion]
         ratio = lambda a, b: float(a / b) if b else None
-        return {"tn": tn, "fp": fp, "fn": fn, "tp": tp, "iou": ratio(tp, tp+fp+fn), "precision": ratio(tp, tp+fp), "recall": ratio(tp, tp+fn), "f1": ratio(2*tp, 2*tp+fp+fn), "accuracy": ratio(tp+tn, tp+tn+fp+fn), "valid_count": tn+fp+fn+tp}
+        positive_recall, negative_recall = ratio(tp, tp+fn), ratio(tn, tn+fp)
+        positive_iou, negative_iou = ratio(tp, tp+fp+fn), ratio(tn, tn+fp+fn)
+        both = positive_recall is not None and negative_recall is not None
+        return {"tn": tn, "fp": fp, "fn": fn, "tp": tp, "iou": positive_iou,
+                "negative_iou": negative_iou, "mean_iou": (positive_iou+negative_iou)/2 if both else None,
+                "precision": ratio(tp, tp+fp), "recall": positive_recall, "negative_recall": negative_recall,
+                "balanced_accuracy": (positive_recall+negative_recall)/2 if both else None,
+                "all_foreground_iou": ratio(tp+fn, tp+tn+fp+fn),
+                "f1": ratio(2*tp, 2*tp+fp+fn), "accuracy": ratio(tp+tn, tp+tn+fp+fn), "valid_count": tn+fp+fn+tp}
 
 
 def pixel_score_diagnostics(histogram):
@@ -45,11 +53,14 @@ def pixel_score_diagnostics(histogram):
     precision = np.divide(descending[1], predicted, out=np.ones(bins, np.float64), where=predicted > 0)
     recall = descending[1]/positives if positives else np.zeros(bins)
     average_precision = float(np.sum(np.diff(np.r_[0, recall])*precision)) if positives else None
+    negatives = int(histogram[0].sum())
+    lower_negative = np.cumsum(histogram[0])-histogram[0]
+    auroc = float((histogram[1]*(lower_negative+.5*histogram[0])).sum()/(positives*negatives)) if positives and negatives else None
     curve = [{"threshold": (bins-1-index)/bins, "precision": float(precision[index]),
               "recall": float(recall[index]) if positives else None} for index in range(bins)]
     return {"bins": bins, "histogram_by_class": histogram.tolist(),
             "approximate_mean_probability_nonshadow_shadow": means, "threshold_sweep": sweep,
-            "approximate_average_precision": average_precision, "pr_curve": curve,
+            "approximate_average_precision": average_precision, "approximate_auroc": auroc, "pr_curve": curve,
             "approved_for_relabeling": False, "scope": "fixed quantized pixel-score diagnostics; no threshold selected"}
 
 

@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shadow_occ.annotation.data import checked_write_image, digest, load_array, read_rows, resolve_path, write_rows
 from shadow_occ.annotation.bev_flow import BEVFlowConfig
 from shadow_occ.annotation.bev_teacher import lit_receiver_negative_mask
+from shadow_occ.annotation.receiver_negatives import independent_lit_receiver_mask
+from shadow_occ.annotation.physics_labels import light_bank
 from shadow_occ.annotation.physics_motion import plane_basis, project_world, sample_at
 from shadow_occ.annotation.video_review import find_clips, load_clip, load_npz
 from shadow_occ.annotation.video_review_render import project_mask, read_rgb
@@ -78,11 +80,11 @@ def negative_index(paths):
 
 
 def automatic_lit_negatives(clip, camera_frames):
-    """Adapt saved v8+ observations to the existing physical weak-negative rule."""
+    """Combine shadow-neighbour negatives with independent observed lit receivers."""
     required = {"receiver_valid_by_frame", "bev_feature_valid"}
     ground_reference = clip["pair"].get("ground_motion_reference_valid_map")
-    if ground_reference is None or not all(required <= arrays.keys() for arrays in clip["arrays"]):
-        return {}, {"reason": "missing_saved_receiver_feature_or_motion_support", "frames": {}}
+    if not all(required <= arrays.keys() for arrays in clip["arrays"]):
+        return {}, {"reason": "missing_saved_receiver_or_feature_support", "frames": {}}
     resolution = float(clip["protocol"]["grid"]["resolution"])
     raw, ratios = [], []
     for arrays, (frame, base) in zip(clip["arrays"], camera_frames):
@@ -103,10 +105,7 @@ def automatic_lit_negatives(clip, camera_frames):
         positive = arrays["shadow_target_bev"] == 1
         frame, base = camera_frames[slot]
         bank_path = clip["folder"]/f"{slot:03d}_light_bank.npz"
-        if not positive.any() or not bank_path.is_file():
-            details[str(slot)] = {"reason": "no_positive_core_or_saved_light", "image_negative_pixels": 0}
-            continue
-        directions = load_npz(bank_path)["directions_world"]
+        directions = load_npz(bank_path)["directions_world"] if bank_path.is_file() else light_bank()
         explanations = []
         for region in clip["rows"][slot]["regions"]:
             physics = region.get("physics", {})
@@ -116,20 +115,29 @@ def automatic_lit_negatives(clip, camera_frames):
         nearby = clip["arrays"][slot-1:slot+2]
         receiver = np.logical_and.reduce([row["receiver_valid_by_frame"].astype(bool) for row in nearby])
         features = np.logical_and.reduce([row["bev_feature_valid"].astype(bool) for row in nearby])
-        motion = ground_reference[slot-1].astype(bool) & ground_reference[slot].astype(bool)
+        motion = ground_reference[slot-1].astype(bool) & ground_reference[slot].astype(bool) if ground_reference is not None else np.zeros_like(receiver)
         volumes = frame.get("object_volumes_world")
-        if volumes is None:
-            details[str(slot)] = {"reason": "missing_all_class_exclusion_volumes", "image_negative_pixels": 0}
-            continue
         input_arrays = {"bev_world_to_grid": arrays["bev_world_to_grid"], "receiver_valid": receiver,
             "learned_bev_receiver_support": features, "shadow_flow_supported": motion,
             "appearance_L_raw": np.stack(raw[slot-1:slot+2]),
             "appearance_local_ratio": np.stack(ratios[slot-1:slot+2]),
             "shadow_candidate": arrays["shadow_proposal_bev"].astype(bool)}
-        negative, detail = lit_receiver_negative_mask(input_arrays, positive, [],
-            clip["protocol"]["ground_plane_world"], directions, explanations,
-            resolution=resolution, volumes=volumes,
-            exclusion=arrays.get("entity_occlusion_mask"))
+        negative, detail = np.zeros_like(receiver), {"reason": "no_positive_core_or_explanation", "cells": 0}
+        if positive.any() and explanations and volumes is not None:
+            negative, detail = lit_receiver_negative_mask(input_arrays, positive, [],
+                clip["protocol"]["ground_plane_world"], directions, explanations,
+                resolution=resolution, volumes=volumes, exclusion=arrays.get("entity_occlusion_mask"))
+        exclusion = np.logical_or.reduce([row["shadow_proposal_bev"].astype(bool)
+            | (row["shadow_target_bev"] == 1) | row.get("entity_occlusion_mask", np.zeros_like(receiver)).astype(bool)
+            for row in nearby])
+        aligned = all(np.allclose(row["receiver_world_xyz"][receiver], arrays["receiver_world_xyz"][receiver], atol=1e-4, rtol=0)
+                      for row in nearby)
+        independent, independent_detail = np.zeros_like(receiver), {"reason": "unaligned_world_receivers", "cells": 0}
+        if aligned:
+            independent, independent_detail = independent_lit_receiver_mask(
+                {**input_arrays, "receiver_valid": receiver & features, "exclusion": exclusion},
+                clip["protocol"]["ground_plane_world"], directions, volumes)
+        negative |= independent
         projected = project_mask(negative, arrays, frame, clip["protocol"]["ground_plane_world"])
         if frame.get("ground_sha256"):
             reference = frame["ground_support"]
@@ -138,10 +146,12 @@ def automatic_lit_negatives(clip, camera_frames):
                 raise ValueError("Receiver support changed since pair export")
         ground = load_array(frame["ground_support"], base) > 0
         projected &= ground & ~clip["images"][slot]["shadow_proposal_image"].astype(bool)
+        projected &= clip["images"][slot]["shadow_target_image"] != 1
         masks[slot] = projected
         details[str(slot)] = {**detail, "image_negative_pixels": int(projected.sum()),
-            "source": "existing_lit_receiver_negative_mask", "weak_not_shadow_gt": True,
-            "support": "three observed receivers + actual BEV validity + two saved ground-motion references"}
+            "source": "observed_lit_receiver_union_v2", "weak_not_shadow_gt": True,
+            "independent": independent_detail,
+            "support": "aligned observed receivers and BEV validity; legacy neighbour branch additionally uses flow support"}
     return masks, {"reason": "automatic_physical_lit_receivers", "frames": details,
         "scope": "weak negatives outside modelled caster projections, not exhaustive unmodelled static-caster exclusion"}
 
@@ -290,7 +300,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             automatic_manifests[method].append({"id": name, "scene_name": scene, "camera": camera,
                 "frame_token": token, "image": str(record["image"]), "split": split,
                 "shadow_mask": str(automatic_path), "mask_encoding": "trimap", "label_source": "temporal_weak",
-                "physics_export_enabled": True, "physics_protocol": "video-lit-receiver-negatives-v1",
+                "physics_export_enabled": True, "physics_protocol": "video-lit-receiver-negatives-v2",
                 "physics_target_sha256": digest(automatic_path), "sources": record["sources"]})
         frozen_prediction = output/method/"discovery"/f"{name}.npz"
         frozen_prediction.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +327,9 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         scene_counts[(method, split, scene)]["frames_with_positive"] += int((target == 1).any())
         scene_counts[(method, split, scene)]["frames_with_negative"] += int((target == 0).any())
         counts[(method, split)]["frames"] += 1
+        counts[(method, split)]["frames_with_positive"] += int((resized == 1).any())
+        counts[(method, split)]["frames_with_negative"] += int((resized == 0).any())
+        counts[(method, split)]["positive_only_frames"] += int((resized == 1).any() and not (resized == 0).any())
         counts[(method, split)]["conflict_pixels"] += int(conflict.sum())
         record["staging"].unlink()
     staging.rmdir()
@@ -325,9 +338,10 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         "negative_rule_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/bev_teacher.py"),
         "scene_roles": scene_roles, "training_performed": False, "unlabeled_is_background": False,
         "development_scenes": sorted(development), "freeze_lock_sha256": digest(freeze_lock) if freeze_lock else None,
-        "automatic_negative_rule": "existing_lit_receiver_negative_mask" if auto_negatives else None,
+        "independent_negative_rule_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_negatives.py"),
+        "automatic_negative_rule": "observed_lit_receiver_union_v2" if auto_negatives else None,
         "negative_loss_weight": negative_weight,
-        "negative_weight_contract": "fixed weak-negative loss coefficient, not calibrated confidence; no change to teacher acceptance",
+        "negative_weight_contract": "weak-negative reliability; class-balanced loss normalizes within each class, legacy loss applies an absolute coefficient",
         "overlapping_clip_merge": "union of positive observations per camera frame; conflicting negative evidence -> IGNORE"}
     for method in sorted({key[0] for key in rows}):
         write_rows(output/method/"automatic_negatives.jsonl", automatic_manifests[method])
@@ -338,6 +352,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             write_rows(output/method/f"discovery_{split}.jsonl", predictions.get((method, split), []))
             detail = dict(counts[(method, split)])
             detail["scenes"] = sorted({row["scene_name"] for row in group})
+            detail["negative_scenes"] = sorted({row["scene_name"] for row in group if row["resized_class_pixels"]["negative"] > 0})
             detail["both_classes_survive_resize"] = all(detail.get("resized_"+label+"_pixels", 0) > 0 for label in ("positive", "negative"))
             details[split] = detail
         summary["methods"][method] = details
@@ -366,9 +381,9 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
 
 
 def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10, batch_size=2, accumulation=4, seed=0,
-                  backbone_weights="imagenet", init_checkpoint=None, reference_method=None, scene_sampling="uniform", skip_untrainable=False):
-    if scene_sampling not in {"image", "uniform"}:
-        raise ValueError("Choose image or uniform scene sampling")
+                  backbone_weights="imagenet", init_checkpoint=None, reference_method=None, scene_sampling="supervision", skip_untrainable=False):
+    if scene_sampling not in {"image", "uniform", "supervision"}:
+        raise ValueError("Choose image, uniform or supervision scene sampling")
     root, output = Path(dataset_root).resolve(), Path(output_root).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
@@ -471,11 +486,12 @@ def prepare_suite(dataset_root, methods, output_root, size=(384, 704), epochs=10
         "init_checkpoint": initialization, "init_checkpoint_sha256": initialization_sha,
         "temporal_weight": 0.0, "receiver_pair_weight": 0.0, "weak_weight": 1.0,
         "scene_sampling": scene_sampling, "pixel_balance": "loss", "dice_weight": 0.5,
+        "loss_mode": "class-balanced", "selection_metric": "balanced_accuracy",
         "requested_methods": requested_methods, "method_availability": list(availability.values()),
         "alignment_dropped_methods": alignment_drops, "alignment_priority": priority,
         "scene_sets": {key: sorted(value) for key, value in scene_sets.items()},
         "aligned_frames": {split: len(aligned[(methods[0], split)]) for split in ("train", "dev")},
-        "budget": "same eligible image IDs, scene sampler/draw count, size, epochs, batch/accumulation and seed; only weak trimaps differ",
+        "budget": "same eligible image IDs, sampler policy/draw count, size, epochs, batch/accumulation and seed; supervision-dependent draws may differ between weak trimaps",
         "architecture": "DeepLabV3-MobileNetV3", "evaluation_gt_used_for_training": False,
         "weak_eval_reference": str(root/reference_method/"seg_eval.jsonl"),
         "weak_eval_reference_sha256": digest(root/reference_method/"seg_eval.jsonl"),
@@ -511,7 +527,7 @@ def main():
     suite.add_argument("--backbone-weights", choices=["none", "imagenet"], default="imagenet")
     suite.add_argument("--init-checkpoint")
     suite.add_argument("--reference-method", help="One frozen teacher reference shared by all held-out agreement evaluations")
-    suite.add_argument("--scene-sampling", choices=["uniform", "image"], default="uniform")
+    suite.add_argument("--scene-sampling", choices=["uniform", "image", "supervision"], default="supervision")
     suite.add_argument("--skip-untrainable", action="store_true", help="Report absent/one-class arms without fabricating labels")
     args = parser.parse_args()
     if min(args.size) < 1:

@@ -89,7 +89,7 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
                     "--output-root", str(folder), "--allow-weak-labels", "--device", device]
         for field in ("epochs", "batch_size", "accumulation", "seed", "lr", "backbone_weights", "temporal_weight", "receiver_pair_weight", "weak_weight"):
             command += ["--"+field.replace("_", "-"), str(plan[field])]
-        for field in ("scene_sampling", "pixel_balance", "dice_weight"):
+        for field in ("scene_sampling", "pixel_balance", "dice_weight", "loss_mode", "selection_metric"):
             if field in plan:
                 command += ["--"+field.replace("_", "-"), str(plan[field])]
         command += ["--size", *map(str, plan["size_hw"])]

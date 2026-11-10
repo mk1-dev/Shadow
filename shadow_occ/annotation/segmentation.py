@@ -21,25 +21,29 @@ from shadow_occ.annotation.data import (
 )
 from shadow_occ.annotation.metrics import BinaryMetrics, pixel_score_diagnostics
 from shadow_occ.annotation.temporal import sampling_grid
-from shadow_occ.annotation.readiness import binary_risk_weights, require_segmenter_checkpoint, segmentation_readiness
+from shadow_occ.annotation.readiness import binary_risk_weights, require_segmenter_checkpoint, segmentation_readiness, segmentation_selection_score
 from shadow_occ.annotation.teacher_provenance import extend_scene_history
-from shadow_occ.annotation.scene_sampling import scene_epoch_indices, scene_probabilities
+from shadow_occ.annotation.scene_sampling import scene_epoch_indices, scene_probabilities, supervision_epoch_indices
 from shadow_occ.utils.io import write_json
 from shadow_occ.utils.seed import seed_everything, seed_worker
 
 
 class SceneBalancedSampler(Sampler):
-    def __init__(self, rows, seed, rank=0, world=1):
+    def __init__(self, rows, seed, rank=0, world=1, mode="uniform"):
         self.rows, self.seed, self.rank, self.world, self.epoch = rows, seed, rank, world, 0
+        self.mode = mode
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __len__(self):
+        if self.mode == "supervision":
+            return 2*((len(self.rows)+2*self.world-1)//(2*self.world))
         return (len(self.rows)+self.world-1)//self.world
 
     def __iter__(self):
-        return iter(scene_epoch_indices(self.rows, self.seed, self.epoch, self.rank, self.world))
+        draw = supervision_epoch_indices if self.mode == "supervision" else scene_epoch_indices
+        return iter(draw(self.rows, self.seed, self.epoch, self.rank, self.world))
 
 
 class ShadowDataset(Dataset):
@@ -167,7 +171,43 @@ def set_segmenter_train_mode(model, freeze_backbone_stats=False):
                 module.eval()
 
 
-def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None, *, return_components=False):
+def class_balanced_masked_loss(logits, target, dice_weight, weights=None, negative_weights=None, *, return_components=False):
+    logits = logits[:, 0].float()
+    truth = target == 1
+    reliability = torch.ones_like(logits)
+    if weights is not None:
+        reliability = reliability*weights.to(logits).reshape(-1, 1, 1)
+    if negative_weights is not None:
+        reliability = torch.where(target == 0, reliability*negative_weights.to(logits).reshape(-1, 1, 1), reliability)
+    bce_map = F.binary_cross_entropy_with_logits(logits, truth.float(), reduction="none")
+    probability = logits.sigmoid()
+    mass = [reliability*(target == value) for value in (0, 1)]
+    local = torch.stack([(bce_map*value).sum() for value in mass]
+                        + [value.sum() for value in mass]
+                        + [(probability*value).sum() for value in mass])
+    if dist.is_available() and dist.is_initialized():
+        global_values = local.detach().clone()
+        dist.all_reduce(global_values)
+        # DDP averages gradients; restore the global class-mean gradient scale.
+        local = local*dist.get_world_size()+(global_values-local.detach()*dist.get_world_size())
+    negative_mass, positive_mass = local[2], local[3]
+    bce = .5*(local[:2]/local[2:4].clamp_min(1e-12)).sum()
+    tp_rate = local[5]/positive_mass.clamp_min(1e-12)
+    fp_rate = local[4]/negative_mass.clamp_min(1e-12)
+    positive_dice = (2*tp_rate+1e-6)/(1+tp_rate+fp_rate+1e-6)
+    negative_dice = (2*(1-fp_rate)+1e-6)/(3-tp_rate-fp_rate+1e-6)
+    # A single-class batch provides BCE, not a reward for filling its unknown surroundings.
+    dice = (1-.5*(positive_dice+negative_dice))*((negative_mass > 0) & (positive_mass > 0))
+    loss = bce+dice_weight*dice
+    return (loss, {"bce": bce, "dice": dice}) if return_components else loss
+
+
+def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None, *, return_components=False, objective="legacy"):
+    if objective == "class-balanced":
+        return class_balanced_masked_loss(logits, target, dice_weight, weights, negative_weights,
+                                         return_components=return_components)
+    if objective != "legacy":
+        raise ValueError("Unknown segmentation loss objective")
     logits = logits[:, 0].float()
     valid = target != 255
     truth = (target == 1).to(logits.dtype)
@@ -266,8 +306,11 @@ def train_main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dice-weight", type=float, default=0.5)
-    parser.add_argument("--pixel-balance", choices=["loss", "none"], default="loss")
-    parser.add_argument("--scene-sampling", choices=["image", "uniform"], default="image")
+    parser.add_argument("--pixel-balance", choices=["loss", "none"], default="loss",
+                        help="Inverse-frequency weighting for the legacy objective only")
+    parser.add_argument("--scene-sampling", choices=["image", "uniform", "supervision"], default="image")
+    parser.add_argument("--loss-mode", choices=["class-balanced", "legacy"], default="class-balanced")
+    parser.add_argument("--selection-metric", choices=["balanced_accuracy", "mean_iou", "iou"], default="balanced_accuracy")
     parser.add_argument("--positive-only-ablation", action="store_true",
                         help="Run the positive-only training control against unchanged two-class dev labels")
     parser.add_argument("--max-pixel-weight", type=float, default=50.0)
@@ -314,6 +357,7 @@ def train_main():
         resized = np.array([(mask == 0).sum(), (mask == 1).sum()])
         resized_counts += resized
         if resized.sum():
+            row["sampling_class_pixels"] = resized.tolist()
             base = (args.weak_weight if row["label_source"] in WEAK_SOURCES else 1.0)*float(row.get("sample_weight", 1.0))
             if not np.isfinite(base) or base <= 0:
                 raise ValueError("Invalid effective segmentation sample weight")
@@ -328,7 +372,7 @@ def train_main():
     positive_only = args.positive_only_ablation and resized_counts[0] == 0 and resized_counts[1] > 0
     if (resized_counts == 0).any() and not positive_only:
         raise ValueError("Both known classes must survive the actual training resize; increase resolution or fix labels")
-    pixel_weights = binary_risk_weights(effective_mass.tolist(), args.max_pixel_weight) if args.pixel_balance == "loss" and not positive_only else [1.0, 1.0]
+    pixel_weights = binary_risk_weights(effective_mass.tolist(), args.max_pixel_weight) if args.loss_mode == "legacy" and args.pixel_balance == "loss" and not positive_only else [1.0, 1.0]
     if args.receiver_pair_weight > 0 and not receiver_pair_rows:
         raise ValueError("Receiver-pair loss requested but no positive transition rows exist; rebuild physics data first")
     dev_counts = np.zeros(2, dtype=np.int64)
@@ -364,9 +408,14 @@ def train_main():
         dist.barrier()
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": "uniform scene then uniform image with replacement; no class sampling" if args.scene_sampling == "uniform" else "ordinary shuffled/distributed; no class oversampling", "approved_for_relabeling": False,
+        sampler_contract = {"uniform": "uniform scene then uniform image with replacement; no class sampling",
+            "image": "ordinary shuffled/distributed; no class oversampling",
+            "supervision": "alternating negative/positive-support draws; uniform scene and image within each support pool"}[args.scene_sampling]
+        write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": sampler_contract, "approved_for_relabeling": False,
             "expected_scene_sample_fraction": {scene: float(sum(probabilities[index] for index, row in enumerate(train) if row["scene_name"] == scene)) for scene in sorted({row["scene_name"] for row in train})},
-            "negative_weight_contract": "per-row weak-negative loss coefficient, not calibrated confidence; class balancing computed before reliability weighting",
+            "negative_weight_contract": "relative reliability within the negative class; normalized global class means, no second inverse-frequency weight" if args.loss_mode == "class-balanced" else "per-row weak-negative loss coefficient; class balancing computed before reliability weighting",
+            "sampler_class_support": {str(value): {"images": sum(row["sampling_class_pixels"][value] > 0 for row in train),
+                "scenes": len({row["scene_name"] for row in train if row["sampling_class_pixels"][value] > 0})} for value in (0, 1)},
             "batchnorm_policy": {"backbone": "frozen_imagenet_statistics" if args.backbone_weights == "imagenet" else "train_batch_statistics",
                 "head": "train_batch_statistics", "aspp_singleton": "running_statistics_only_for_single_value_per_channel"},
             "code_sha256": {name: digest(Path(__file__).with_name(name)) for name in ("segmentation.py", "readiness.py", "scene_sampling.py")},
@@ -375,7 +424,7 @@ def train_main():
                "pixel_loss_weights": pixel_weights, "receiver_pair_rows": receiver_pair_rows}, flush=True)
     if world > 1:
         dist.barrier()
-    sampler = (SceneBalancedSampler(train, args.seed, rank, world) if args.scene_sampling == "uniform"
+    sampler = (SceneBalancedSampler(train, args.seed, rank, world, args.scene_sampling) if args.scene_sampling in {"uniform", "supervision"}
                else DistributedSampler(ShadowDataset(train, args.size), seed=args.seed) if world > 1 else None)
     loader = DataLoader(ShadowDataset(train, args.size, augment=True, receiver_pairs=args.receiver_pair_weight > 0), batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=device.type == "cuda")
     model = build_segmenter(None if initial_checkpoint is not None else args.backbone_weights).to(device)
@@ -417,7 +466,7 @@ def train_main():
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
                     weights = weights*batch["sample_weight"].to(device)
                     loss, terms = masked_loss(logits, batch["target"].to(device), args.dice_weight, weights, pixel_weights,
-                                       batch["negative_weight"].to(device), return_components=True)
+                                       batch["negative_weight"].to(device), return_components=True, objective=args.loss_mode)
                     temporal_value, pair_value = loss.new_zeros(()), loss.new_zeros(())
                     if use_temporal:
                         previous = predictions[images.shape[0]:2*images.shape[0]]
@@ -459,22 +508,23 @@ def train_main():
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
         train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
-            reduction="sample-mean before gradient accumulation scaling, across all DDP ranks")
+            reduction="global supervised class means per microbatch; epoch mean weighted by images before accumulation scaling" if args.loss_mode == "class-balanced"
+                else "sample-mean before gradient accumulation scaling, across all DDP ranks")
         gradient_sum, attempted, skipped = optimizer_totals.cpu().tolist()
         train_metrics.update(mean_gradient_norm=gradient_sum/attempted if attempted and np.isfinite(gradient_sum) else None,
             optimizer_steps=int((attempted-skipped)/world), skipped_optimizer_steps=int(skipped/world))
         metrics, temporal_metrics = evaluate(raw, dev, args.size, device, rank, world)
         readiness = segmentation_readiness(metrics)
-        preferred = [v["iou"] for k, v in metrics.items() if k in GT_SOURCES and v["iou"] is not None]
-        values = preferred or [v["iou"] for v in metrics.values() if v["iou"] is not None]
-        score = float(np.mean(values)) if values else -1.0
+        score = segmentation_selection_score(metrics, args.selection_metric)
         if rank == 0:
-            state = {"model": raw.state_dict(), "epoch": epoch, "size": args.size, "args": vars(args), "dev_metrics_by_source": metrics, "dev_temporal_metrics": temporal_metrics, "readiness": readiness, "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes)}
+            state = {"model": raw.state_dict(), "epoch": epoch, "size": args.size, "args": vars(args), "dev_metrics_by_source": metrics, "dev_temporal_metrics": temporal_metrics, "readiness": readiness, "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes),
+                "selection_metric": args.selection_metric, "selection_score": score}
             torch.save(state, output/"last.pth")
             if readiness["noncollapsed"] and score > best:
                 best = score
                 torch.save(state, output/"best.pth")
             history.append({"epoch": epoch, "train_loss": train_metrics, "dev_metrics_by_source": metrics, "temporal": temporal_metrics, "readiness": readiness,
+                "selection_metric": args.selection_metric, "selection_score": score,
                 "receiver_pairs_rank0": {"active_transition_pixels": pair_weight_sum, "batches": pair_batches,
                     "mean_relative_loss": pair_loss_sum/pair_batches if pair_batches else None}})
             write_json(output/"history.json", history)

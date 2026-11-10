@@ -171,10 +171,10 @@ def test_automatic_lit_negative_rule_uses_real_observation_support(tmp_path):
     masks, details = module.automatic_lit_negatives(clip, frames)
     assert masks[1].sum() > 0
     assert not (masks[1] & clip["images"][1]["shadow_proposal_image"]).any()
-    assert details["frames"]["1"]["source"] == "existing_lit_receiver_negative_mask"
+    assert details["frames"]["1"]["source"] == "observed_lit_receiver_union_v2"
     clip["pair"]["ground_motion_reference_valid_map"][:] = False
-    missing, _ = module.automatic_lit_negatives(clip, frames)
-    assert not missing[1].any()  # Missing correspondence never turns into a known negative.
+    _, missing_details = module.automatic_lit_negatives(clip, frames)
+    assert missing_details["frames"]["1"]["cells"] == 0  # Legacy flow-dependent branch has no support.
 
 
 def test_full_export_creates_two_class_weak_data_and_reusable_negatives_without_manual_input(tmp_path):
@@ -195,6 +195,23 @@ def test_full_export_creates_two_class_weak_data_and_reusable_negatives_without_
     module.build_dataset(runs, tmp_path/"common_pool_data", [pool], (80, 80))
     copied = read_rows(tmp_path/"common_pool_data/anchor_first_v8plus/seg_train.jsonl")
     assert np.array_equal(cv2.imread(copied[1]["target"], 0), target)
+
+
+def test_independent_negative_export_runs_without_positive_core_or_saved_light(tmp_path, monkeypatch):
+    module, clip, frames, folder, _ = lit_fixture(tmp_path)
+    for arrays, image in zip(clip["arrays"], clip["images"]):
+        arrays["shadow_target_bev"][:] = 255
+        image["shadow_target_image"][:] = 255
+    for path in (folder/"clip").glob("*_light_bank.npz"):
+        path.unlink()
+    called = []
+    def independent(arrays, plane, directions, volumes):
+        called.append((len(directions), volumes))
+        return np.zeros((8, 8), bool), {"reason": "independent_test", "cells": 0}
+    monkeypatch.setattr(module, "independent_lit_receiver_mask", independent)
+    _, details = module.automatic_lit_negatives(clip, frames)
+    assert len(called) == 1 and called[0][0] == 96
+    assert details["frames"]["1"]["independent"]["reason"] == "independent_test"
 
 
 def test_weak_teacher_metrics_are_separately_named_not_shadow_ground_truth(tmp_path):
@@ -273,7 +290,8 @@ def test_export_writes_resized_per_image_scene_and_delivery_artifacts(tmp_path):
     availability = json.loads((tmp_path/"suite/method_availability.json").read_text())
     assert availability[0]["status"] == "untrainable"
     plan = json.loads((tmp_path/"suite/suite.json").read_text())
-    assert plan["scene_sampling"] == "uniform" and len(plan["arms"]) == 1
+    assert plan["scene_sampling"] == "supervision" and len(plan["arms"]) == 1
+    assert plan["loss_mode"] == "class-balanced" and plan["selection_metric"] == "balanced_accuracy"
 
 
 def test_full_population_split_does_not_change_when_only_a_cache_subset_is_present(tmp_path):

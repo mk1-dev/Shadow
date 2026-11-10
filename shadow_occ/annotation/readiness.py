@@ -6,6 +6,14 @@ import math
 from shadow_occ.annotation.data import GT_SOURCES
 
 
+def segmentation_selection_score(by_source, metric="balanced_accuracy"):
+    if metric not in {"balanced_accuracy", "mean_iou", "iou"}:
+        raise ValueError("Unknown segmenter selection metric")
+    preferred = {key: value for key, value in by_source.items() if key in GT_SOURCES}
+    values = [value[metric] for value in (preferred or by_source).values() if value.get(metric) is not None]
+    return sum(values)/len(values) if values else -1.0
+
+
 def segmentation_readiness(by_source):
     preferred = {key: value for key, value in by_source.items() if key in GT_SOURCES}
     by_source = preferred or by_source
