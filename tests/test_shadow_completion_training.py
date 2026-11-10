@@ -53,6 +53,29 @@ def test_shortage_is_reported_not_filled_with_repeated_scenes(tmp_path):
         module.prepare(source_fixture(tmp_path), tmp_path/"new", {"train": 3, "dev": 1, "eval": 1})
 
 
+def test_expansion_keeps_heldout_scenes_and_exact_clips_fixed(tmp_path):
+    module = script("run_shadow_completion_training")
+    source = source_fixture(tmp_path)
+    old = tmp_path/"old"
+    previous = module.prepare(source, old, {"train": 1, "dev": 1, "eval": 1}, clips_per_scene=1)
+    new = tmp_path/"expanded"
+    expanded = module.prepare(source, new, {"train": 2, "dev": 1, "eval": 1}, clips_per_scene=3,
+        heldout_plan=old/"plan.json", negative_maximum_cells=256, negative_maximum_fraction=.25)
+    assert len(expanded["scene_sets"]["train"]) == 2
+    for role in ("dev", "eval"):
+        assert expanded["scene_sets"][role] == previous["scene_sets"][role]
+        old_batch = next(row for row in read_rows(old/"batches.jsonl") if row["split"] == role)
+        new_batch = next(row for row in read_rows(new/"batches.jsonl") if row["split"] == role)
+        assert read_rows(old_batch["clips"]) == read_rows(new_batch["clips"])
+
+
+def test_clip_selection_prefers_distinct_caster_tracks():
+    module = script("run_shadow_completion_training")
+    clips = [{"camera": "front", "track_id": track, "id": str(index)}
+             for index, track in enumerate(["a", "a", "a", "b", "c"])]
+    assert len({row["track_id"] for row in module.diverse_clips(clips, 3, 0)}) == 3
+
+
 def test_changed_plan_inputs_cannot_launch_training(tmp_path, monkeypatch):
     module = script("run_shadow_completion_training")
     root = tmp_path/"new"

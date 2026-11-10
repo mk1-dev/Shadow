@@ -601,6 +601,7 @@ def predict_main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--allow-train-scenes", action="store_true", help="Explicit in-sample annotation, not held-out evaluation")
     parser.add_argument("--diagnostics-only", action="store_true", help="Inspect collapsed/legacy models; outputs are quarantined from relabeling")
+    parser.add_argument("--review-images-per-scene", type=int, default=3)
     args = parser.parse_args()
     rows = read_rows(args.manifest)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -616,7 +617,9 @@ def predict_main():
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(output)
     output.mkdir(parents=True, exist_ok=True)
+    from shadow_occ.annotation.full_image_review import prediction_coverage, review_panel, summarize_coverage
     states, predictions = defaultdict(BinaryMetrics), []
+    review_counts = defaultdict(int)
     histograms = defaultdict(lambda: np.zeros((2, 256), np.int64))
     temporal_error, temporal_count = 0.0, 0.0
     with torch.inference_mode():
@@ -642,12 +645,20 @@ def predict_main():
             path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(path, probability=probability.astype(np.float16))
             checked_write_image(output/"masks"/f"{index:07d}.png", (probability >= args.threshold).astype(np.uint8)*255)
+            coverage = prediction_coverage(probability, target, args.threshold)
+            review = None
+            if review_counts[row["scene_name"]] < args.review_images_per_scene:
+                review = output/"full_image_review"/f"{index:07d}.jpg"
+                checked_write_image(review, review_panel(original, probability, target, args.threshold))
+                review_counts[row["scene_name"]] += 1
             predictions.append({**row, "probability": str(path), "threshold": args.threshold,
+                "full_image_coverage": coverage, "full_image_review": str(review) if review else None,
                 "diagnostics_only": args.diagnostics_only, "segmenter_readiness": readiness,
                 "probability_sha256": digest(path), "source_image_sha256": digest(row["image"]),
                 "source_target_sha256": digest(row["target"]),
                 "source_ground_sha256": digest(row["ground_support"]) if row.get("ground_support") else None})
     write_rows(output/"predictions.jsonl", predictions)
+    write_json(output/"full_image_summary.json", summarize_coverage(predictions))
     write_json(output/"segmentation_metrics.json", {"checkpoint": str(Path(args.checkpoint).resolve()),
         "checkpoint_sha256": digest(args.checkpoint), "manifest_sha256": digest(args.manifest),
         "predictions_sha256": digest(output/"predictions.jsonl"), "threshold": args.threshold,

@@ -9,13 +9,17 @@ from shadow_occ.annotation.physics_labels import footprint_mask
 
 def independent_lit_receiver_mask(arrays, plane, directions, volumes, *, maximum_cells=64,
                                   minimum_L=30.0, minimum_contrast_L=6.0,
-                                  minimum_local_ratio=.98, maximum_log_change=.12):
+                                  minimum_local_ratio=.98, maximum_log_change=.12,
+                                  maximum_fraction=.1):
+    if maximum_cells < 1 or not 0 < maximum_fraction <= 1:
+        raise ValueError("Negative budget must be positive and fraction in (0,1]")
     receiver = np.asarray(arrays["receiver_valid"], bool)
     empty = np.zeros_like(receiver)
     details = {"protocol": "independent-lit-receiver-v1", "requires_positive_core": False,
         "minimum_L": minimum_L, "minimum_contrast_L": minimum_contrast_L,
         "minimum_local_ratio": minimum_local_ratio, "maximum_log_change": maximum_log_change,
-        "maximum_cells": maximum_cells}
+        "maximum_cells": maximum_cells, "maximum_fraction": maximum_fraction,
+        "selection": "spatial_tile_round_robin_brightness_rank"}
     if volumes is None:
         return empty, {**details, "reason": "missing_all_class_exclusion_volumes", "cells": 0}
     light = np.asarray(arrays["appearance_L_raw"], np.float64)
@@ -58,8 +62,21 @@ def independent_lit_receiver_mask(arrays, plane, directions, volumes, *, maximum
                 usable |= labels == identity
         indices = np.flatnonzero(usable)
         # Cap the pool independently of positive area, retaining observed evidence only.
-        budget = min(maximum_cells, max(1, int(np.ceil(supported.sum()*.1))))
-        order = np.argsort(-light[1].ravel()[indices], kind="stable")
-        result.ravel()[indices[order[:budget]]] = True
+        budget = min(maximum_cells, max(1, int(np.ceil(supported.sum()*maximum_fraction))))
+        # Spread the existing evidence over the receiver instead of concentrating
+        # every retained negative in the single brightest road patch.
+        yy, xx = np.unravel_index(indices, receiver.shape)
+        tiles = (yy*4//receiver.shape[0])*4 + xx*4//receiver.shape[1]
+        remaining, ordered = list(np.unique(tiles)), []
+        while remaining:
+            tile = remaining[0] if not ordered else max(remaining, key=lambda value:
+                min((value//4-other//4)**2+(value%4-other%4)**2 for other in ordered))
+            ordered.append(tile)
+            remaining.remove(tile)
+        queues = [indices[tiles == tile][np.argsort(-light[1].ravel()[indices[tiles == tile]], kind="stable")]
+                  for tile in ordered]
+        selected = [int(queue[level]) for level in range(max(map(len, queues), default=0))
+                    for queue in queues if level < len(queue)][:budget]
+        result.ravel()[selected] = True
     return result, {**details, "reason": "independent_observed_lit_receiver" if result.any() else "no_independent_lit_receiver",
                     "cells": int(result.sum()), "unlabelled_is_background": False}

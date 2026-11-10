@@ -58,6 +58,20 @@ def test_independent_negatives_do_not_require_shadow_core_and_have_a_budget():
     assert not details["unlabelled_is_background"]
 
 
+def test_negative_budget_expands_only_existing_evidence_and_spreads_spatially():
+    arrays = lit_arrays()
+    small, _ = independent_lit_receiver_mask(arrays, [0, 0, 1, 0], [[0, 0, -1]], [], maximum_cells=4)
+    large, details = independent_lit_receiver_mask(arrays, [0, 0, 1, 0], [[0, 0, -1]], [],
+                                                  maximum_cells=256, maximum_fraction=.25)
+    assert large.sum() > small.sum()
+    assert not large[:, :7].any()
+    assert ((large | small) == large).all()
+    assert small[:3].any() and small[-3:].any()
+    assert details["maximum_fraction"] == .25
+    with pytest.raises(ValueError, match="budget"):
+        independent_lit_receiver_mask(arrays, [0, 0, 1, 0], [], [], maximum_fraction=0)
+
+
 def test_independent_negatives_exclude_proposals_occlusion_and_unstable_appearance():
     arrays = lit_arrays()
     arrays["exclusion"][:, 7:] = True

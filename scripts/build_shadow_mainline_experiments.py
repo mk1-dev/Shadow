@@ -79,7 +79,7 @@ def negative_index(paths):
     return result
 
 
-def automatic_lit_negatives(clip, camera_frames):
+def automatic_lit_negatives(clip, camera_frames, *, maximum_cells=64, maximum_fraction=.1):
     """Combine shadow-neighbour negatives with independent observed lit receivers."""
     required = {"receiver_valid_by_frame", "bev_feature_valid"}
     ground_reference = clip["pair"].get("ground_motion_reference_valid_map")
@@ -136,7 +136,8 @@ def automatic_lit_negatives(clip, camera_frames):
         if aligned:
             independent, independent_detail = independent_lit_receiver_mask(
                 {**input_arrays, "receiver_valid": receiver & features, "exclusion": exclusion},
-                clip["protocol"]["ground_plane_world"], directions, volumes)
+                clip["protocol"]["ground_plane_world"], directions, volumes,
+                maximum_cells=maximum_cells, maximum_fraction=maximum_fraction)
         negative |= independent
         projected = project_mask(negative, arrays, frame, clip["protocol"]["ground_plane_world"])
         if frame.get("ground_sha256"):
@@ -159,7 +160,8 @@ def automatic_lit_negatives(clip, camera_frames):
 
 
 def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704), freeze_lock=None, auto_negatives=False,
-                  write_manual_template=False, negative_weight=0.5):
+                  write_manual_template=False, negative_weight=0.5, negative_maximum_cells=64,
+                  negative_maximum_fraction=.1):
     if not np.isfinite(negative_weight) or not 0 < negative_weight <= 1:
         raise ValueError("Weak-negative loss coefficient must be in (0, 1]")
     runs_path = Path(runs_path).resolve()
@@ -219,7 +221,8 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             input_hashes.update(clip["fingerprints"])
             automatic, automatic_details = ({}, {"frames": {}})
             if auto_negatives:
-                automatic, automatic_details = automatic_lit_negatives(clip, [cameras[(scene, camera, token)] for token in tokens])
+                automatic, automatic_details = automatic_lit_negatives(clip, [cameras[(scene, camera, token)] for token in tokens],
+                    maximum_cells=negative_maximum_cells, maximum_fraction=negative_maximum_fraction)
             for slot, token in enumerate(tokens):
                 frame, base = cameras[(scene, camera, token)]
                 if frame["camera_timestamp"] != clip["rows"][slot]["timestamp"]:
@@ -330,6 +333,8 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             row["supervision_tiers"] = {str(value): int((tier == value).sum()) for value in range(4)}
             counts[(method, split)]["core_positive_pixels"] += int((tier == 1).sum())
             counts[(method, split)]["expanded_positive_pixels"] += int((tier == 2).sum())
+            scene_counts[(method, split, scene)]["core_positive_pixels"] += int((tier == 1).sum())
+            scene_counts[(method, split, scene)]["expanded_positive_pixels"] += int((tier == 2).sum())
         rows[(method, split)].append(row)
         if automatic_negative.any():
             automatic_path = output/method/"automatic_negative_targets"/f"{name}.png"
@@ -381,6 +386,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         "independent_negative_rule_sha256": digest(Path(__file__).resolve().parents[1]/"shadow_occ/annotation/receiver_negatives.py"),
         "automatic_negative_rule": "observed_lit_receiver_union_v2" if auto_negatives else None,
         "negative_loss_weight": negative_weight,
+        "negative_budget": {"maximum_cells": negative_maximum_cells, "maximum_fraction": negative_maximum_fraction},
         "negative_weight_contract": "weak-negative reliability; class-balanced loss normalizes within each class, legacy loss applies an absolute coefficient",
         "overlapping_clip_merge": "union of positive observations per camera frame; conflicting negative evidence -> IGNORE"}
     for method in sorted({key[0] for key in rows}):
@@ -393,6 +399,9 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             detail = dict(counts[(method, split)])
             detail["scenes"] = sorted({row["scene_name"] for row in group})
             detail["negative_scenes"] = sorted({row["scene_name"] for row in group if row["resized_class_pixels"]["negative"] > 0})
+            detail["positive_scenes"] = sorted({row["scene_name"] for row in group if row["resized_class_pixels"]["positive"] > 0})
+            scene_positive = [scene_counts[(method, split, scene)]["resized_positive_pixels"] for scene in detail["scenes"]]
+            detail["largest_scene_positive_share"] = max(scene_positive)/sum(scene_positive) if sum(scene_positive) else None
             detail["both_classes_survive_resize"] = all(detail.get("resized_"+label+"_pixels", 0) > 0 for label in ("positive", "negative"))
             details[split] = detail
         summary["methods"][method] = details
@@ -556,6 +565,8 @@ def main():
     export.add_argument("--freeze-lock")
     export.add_argument("--auto-negatives", action="store_true", help="Generate physical weak negatives automatically from saved observations")
     export.add_argument("--negative-weight", type=float, default=0.5, help="Weak-negative loss coefficient, not a probability")
+    export.add_argument("--negative-maximum-cells", type=int, default=64)
+    export.add_argument("--negative-maximum-fraction", type=float, default=.1)
     export.add_argument("--manual-eval-template", action="store_true", help="Optional separate manual-evaluation task list; never required for training")
     suite = sub.add_parser("suite")
     suite.add_argument("--dataset-root", required=True)
@@ -577,7 +588,8 @@ def main():
     if min(args.size) < 1:
         raise ValueError("Image size must be positive")
     if args.command == "export":
-        result = build_dataset(args.runs, args.output_root, args.negative_manifests, args.size, args.freeze_lock, args.auto_negatives, args.manual_eval_template, args.negative_weight)
+        result = build_dataset(args.runs, args.output_root, args.negative_manifests, args.size, args.freeze_lock, args.auto_negatives, args.manual_eval_template, args.negative_weight,
+                               args.negative_maximum_cells, args.negative_maximum_fraction)
     else:
         result = prepare_suite(args.dataset_root, args.methods, args.output_root, args.size, args.epochs, args.batch_size, args.accumulation, args.seed,
                                args.backbone_weights, args.init_checkpoint, args.reference_method, args.scene_sampling, args.skip_untrainable,

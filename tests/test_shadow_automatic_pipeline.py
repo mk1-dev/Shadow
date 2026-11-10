@@ -205,7 +205,7 @@ def test_independent_negative_export_runs_without_positive_core_or_saved_light(t
     for path in (folder/"clip").glob("*_light_bank.npz"):
         path.unlink()
     called = []
-    def independent(arrays, plane, directions, volumes):
+    def independent(arrays, plane, directions, volumes, **kwargs):
         called.append((len(directions), volumes))
         return np.zeros((8, 8), bool), {"reason": "independent_test", "cells": 0}
     monkeypatch.setattr(module, "independent_lit_receiver_mask", independent)
