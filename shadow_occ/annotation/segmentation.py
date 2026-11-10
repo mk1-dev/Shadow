@@ -72,9 +72,9 @@ class ShadowDataset(Dataset):
                 raise ValueError("Pixel supervision changed since dataset export")
             with np.load(supervision["path"], allow_pickle=False) as archive:
                 tier, confidence = archive["tier"].copy(), archive["confidence"].astype(np.float32)
-            if (tier.shape != target.shape or confidence.shape != target.shape or not np.isin(tier, [0, 1, 2, 3]).all()
+            if (tier.shape != target.shape or confidence.shape != target.shape or not np.isin(tier, [0, 1, 2, 3, 4]).all()
                     or not np.isfinite(confidence).all() or ((confidence < 0) | (confidence > 1)).any()
-                    or not np.array_equal((tier == 1) | (tier == 2), target == 1)
+                    or not np.array_equal((tier == 1) | (tier == 2) | (tier == 4), target == 1)
                     or not np.array_equal(tier == 3, target == 0)
                     or ((target != 255) & (confidence <= 0)).any()):
                 raise ValueError("Invalid pixel confidence/tier trimap")
@@ -252,12 +252,12 @@ def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, n
 
 def layered_masked_loss(logits, target, tier, confidence, dice_weight, weights=None, class_weights=None,
                         negative_weights=None, *, expansion_scale=1., objective="class-balanced"):
-    """Keep expansion out of core Dice and preserve its absolute low weight.
+    """Keep expansion/inherited hypotheses out of confirmed-core Dice.
 
     Normalizing by confidence mass would cancel a uniform 0.25 expansion weight.
     Here the auxiliary BCE uses the unweighted expansion pixel count instead.
     """
-    core_target = torch.where(tier == 2, 255, target)
+    core_target = torch.where((tier == 2) | (tier == 4), 255, target)
     loss, terms = masked_loss(logits, core_target, dice_weight, weights, class_weights,
         negative_weights, return_components=True, objective=objective)
     active = (tier == 2) & (target == 1)
@@ -271,7 +271,17 @@ def layered_masked_loss(logits, target, tier, confidence, dice_weight, weights=N
         dist.all_reduce(global_values)
         totals = totals*dist.get_world_size()+(global_values-totals.detach()*dist.get_world_size())
     expansion = totals[0]/totals[1].clamp_min(1)
-    return loss+expansion_scale*expansion, {**terms, "expansion": expansion}
+    inherited = (tier == 4) & (target == 1)
+    inherited_coefficient = confidence.to(device=logits.device, dtype=torch.float32)*inherited
+    if weights is not None:
+        inherited_coefficient = inherited_coefficient*weights.to(inherited_coefficient).reshape(-1, 1, 1)
+    inherited_totals = torch.stack([(pixel_bce*inherited_coefficient).sum(), inherited.sum().to(dtype=torch.float32)])
+    if dist.is_available() and dist.is_initialized():
+        global_values = inherited_totals.detach().clone()
+        dist.all_reduce(global_values)
+        inherited_totals = inherited_totals*dist.get_world_size()+(global_values-inherited_totals.detach()*dist.get_world_size())
+    inherited_loss = inherited_totals[0]/inherited_totals[1].clamp_min(1)
+    return loss+expansion_scale*expansion+inherited_loss, {**terms, "expansion": expansion, "inherited": inherited_loss}
 
 
 def temporal_loss(current, previous, grid, weight, sample_weight=None):
@@ -458,6 +468,8 @@ def train_main():
             "image": "ordinary shuffled/distributed; no class oversampling",
             "supervision": "alternating negative/positive-support draws; uniform scene and image within each support pool"}[args.scene_sampling]
         write_json(output/"protocol.json", {**vars(args), "train_sha256": digest(args.train), "dev_sha256": digest(args.dev), "train_scenes": sorted(train_scenes), "dev_scenes": sorted(dev_scenes), "pixel_counts": class_counts.tolist(), "resized_pixel_counts": resized_counts.tolist(), "dev_resized_pixel_counts": dev_counts.tolist(), "effective_class_mass": effective_mass.tolist(), "pixel_loss_weights": pixel_weights, "sampler": sampler_contract, "approved_for_relabeling": False,
+            "pixel_supervision_tiers": {"0": "ignore", "1": "confirmed_or_legacy_strong", "2": "extension", "3": "lit_negative", "4": "inherited_weak_core"},
+            "inherited_loss_contract": "absolute confidence-weighted BCE from epoch zero; excluded from strong BCE/Dice; confidence mass is not the denominator",
             "expected_scene_sample_fraction": {scene: float(sum(probabilities[index] for index, row in enumerate(train) if row["scene_name"] == scene)) for scene in sorted({row["scene_name"] for row in train})},
             "negative_weight_contract": "relative reliability within the negative class; normalized global class means, no second inverse-frequency weight" if args.loss_mode == "class-balanced" else "per-row weak-negative loss coefficient; class balancing computed before reliability weighting",
             "sampler_class_support": {str(value): {"images": sum(row["sampling_class_pixels"][value] > 0 for row in train),
@@ -489,7 +501,7 @@ def train_main():
         set_segmenter_train_mode(model, freeze_backbone_stats=args.backbone_weights == "imagenet")
         optimizer.zero_grad(set_to_none=True)
         pair_weight_sum, pair_loss_sum, pair_batches = 0.0, 0.0, 0
-        train_totals = torch.zeros(7, device=device, dtype=torch.float64)
+        train_totals = torch.zeros(8, device=device, dtype=torch.float64)
         expansion_scale = min(1., max(0., (epoch-args.expansion_warmup_epochs+1)/args.expansion_ramp_epochs))
         optimizer_totals = torch.zeros(3, device=device, dtype=torch.float64)
         for step, batch in enumerate(tqdm(loader, desc=f"segmenter epoch {epoch}", disable=rank != 0)):
@@ -533,6 +545,7 @@ def train_main():
                     train_totals[:5] += torch.stack([loss, terms["bce"], terms["dice"], temporal_value, pair_value]).detach().double()*len(images)
                     train_totals[5] += len(images)
                     train_totals[6] += terms["expansion"].detach().double()*len(images)
+                    train_totals[7] += terms["inherited"].detach().double()*len(images)
                     loss = loss/window
                 scaler.scale(loss).backward()
             if boundary:
@@ -557,6 +570,7 @@ def train_main():
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
         train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
             expansion_loss=totals[6]/max(totals[5], 1), expansion_scale=expansion_scale,
+            inherited_weak_loss=totals[7]/max(totals[5], 1),
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
             reduction="global supervised class means per microbatch; epoch mean weighted by images before accumulation scaling" if args.loss_mode == "class-balanced"
                 else "sample-mean before gradient accumulation scaling, across all DDP ranks")

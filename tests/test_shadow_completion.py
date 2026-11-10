@@ -34,7 +34,8 @@ def test_completion_preserves_core_and_expands_only_independently_supported_visi
     result = complete_visible_shadow(*args, illumination=illumination(args))
     assert result["expanded_mask"].sum() > args[1].sum()
     assert (result["target"][args[1]] == 1).all()
-    assert (result["confidence"][args[1]] == 1).all()
+    assert (result["confidence"][args[1]] == CompletionConfig().inherited_core_weight).all()
+    assert (result["tier"][args[1]] == 4).all()
     assert (result["confidence"][result["expanded_mask"]] <= .25).all()
     assert (result["target"][:, 25:] == 255).all()
     assert not result["visible_mask"][:, 25:].any()
@@ -92,6 +93,56 @@ def test_inherited_static_cores_survive_without_new_illumination():
     result = complete_visible_shadow(*args)
     np.testing.assert_array_equal(result["target"] == 1, args[1])
     assert not result["expanded_mask"].any()
+    assert not result["core_mask"].any()
+    assert (result["tier"][args[1]] == 4).all()
+
+
+def test_joint_four_cue_evidence_can_confirm_new_core_without_legacy_labels():
+    pytest.importorskip("maxflow")
+    args = list(example())
+    args[1][:] = False
+    observed = region_event(args)
+    result = complete_visible_shadow(*args, illumination=observed)
+    confirmed = result["core_mask"]
+    assert confirmed.any()
+    assert not (confirmed & ~observed["joint_onset"]).any()
+    assert (result["tier"][confirmed] == 1).all()
+    assert (result["confidence"][confirmed] == 1).all()
+    assert not (confirmed & result["expanded_mask"]).any()
+
+
+@pytest.mark.parametrize("missing", ["anchor", "physics", "fsd", "rgb", "correspondence", "event"])
+def test_confirmed_core_requires_all_four_cues(missing):
+    pytest.importorskip("maxflow")
+    args = list(example())
+    observed = region_event(args)
+    if missing == "anchor":
+        observed["anchor_available"][:] = False
+    elif missing == "physics":
+        args[-1][:] = False
+    elif missing == "fsd":
+        args[3][:] = 0
+    elif missing == "rgb":
+        observed["qualified"][:] = False
+    elif missing == "correspondence":
+        observed["correspondence_quality"][:] = 0
+    else:
+        observed["joint_onset"][:] = False
+    result = complete_visible_shadow(*args, illumination=observed)
+    assert not result["core_mask"].any()
+    assert (result["target"][args[1]] == 1).all()
+    assert (result["tier"][args[1]] == 4).all()
+
+
+def test_static_joint_spatial_support_increases_weak_weight_without_claiming_an_event():
+    pytest.importorskip("maxflow")
+    args = example()
+    observed = region_event(args)
+    observed["joint_onset"][:] = False
+    observed["observed_pair"] = np.ones(args[1].shape, bool)
+    result = complete_visible_shadow(*args, illumination=observed)
+    assert not result["core_mask"].any()
+    assert (result["confidence"][args[1]] == CompletionConfig().static_supported_core_weight).all()
 
 
 def test_expansion_confidence_tracks_illumination_not_saturated_prior():
@@ -229,6 +280,52 @@ def test_export_retains_tiers_and_confidence_through_dataset_merge(tmp_path):
         assert np.allclose(archive["confidence"][40:44, 40:44], .2)
         assert (archive["confidence"][archive["tier"] == 1] == 1).all()
     assert digest(row["pixel_supervision"]["path"]) == row["pixel_supervision"]["sha256"]
+
+
+def test_export_keeps_unconfirmed_core_out_of_strong_core_tier(tmp_path):
+    from tests.test_shadow_mainline_experiments import data_fixture
+    from tests.test_bev_flow_ablations import script
+    from pathlib import Path
+    runs, negatives = data_fixture(tmp_path)
+    for run in read_rows(runs):
+        if run["method"] != "anchor":
+            continue
+        path = Path(run["run_root"])/"clip/001_image.npz"
+        with np.load(path) as archive:
+            payload = {key: archive[key] for key in archive.files}
+        inherited = payload["shadow_target_image"] == 1
+        payload["shadow_core_image"] = np.zeros_like(inherited)
+        payload["shadow_weak_core_image"] = inherited
+        payload["shadow_confidence_image"] = inherited.astype(np.float32)*.25
+        np.savez_compressed(path, **payload)
+    output = tmp_path/"dataset"
+    script("build_shadow_mainline_experiments").build_dataset(runs, output, [negatives], size=(80, 80))
+    row = next(row for row in read_rows(output/"anchor/seg_train.jsonl") if row.get("pixel_supervision"))
+    with np.load(row["pixel_supervision"]["path"]) as archive:
+        weak = archive["tier"] == 4
+        assert weak.any()
+        assert not (archive["tier"] == 1).any()
+        assert (archive["confidence"][weak] == .25).all()
+
+
+def test_inherited_weak_loss_preserves_absolute_confidence_and_works_during_warmup():
+    torch = pytest.importorskip("torch")
+    from shadow_occ.annotation.segmentation import layered_masked_loss
+    tier = torch.tensor([[[4, 3, 2, 0]]])
+    target = torch.tensor([[[1, 0, 1, 255]]])
+    confidence = torch.tensor([[[.25, 1., .1, 0.]]])
+    logits = torch.zeros(1, 1, 1, 4, requires_grad=True)
+    loss, terms = layered_masked_loss(logits, target, tier, confidence, .5, expansion_scale=0)
+    loss.backward()
+    assert logits.grad[0, 0, 0, 0].item() == pytest.approx(-.125)
+    assert logits.grad[0, 0, 0, 2].item() == 0
+    assert logits.grad[0, 0, 0, 3].item() == 0
+    assert terms["dice"].item() == 0  # Weak inherited positives cannot create strong Dice supervision.
+    assert terms["inherited"].item() == pytest.approx(.25*np.log(2))
+    half = confidence.clone()
+    half[0, 0, 0] *= .5
+    _, smaller = layered_masked_loss(logits, target, tier, half, .5, expansion_scale=0)
+    assert smaller["inherited"].item() == pytest.approx(terms["inherited"].item()*.5)
 
 
 def test_layered_loss_does_not_cancel_expansion_weight_or_train_during_warmup():

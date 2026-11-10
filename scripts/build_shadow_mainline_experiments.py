@@ -231,10 +231,12 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                 image_evidence = clip["images"][slot]
                 layered = "shadow_confidence_image" in image_evidence
                 core = image_evidence.get("shadow_core_image", saved == 1).astype(bool)
+                weak_core = image_evidence.get("shadow_weak_core_image", np.zeros_like(core)).astype(bool)
                 reliability = image_evidence.get("shadow_confidence_image", (saved == 1).astype(np.float32))
                 if (core.shape != saved.shape or reliability.shape != saved.shape
                         or not np.isfinite(reliability).all() or ((reliability < 0) | (reliability > 1)).any()
-                        or (core & (saved != 1)).any() or ((saved == 1) & (reliability <= 0)).any()):
+                        or weak_core.shape != saved.shape or (weak_core & core).any()
+                        or ((core | weak_core) & (saved != 1)).any() or ((saved == 1) & (reliability <= 0)).any()):
                     raise ValueError("Invalid layered image supervision")
                 if not np.isin(saved, [1, 255]).all():
                     raise ValueError("Video teacher contract is positive/IGNORE; use explicit negative evidence")
@@ -257,7 +259,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                     "automatic_negative_evidence": automatic_details["frames"].get(str(slot), {"reason": automatic_details.get("reason", "disabled")})}
                 frame_negative = automatic.get(slot, np.zeros(shape, bool))
                 if identity not in records:
-                    merged = {"positive": saved == 1, "core": core, "confidence": reliability,
+                    merged = {"positive": saved == 1, "core": core, "weak_core": weak_core, "confidence": reliability,
                               "score": score if score is not None else np.zeros(shape, np.float32),
                               "score_support": score_info["support"] if score_info else np.zeros(shape, bool), "negative": frame_negative}
                     records[identity] = {"image": image,
@@ -272,6 +274,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                         merged = {key: archive[key] for key in archive.files}
                     merged["positive"] |= saved == 1
                     merged["core"] |= core
+                    merged["weak_core"] |= weak_core
                     merged["confidence"] = np.maximum(merged["confidence"], reliability)
                     previous["layered"] |= layered
                     merged["negative"] |= frame_negative
@@ -322,6 +325,7 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
         if record["layered"]:
             tier = np.zeros(target.shape, np.uint8)
             tier[(target == 1) & ~merged["core"]] = 2
+            tier[(target == 1) & merged["weak_core"]] = 4
             tier[(target == 1) & merged["core"]] = 1
             tier[target == 0] = 3
             reliability = np.where(target == 1, merged["confidence"], (target == 0).astype(np.float32))
@@ -330,7 +334,9 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
             supervision.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(supervision, confidence=reliability, tier=tier)
             row["pixel_supervision"] = {"path": str(supervision), "sha256": digest(supervision)}
-            row["supervision_tiers"] = {str(value): int((tier == value).sum()) for value in range(4)}
+            row["supervision_tiers"] = {str(value): int((tier == value).sum()) for value in range(5)}
+            counts[(method, split)]["inherited_weak_positive_pixels"] += int((tier == 4).sum())
+            scene_counts[(method, split, scene)]["inherited_weak_positive_pixels"] += int((tier == 4).sum())
             counts[(method, split)]["core_positive_pixels"] += int((tier == 1).sum())
             counts[(method, split)]["expanded_positive_pixels"] += int((tier == 2).sum())
             scene_counts[(method, split, scene)]["core_positive_pixels"] += int((tier == 1).sum())

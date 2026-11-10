@@ -399,7 +399,8 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     assert len((tmp_path/"clip/region_memory.jsonl").read_text().splitlines()) == 3
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
-    assert protocol["protocol"] == ("event-anchored-region-shadow-completion-v9.3" if prior_enabled else "entity-shadow-disentangled-video-v8")
+    from shadow_occ.annotation.shadow_completion import COMPLETION_PROTOCOL
+    assert protocol["protocol"] == (COMPLETION_PROTOCOL if prior_enabled else "entity-shadow-disentangled-video-v8")
     if prior_enabled:
         with np.load(tmp_path/"clip/001_image.npz", allow_pickle=False) as archive:
             assert "shadow_core_image" in archive.files

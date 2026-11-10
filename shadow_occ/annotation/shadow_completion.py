@@ -12,7 +12,7 @@ from scipy.ndimage import binary_propagation, distance_transform_edt
 from shadow_occ.annotation.data import digest, read_rows, resolve_path
 from shadow_occ.annotation.physics_labels import footprint_mask
 
-COMPLETION_PROTOCOL = "event-anchored-region-shadow-completion-v9.3"
+COMPLETION_PROTOCOL = "four-cue-shadow-supervision-v9.4"
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,37 @@ class CompletionConfig:
     region_growth_color_distance: float = 12.
     region_minimum_joint_pixels: int = 4
     region_inference_weight: float = .1
+    inherited_core_weight: float = .25
+    static_supported_core_weight: float = .5
+
+
+def four_cue_core_support(core, direct, receiver, prior, envelope, illumination, config):
+    """Separate current joint observations from inherited physical hypotheses.
+
+    Static inherited shadows survive without an event, but do not acquire the
+    same supervision strength as newly corroborated physical/appearance events.
+    """
+    confirmed = np.zeros_like(core)
+    static = np.zeros_like(core)
+    if illumination is not None:
+        available = np.asarray(illumination.get("anchor_available", confirmed), bool)
+        observed = np.asarray(illumination.get("observed_pair", confirmed), bool)
+        correspondence = np.asarray(illumination.get("correspondence_quality", confirmed), np.float32)
+        conflict = np.asarray(illumination.get("shadow_state_conflict", confirmed), np.float32)
+        spatial = receiver & envelope & available & (prior >= config.prior_seed)
+        spatial &= (correspondence > 0) & (conflict < .05)
+        joint = (np.asarray(illumination.get("joint_onset", confirmed), bool)
+                 | np.asarray(illumination.get("joint_recovery", confirmed), bool))
+        confirmed = (core | direct) & spatial & illumination["qualified"] & joint
+        static = core & spatial & observed & ~confirmed
+    weak = core & ~confirmed
+    weights = np.zeros(core.shape, np.float32)
+    weights[weak] = config.inherited_core_weight
+    weights[static] = config.static_supported_core_weight
+    weights[confirmed] = 1.
+    status = np.zeros(core.shape, np.uint8)
+    status[weak], status[static], status[confirmed] = 1, 2, 3
+    return confirmed, weak, weights, status
 
 
 class ShadowPriorCache:
@@ -226,7 +257,7 @@ def complete_visible_shadow(image, core, receiver, prior, cross, appearance, env
     seeds = (core | (prior >= config.prior_seed) | (cross >= config.cross_seed) | dynamic) & receiver & ~negative
     target = np.full(shape, 255, np.uint8)
     weight = np.zeros(shape, np.float32)
-    tier = np.zeros(shape, np.uint8)  # 0=unknown, 1=core, 2=expansion, 3=negative
+    tier = np.zeros(shape, np.uint8)  # 0=unknown, 1=confirmed, 2=expansion, 3=negative, 4=inherited
     completed = np.zeros(shape, bool)
     if seeds.any():
         import maxflow
@@ -282,11 +313,16 @@ def complete_visible_shadow(image, core, receiver, prior, cross, appearance, env
     target[extended | core] = 1
     weight[extended] = config.expansion_weight*np.clip(evidence[extended], 0, 1)
     weight[inferred] = inference_weight[inferred]
-    weight[core] = 1.
-    tier[extended], tier[core] = 2, 1
+    confirmed, weak_core, core_weight, core_status = four_cue_core_support(
+        core, direct, receiver, prior, envelope, illumination, config)
+    weight[core | confirmed] = core_weight[core | confirmed]
+    tier[extended], tier[weak_core], tier[confirmed] = 2, 4, 1
+    extended &= ~confirmed
+    direct &= ~confirmed
     known_negative = negative & receiver & ~completed
     target[known_negative], weight[known_negative], tier[known_negative] = 0, 1., 3
-    return {"visible_mask": completed, "core_mask": core, "expanded_mask": extended,
+    return {"visible_mask": completed, "core_mask": confirmed, "expanded_mask": extended,
+        "inherited_core_mask": core, "weak_core_mask": weak_core, "core_evidence_status": core_status,
         "direct_expanded_mask": direct, "region_inferred_mask": inferred,
         "unsupported_static_prior": completed & (prior >= config.prior_seed) & ~core & ~dynamic & ~inferred,
         "target": target, "confidence": weight, "tier": tier,

@@ -103,7 +103,8 @@ def test_parallel_annotation_resumes_complete_scenes_and_preserves_partial_outpu
         for clip in clips:
             folder = output/clip["id"]
             folder.mkdir()
-            (folder/"protocol.json").write_text(json.dumps({"clip": clip, "protocol": "event-anchored-region-shadow-completion-v9.3"}))
+            from shadow_occ.annotation.shadow_completion import COMPLETION_PROTOCOL
+            (folder/"protocol.json").write_text(json.dumps({"clip": clip, "protocol": COMPLETION_PROTOCOL}))
             write_rows(folder/"frames.jsonl", [{"frame_token": clip["id"], "timestamp": 1}])
         (output/"summary.json").write_text('{}')
         calls.append(output)
