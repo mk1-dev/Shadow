@@ -906,8 +906,17 @@ observe entity surfaces; physical weak labels still require visible ground.
 The comparison reports candidate counts, stage runtime, weak positives and
 owner assignments. Shadow preservation requires independent review masks.
 
-The opt-in [v9 discrepancy-guided completion path](docs/shadow_v9_completion.md)
+The opt-in [v9.3 event-anchored completion path](docs/shadow_v9_completion.md)
 adds a pinned external FSD shadow prior in parallel with BEV/flow discovery,
-visible-ground graph-cut completion, separate hidden-state hypotheses, and
-confidence-tiered student supervision. It does not replace the frozen v8+
-baseline or change its physical acceptance/owner thresholds.
+confidence-labelled dense receiver interpolation, and signed same-world
+illumination proposals. Graph Cut completes candidate shapes; new labels
+require independent temporal illumination and physical support. Static FSD-only
+dark regions stay IGNORE. Pre-FSD v8+ cores are inherited separately through
+`--core-reference-root`; the frozen baseline and M3 owner thresholds remain
+unchanged. Existing prior caches can be replayed on CPU without new downloads.
+Ground-warped FSD semantic changes now jointly support RGB illumination events
+in caster reasoning. `scripts/run_shadow_completion_training.py` expands cached
+scenes and runs matched core-only/new-teacher segmenter training and held-out
+teacher agreement without rebuilding nuScenes, flow or BEV.
+Joint events can seed bounded, Lab-connected interior inference with a separate
+mask and lower training confidence; FSD or a static core alone cannot trigger it.

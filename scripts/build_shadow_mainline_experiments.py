@@ -196,7 +196,13 @@ def build_dataset(runs_path, output_root, negative_manifests=(), size=(384, 704)
                 if official.setdefault(identity, pair["official_split"]) != pair["official_split"]:
                     raise ValueError("Conflicting official scene splits")
         input_hashes.update({str(path): digest(path) for path in pair_paths})
-        for key, entry in find_clips(root).items():
+        entries = find_clips(root)
+        selected = set(run["clip_ids"]) if "clip_ids" in run else None
+        if selected is not None and (not selected or not selected <= {entry[1]["clip"]["id"] for entry in entries.values()}):
+            raise ValueError("Selected comparison clips are absent from the actual teacher run")
+        for key, entry in entries.items():
+            if selected is not None and entry[1]["clip"]["id"] not in selected:
+                continue
             scene, camera, tokens = key
             if split == "eval" and scene in development:
                 raise ValueError("Independent eval cannot reuse teacher-development scenes")

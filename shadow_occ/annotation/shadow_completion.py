@@ -7,9 +7,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.ndimage import binary_propagation, distance_transform_edt
 
 from shadow_occ.annotation.data import digest, read_rows, resolve_path
 from shadow_occ.annotation.physics_labels import footprint_mask
+
+COMPLETION_PROTOCOL = "event-anchored-region-shadow-completion-v9.3"
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,10 @@ class CompletionConfig:
     pairwise_weight: float = .8
     color_sigma: float = 15.
     expansion_weight: float = .25
+    region_growth_radius_px_at_800: float = 12.
+    region_growth_color_distance: float = 12.
+    region_minimum_joint_pixels: int = 4
+    region_inference_weight: float = .1
 
 
 class ShadowPriorCache:
@@ -38,7 +45,7 @@ class ShadowPriorCache:
             "protocol": json.loads(protocol.read_text(encoding="utf-8")),
             "protocol_sha256": digest(protocol)}
 
-    def load(self, frame, scene, camera, image_path):
+    def load(self, frame, scene, camera, image_path, *, return_semantic=False):
         row = self.rows[frame["sample_data_token"]]
         if (row["scene_name"], row["camera"], row["timestamp"]) != (scene, camera, frame["camera_timestamp"]):
             raise ValueError("Shadow prior differs from camera identity/time")
@@ -49,17 +56,50 @@ class ShadowPriorCache:
             raise ValueError("Shadow prior response changed")
         with np.load(path, allow_pickle=False) as archive:
             response = np.asarray(archive["binary_response"], np.float32)
+            semantic = np.asarray(archive["semantic_probability"], np.float32) if "semantic_probability" in archive else None
         shape = tuple(frame["image_size_wh"][::-1])
         if response.shape != shape or not np.isfinite(response).all() or (response < 0).any():
             raise ValueError("Shadow prior needs finite nonnegative calibrated-image responses")
-        return np.clip(response, 0, 1)
+        if semantic is not None and (semantic.shape != shape or not np.isfinite(semantic).all()
+                                     or ((semantic < 0) | (semantic > 1)).any()):
+            raise ValueError("FSD semantic state must use its existing sigmoid output")
+        binary = np.clip(response, 0, 1)
+        return (binary, semantic) if return_semantic else binary
+
+
+class PhysicalCoreReference:
+    """Inherited v8+ labels, never cores accepted after adding the FSD prior."""
+    def __init__(self, root):
+        from shadow_occ.annotation.video_review import find_clips
+        self.entries = find_clips(root)
+        if any(entry[1].get("shadow_prior") is not None for entry in self.entries.values()):
+            raise ValueError("Core reference must be independent of the pretrained shadow prior")
+
+    def load(self, clip, frames, images):
+        from shadow_occ.annotation.video_review import artifact_path
+        key = (clip["scene_name"], clip["camera"], tuple(frame["sample_data_token"] for frame in frames))
+        folder, protocol, rows = self.entries[key]
+        masks, sources = [], []
+        for slot, (frame, image, row) in enumerate(zip(frames, images, rows)):
+            if frame["camera_timestamp"] != row["timestamp"]:
+                raise ValueError("Physical reference and current RGB timestamps differ")
+            path = artifact_path(folder, row.get("image_representation"), f"{slot:03d}_image.npz")
+            with np.load(path, allow_pickle=False) as archive:
+                target = archive["shadow_target_image"]
+            if target.shape != image.shape[:2] or not np.isin(target, [1, 255]).all():
+                raise ValueError("Inherited cores require calibrated image-space positive/IGNORE labels")
+            masks.append(target == 1)
+            sources.append({"path": str(path), "sha256": digest(path)})
+        return masks, {"protocol_sha256": digest(folder/"protocol.json"), "sources": sources,
+                       "semantics": "inherited weak physical labels, not independent shadow GT"}
 
 
 def fuse_prior_proposals(maps, responses, coordinates, config=CompletionConfig()):
     """Union only: neither the prior nor a missing flow can veto cross-space seeds."""
     from shadow_occ.annotation.physics_motion import sample_at
     sampled = np.stack([sample_at(response, uv) for response, uv in zip(responses, coordinates)])
-    sampled = np.where(maps["receiver_valid_by_frame"], np.nan_to_num(sampled), 0).astype(np.float32)
+    domain = maps.get("completion_receiver_valid_by_frame", maps["receiver_valid_by_frame"])
+    sampled = np.where(domain, np.nan_to_num(sampled), 0).astype(np.float32)
     prior_seed = sampled >= config.prior_seed
     before = maps["proposal_score_map"].copy()
     maps["shadow_prior_response"] = sampled
@@ -126,8 +166,40 @@ def native_illumination_evidence(images, receivers, frames, basis, exposures, sl
     return score, support
 
 
+def event_anchored_interiors(image, completed, receiver, prior, envelope, illumination, config):
+    """Bounded, color-connected inference from actual joint events, not old cores."""
+    result = np.zeros(receiver.shape, bool)
+    confidence = np.zeros(receiver.shape, np.float32)
+    if illumination is None or "joint_onset" not in illumination:
+        return result, confidence
+    joint = illumination["joint_onset"] | illumination["joint_recovery"]
+    seeds = joint & illumination["qualified"] & completed & receiver & envelope
+    seeds &= illumination["score"] > 0
+    if int(seeds.sum()) < config.region_minimum_joint_pixels:
+        return result, confidence
+    radius = config.region_growth_radius_px_at_800*image.shape[1]/800.
+    distance, nearest = distance_transform_edt(~seeds, return_indices=True)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    color = np.linalg.norm(lab-lab[nearest[0], nearest[1]], axis=-1)
+    domain = completed & receiver & envelope & (prior >= config.prior_seed)
+    domain &= (distance <= radius) & (color <= config.region_growth_color_distance)
+    domain &= illumination["anchor_available"] & (illumination["correspondence_quality"] > 0)
+    domain &= illumination["shadow_state_conflict"] < .05
+    _, components = cv2.connectedComponents(domain.astype(np.uint8), connectivity=8)
+    counts = np.bincount(components[seeds & domain])
+    supported = np.flatnonzero(counts >= config.region_minimum_joint_pixels)
+    supported = supported[supported != 0]
+    domain &= np.isin(components, supported)
+    result = binary_propagation(seeds & domain, structure=np.ones((3, 3), bool), mask=domain)
+    strength = illumination["score"][nearest[0], nearest[1]]
+    confidence[result] = (config.region_inference_weight*strength[result]
+        *np.exp(-distance[result]/max(radius, 1e-6))
+        *illumination["correspondence_quality"][result])
+    return result, confidence
+
+
 def complete_visible_shadow(image, core, receiver, prior, cross, appearance, envelope, *,
-                            negative=None, config=CompletionConfig()):
+                            negative=None, illumination=None, config=CompletionConfig()):
     """Graph-cut candidate shape; only independently supported pixels get labels.
 
     PyMaxflow minimizes a binary contrast-sensitive Potts energy. Semantic-only
@@ -146,7 +218,12 @@ def complete_visible_shadow(image, core, receiver, prior, cross, appearance, env
     prior, cross, appearance = [np.clip(np.nan_to_num(value), 0, 1).astype(np.float32)
                                 for value in (prior, cross, appearance)]
     core = core & receiver
-    seeds = (core | (prior >= config.prior_seed) | (cross >= config.cross_seed)) & receiver & ~negative
+    dynamic = np.zeros(shape, bool) if illumination is None else np.array(illumination["qualified"], bool, copy=True)
+    evidence = np.zeros(shape, np.float32) if illumination is None else np.asarray(illumination["score"], np.float32)
+    if dynamic.shape != shape or evidence.shape != shape or not np.isfinite(evidence).all():
+        raise ValueError("Independent illumination evidence must share RGB coordinates")
+    dynamic &= receiver & ~negative
+    seeds = (core | (prior >= config.prior_seed) | (cross >= config.cross_seed) | dynamic) & receiver & ~negative
     target = np.full(shape, 255, np.uint8)
     weight = np.zeros(shape, np.float32)
     tier = np.zeros(shape, np.uint8)  # 0=unknown, 1=core, 2=expansion, 3=negative
@@ -160,7 +237,7 @@ def complete_visible_shadow(image, core, receiver, prior, cross, appearance, env
         domain = receiver[section] & ~negative[section]
         # Fixed seeds carry spatial identity; the prior supplies shape rather than
         # multiplying away an independent cross-space illumination observation.
-        unary = np.maximum(np.maximum(prior[section], cross[section]), .55*appearance[section])
+        unary = np.maximum(np.maximum(prior[section], cross[section]), np.where(dynamic[section], evidence[section], 0))
         unary = np.clip(unary, .01, .99)
         background_cost, foreground_cost = -np.log1p(-unary), -np.log(unary)
         lab = cv2.cvtColor(image[section], cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -194,18 +271,25 @@ def complete_visible_shadow(image, core, receiver, prior, cross, appearance, env
     core_connected = np.isin(components, core_ids[core_ids != 0])
     # No exact per-pixel box intersection: near-feasible projections bound the
     # extension; independent illumination plus semantic/cross evidence licenses it.
-    extended = completed & envelope & (appearance >= config.appearance_minimum) & ~core
+    extended = completed & envelope & dynamic & ~core
     extended &= ((prior >= config.prior_seed) | (cross >= config.cross_seed)
-                 | (core_connected & (appearance >= config.cross_seed)))
+                 | core_connected | (evidence >= config.appearance_minimum))
+    direct = extended.copy()
+    inferred, inference_weight = event_anchored_interiors(image, completed, receiver & ~negative,
+        prior, envelope, illumination, config)
+    inferred &= ~core & ~direct
+    extended |= inferred
     target[extended | core] = 1
-    extension_support = np.maximum(np.maximum(prior, cross), appearance*core_connected)
-    weight[extended] = config.expansion_weight*extension_support[extended]
+    weight[extended] = config.expansion_weight*np.clip(evidence[extended], 0, 1)
+    weight[inferred] = inference_weight[inferred]
     weight[core] = 1.
     tier[extended], tier[core] = 2, 1
     known_negative = negative & receiver & ~completed
     target[known_negative], weight[known_negative], tier[known_negative] = 0, 1., 3
     return {"visible_mask": completed, "core_mask": core, "expanded_mask": extended,
+        "direct_expanded_mask": direct, "region_inferred_mask": inferred,
+        "unsupported_static_prior": completed & (prior >= config.prior_seed) & ~core & ~dynamic & ~inferred,
         "target": target, "confidence": weight, "tier": tier,
         "candidate_source_bits": (prior >= config.prior_seed).astype(np.uint8)*16
                                  | (cross >= config.cross_seed).astype(np.uint8)*8
-                                 | (core_connected & (appearance >= config.cross_seed)).astype(np.uint8)*32}
+                                 | dynamic.astype(np.uint8)*32 | inferred.astype(np.uint8)*64}

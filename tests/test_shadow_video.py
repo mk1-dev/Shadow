@@ -360,8 +360,12 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
         monkeypatch.setattr(module, "factorized_shadow_decision", forbidden)
     class Prior:
         provenance = {"test_fixture": True}
-        def load(self, frame, scene, camera, path):
-            return np.full((64, 64), .8, np.float32)
+        def load(self, frame, scene, camera, path, *, return_semantic=False):
+            response = np.full((64, 64), .8, np.float32)
+            return (response, response.copy()) if return_semantic else response
+    class CoreReference:
+        def load(self, clip, frames, images):
+            return [np.zeros(image.shape[:2], bool) for image in images], {"test_fixture": True}
     if prior_enabled:
         pytest.importorskip("maxflow")
         for frame in frames:
@@ -369,6 +373,7 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     result = module.run_clip({"id": "test", "track_id": "car", "scene_name": "scene1", "camera": "CAM_FRONT"}, pairs,
         inputs, context, tmp_path/"clip", VideoShadowConfig(), stage=stage,
         shadow_prior=Prior() if prior_enabled else None,
+        core_reference=CoreReference() if prior_enabled else None,
         reviews={"cam1": [{"region_type": "shadow", "mask": np.ones((64, 64), bool)}]})
     assert result["frames"] == 3 and result["regions"] > 0
     with np.load(tmp_path/"clip/001.npz", allow_pickle=False) as archive:
@@ -394,7 +399,7 @@ def test_clip_runner_exports_video_masks_and_separate_shadow_bev(tmp_path, monke
     assert len((tmp_path/"clip/region_memory.jsonl").read_text().splitlines()) == 3
     assert cv2.imread(str(tmp_path/"clip/001_target.png"), cv2.IMREAD_GRAYSCALE).shape == (64, 64)
     protocol = json.loads((tmp_path/"clip/protocol.json").read_text())
-    assert protocol["protocol"] == ("discrepancy-guided-shadow-completion-v9" if prior_enabled else "entity-shadow-disentangled-video-v8")
+    assert protocol["protocol"] == ("event-anchored-region-shadow-completion-v9.3" if prior_enabled else "entity-shadow-disentangled-video-v8")
     if prior_enabled:
         with np.load(tmp_path/"clip/001_image.npz", allow_pickle=False) as archive:
             assert "shadow_core_image" in archive.files

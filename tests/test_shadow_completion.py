@@ -6,7 +6,7 @@ import pytest
 
 from shadow_occ.annotation.data import checked_write_image, digest, read_rows, write_rows
 from shadow_occ.annotation.shadow_completion import (CompletionConfig, ShadowPriorCache,
-    complete_visible_shadow, fuse_prior_proposals, native_illumination_evidence, plausible_projection_envelope)
+    PhysicalCoreReference, complete_visible_shadow, fuse_prior_proposals, native_illumination_evidence, plausible_projection_envelope)
 
 
 def example():
@@ -23,11 +23,15 @@ def example():
     return image, core, receiver, prior, np.zeros_like(prior), appearance, envelope
 
 
+def illumination(args):
+    return {"qualified": args[5] > .05, "score": args[5].copy()}
+
+
 def test_completion_preserves_core_and_expands_only_independently_supported_visible_pixels():
     pytest.importorskip("maxflow")
     args = list(example())
     args[2][:, 25:] = False
-    result = complete_visible_shadow(*args)
+    result = complete_visible_shadow(*args, illumination=illumination(args))
     assert result["expanded_mask"].sum() > args[1].sum()
     assert (result["target"][args[1]] == 1).all()
     assert (result["confidence"][args[1]] == 1).all()
@@ -43,7 +47,7 @@ def test_prior_only_is_a_candidate_not_a_positive_label(missing):
     args = list(example())
     args[1][:] = False
     args[5 if missing == "appearance" else 6][:] = 0
-    result = complete_visible_shadow(*args)
+    result = complete_visible_shadow(*args, illumination=illumination(args))
     assert result["visible_mask"].any()
     assert not (result["target"] == 1).any()
 
@@ -53,7 +57,7 @@ def test_cross_space_seed_does_not_need_a_pretrained_positive():
     args = list(example())
     args[4] = args[3].copy()
     args[3][:] = 0
-    result = complete_visible_shadow(*args)
+    result = complete_visible_shadow(*args, illumination=illumination(args))
     assert result["expanded_mask"].any()
     assert (result["candidate_source_bits"][result["expanded_mask"]] & 8).all()
     assert not (result["candidate_source_bits"] & 16).any()
@@ -64,9 +68,96 @@ def test_native_illumination_can_fill_a_prior_hole_connected_to_physical_core():
     args = list(example())
     args[3][18:20, 18:20] = 0
     args[5][18:20, 18:20] = 1
-    result = complete_visible_shadow(*args)
+    result = complete_visible_shadow(*args, illumination=illumination(args))
     assert result["expanded_mask"][18:20, 18:20].all()
     assert (result["confidence"][18:20, 18:20] > 0).all()
+
+
+def test_static_dark_material_cannot_bootstrap_new_cores_from_fsd_and_projection():
+    pytest.importorskip("maxflow")
+    args = list(example())
+    args[1][:] = False
+    args[4][:] = 1  # Even strong BEV-assisted appearance is not an illumination event.
+    args[5][:] = 1
+    result = complete_visible_shadow(*args)
+    assert result["visible_mask"].any()
+    assert result["unsupported_static_prior"].any()
+    assert (result["target"] == 255).all()
+    assert not result["confidence"].any()
+
+
+def test_inherited_static_cores_survive_without_new_illumination():
+    pytest.importorskip("maxflow")
+    args = example()
+    result = complete_visible_shadow(*args)
+    np.testing.assert_array_equal(result["target"] == 1, args[1])
+    assert not result["expanded_mask"].any()
+
+
+def test_expansion_confidence_tracks_illumination_not_saturated_prior():
+    pytest.importorskip("maxflow")
+    args = example()
+    first = complete_visible_shadow(*args, illumination=illumination(args))
+    dim = illumination(args)
+    dim["score"] *= .25
+    second = complete_visible_shadow(*args, illumination=dim)
+    mask = first["expanded_mask"] & second["expanded_mask"]
+    assert mask.any()
+    np.testing.assert_allclose(second["confidence"][mask], first["confidence"][mask]*.25)
+
+
+def region_event(args):
+    shape = args[1].shape
+    seed = np.zeros(shape, bool)
+    seed[12:14, 12:14] = True
+    return {"qualified": seed, "score": seed.astype(np.float32)*.6,
+        "joint_onset": seed, "joint_recovery": np.zeros(shape, bool),
+        "anchor_available": np.ones(shape, bool), "correspondence_quality": np.ones(shape, np.float32)*.8,
+        "shadow_state_conflict": np.zeros(shape, np.float32)}
+
+
+def test_joint_events_can_complete_interiors_without_claiming_pixelwise_observations():
+    pytest.importorskip("maxflow")
+    args = example()
+    observed = region_event(args)
+    config = CompletionConfig(region_growth_radius_px_at_800=160)
+    result = complete_visible_shadow(*args, illumination=observed, config=config)
+    inferred = result["region_inferred_mask"]
+    assert inferred.any()
+    assert not (inferred & observed["qualified"]).any()
+    assert not (inferred & ~args[-1]).any()
+    assert (result["target"][inferred] == 1).all()
+    assert (result["confidence"][inferred] > 0).all()
+    assert result["confidence"][inferred].max() < .1
+    assert (result["candidate_source_bits"][inferred] & 64).all()
+
+
+@pytest.mark.parametrize("missing", ["joint_event", "visibility", "anchor", "physics"])
+def test_interior_inference_requires_connected_observed_support(missing):
+    pytest.importorskip("maxflow")
+    args = list(example())
+    observed = region_event(args)
+    if missing == "joint_event":
+        observed["joint_onset"][:] = False
+    elif missing == "visibility":
+        args[2][:] = False
+    elif missing == "anchor":
+        observed["anchor_available"][:] = False
+    else:
+        args[-1][:] = False
+    result = complete_visible_shadow(*args, illumination=observed, config=CompletionConfig(region_growth_radius_px_at_800=160))
+    assert not result["region_inferred_mask"].any()
+
+
+def test_region_inference_stops_at_color_and_occlusion_boundaries():
+    pytest.importorskip("maxflow")
+    args = list(example())
+    observed = region_event(args)
+    args[0][:, 20:] = 180
+    args[2][18:20] = False
+    result = complete_visible_shadow(*args, illumination=observed, config=CompletionConfig(region_growth_radius_px_at_800=400))
+    assert not result["region_inferred_mask"][:, 20:].any()
+    assert not result["region_inferred_mask"][18:].any()
 
 
 def test_prior_union_does_not_veto_existing_cross_space_proposals():
@@ -95,7 +186,8 @@ def test_prior_cache_checks_token_camera_time_rgb_and_response_hash(tmp_path):
     image = tmp_path/"image.png"
     checked_write_image(image, np.zeros((3, 4, 3), np.uint8))
     response = tmp_path/"frame.npz"
-    np.savez_compressed(response, binary_response=np.full((3, 4), 2., np.float32))
+    np.savez_compressed(response, binary_response=np.full((3, 4), 2., np.float32),
+                        semantic_probability=np.full((3, 4), .8, np.float32))
     row = {"frame_token": "frame", "scene_name": "scene", "camera": "front", "timestamp": 42,
         "image_sha256": digest(image), "response": response.name, "response_sha256": digest(response)}
     write_rows(tmp_path/"manifest.jsonl", [row])
@@ -103,6 +195,9 @@ def test_prior_cache_checks_token_camera_time_rgb_and_response_hash(tmp_path):
     frame = {"sample_data_token": "frame", "camera_timestamp": 42, "image_size_wh": [4, 3]}
     cache = ShadowPriorCache(tmp_path/"manifest.jsonl")
     assert (cache.load(frame, "scene", "front", image) == 1).all()  # Clip ReLU response, no sigmoid.
+    binary, semantic = cache.load(frame, "scene", "front", image, return_semantic=True)
+    assert (binary == 1).all()
+    np.testing.assert_allclose(semantic, .8)  # Already sigmoid; do not apply it twice.
     with pytest.raises(ValueError, match="identity/time"):
         cache.load(frame, "scene", "other", image)
     np.savez_compressed(response, binary_response=np.zeros((3, 4)))

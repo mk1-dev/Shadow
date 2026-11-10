@@ -19,13 +19,18 @@ ASSETS="${SHADOW_FSD_ASSETS:?}"
 export PYTHONPATH="$ASSETS/python_deps:${PYTHONPATH:-}"
 OUTPUT="${SHADOW_V9_OUTPUT:?Set a new output directory}"
 mkdir "$OUTPUT"
-python -u scripts/export_fsd_shadow_priors.py \
-  --pairs "${SHADOW_PAIRS:?}" --clips "${SHADOW_CLIPS:?}" \
-  --fsd-root "$ASSETS/source" --checkpoint "$ASSETS/FSD_best.ckpt" \
-  --output-root "$OUTPUT/prior" --max-width "${SHADOW_PRIOR_WIDTH:-800}"
+CORE="${SHADOW_CORE_REFERENCE:?Set the pre-FSD v8+ output root for these clips}"
+PRIOR="${SHADOW_PRIOR_MANIFEST:-}"
+if [[ -z "$PRIOR" ]]; then
+  python -u scripts/export_fsd_shadow_priors.py \
+    --pairs "${SHADOW_PAIRS:?}" --clips "${SHADOW_CLIPS:?}" \
+    --fsd-root "$ASSETS/source" --checkpoint "$ASSETS/FSD_best.ckpt" \
+    --output-root "$OUTPUT/prior" --max-width "${SHADOW_PRIOR_WIDTH:-800}"
+  PRIOR="$OUTPUT/prior/manifest.jsonl"
+fi
 python -u scripts/discover_shadow_video.py \
   --pairs "$SHADOW_PAIRS" --clips "$SHADOW_CLIPS" \
   --analysis-root "${SHADOW_FLOW_ROOT:?}" \
   --feature-root "${SHADOW_CONTEXT_BEV:?}" --spatial-feature-root "${SHADOW_SPATIAL_BEV:?}" \
-  --shadow-prior-manifest "$OUTPUT/prior/manifest.jsonl" \
+  --shadow-prior-manifest "$PRIOR" --core-reference-root "$CORE" \
   --output-root "$OUTPUT/discovery" --stage full --discovery-mode cross-space
