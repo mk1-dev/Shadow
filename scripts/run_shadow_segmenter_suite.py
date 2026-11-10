@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import statistics
 import subprocess
 import sys
 
@@ -28,6 +29,25 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
             raise ValueError("Aligned training manifests changed after suite preparation")
     if plan.get("init_checkpoint") and digest(plan["init_checkpoint"]) != plan["init_checkpoint_sha256"]:
         raise ValueError("Shared initialization checkpoint changed")
+    for path, expected in plan.get("source_suite_sha256", {}).items():
+        if digest(path) != expected:
+            raise ValueError("Source comparison suite changed")
+    if plan.get("binary_observations"):
+        checked = {}
+        def content_hash(path):
+            if path not in checked:
+                checked[path] = digest(path)
+            return checked[path]
+        for arm in plan["arms"]:
+            for split in ("train", "dev"):
+                expected = {row["id"]: row for row in plan["binary_observations"][split]}
+                rows = read_rows(arm[split])
+                if {row["id"] for row in rows} != expected.keys():
+                    raise ValueError("Paired binary observation IDs changed")
+                for row in rows:
+                    if (content_hash(row["target"]) != expected[row["id"]]["target_sha256"]
+                            or content_hash(row["image"]) != expected[row["id"]]["image_sha256"]):
+                        raise ValueError("Paired RGB/trimap contents changed")
     evaluation = []
     reference_kind = "manual" if ground_truth else "frozen-teacher"
     if ground_truth:
@@ -78,7 +98,9 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
     status["evaluation_reference_kind"] = reference_kind if evaluation else None
     status["is_true_shadow_accuracy"] = bool(evaluation) and reference_kind == "manual"
     evaluated = []
+    shared_initializations, paired_orders = {}, {}
     for arm in plan["arms"]:
+        settings = {**plan, **arm.get("training", {})}
         method, folder = arm["method"], output/arm["method"]
         if Path(method).name != method or method in {".", ".."} or "\\" in method:
             raise ValueError("Invalid method directory")
@@ -88,16 +110,33 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
         command += [str(repo/"scripts/train_shadow_segmenter.py"), "--train", arm["train"], "--dev", arm["dev"],
                     "--output-root", str(folder), "--allow-weak-labels", "--device", device]
         for field in ("epochs", "batch_size", "accumulation", "seed", "lr", "backbone_weights", "temporal_weight", "receiver_pair_weight", "weak_weight"):
-            command += ["--"+field.replace("_", "-"), str(plan[field])]
-        for field in ("scene_sampling", "pixel_balance", "dice_weight", "loss_mode", "selection_metric"):
-            if field in plan:
-                command += ["--"+field.replace("_", "-"), str(plan[field])]
+            command += ["--"+field.replace("_", "-"), str(settings[field])]
+        for field in ("scene_sampling", "pixel_balance", "dice_weight", "loss_mode", "selection_metric",
+                      "supervision_mode", "amp", "workers", "inherited_weight", "expanded_weight"):
+            if field in settings:
+                command += ["--"+field.replace("_", "-"), str(settings[field])]
+        if settings.get("deterministic"):
+            command += ["--deterministic"]
         for field in ("expansion_warmup_epochs", "expansion_ramp_epochs"):
-            if field in plan:
-                command += ["--"+field.replace("_", "-"), str(plan[field])]
+            if field in settings:
+                command += ["--"+field.replace("_", "-"), str(settings[field])]
         command += ["--size", *map(str, plan["size_hw"])]
-        if plan.get("init_checkpoint"):
-            command += ["--init-checkpoint", plan["init_checkpoint"]]
+        initialization = plan.get("init_checkpoint")
+        if plan.get("paired_initialization"):
+            import torch
+            from shadow_occ.annotation.segmentation import build_segmenter, model_state_sha256
+            from shadow_occ.utils.seed import seed_everything
+            seed = settings["seed"]
+            if seed not in shared_initializations:
+                seed_everything(seed)
+                initial = build_segmenter(settings["backbone_weights"])
+                initialization = output/f"initialization_seed_{seed}.pth"
+                torch.save({"model": initial.state_dict(), "train_scenes": [], "dev_scenes": []}, initialization)
+                shared_initializations[seed] = (str(initialization), model_state_sha256(initial))
+                del initial
+            initialization = shared_initializations[seed][0]
+        if initialization:
+            command += ["--init-checkpoint", str(initialization)]
         record = {"method": method, "train_command": command, "status": "training"}
         status["arms"].append(record)
         write_json(output/"suite_status.json", status)
@@ -110,6 +149,18 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
             write_json(output/"suite_status.json", status)
             continue
         record["status"] = "trained"
+        record["checkpoint_sha256"] = digest(folder/"best.pth")
+        if plan.get("paired_initialization"):
+            repro = json.loads((folder/"reproducibility.json").read_text(encoding="utf-8"))
+            if repro["initial_state_sha256"] != shared_initializations[settings["seed"]][1]:
+                raise ValueError("Paired arm did not load the shared model initialization")
+            history = json.loads((folder/"history.json").read_text(encoding="utf-8"))
+            order = [row["train_loss"]["sample_order_sha256"] for row in history]
+            if settings["seed"] in paired_orders and order != paired_orders[settings["seed"]]:
+                raise ValueError("Paired arms used different sample orders")
+            paired_orders[settings["seed"]] = order
+            record.update(seed=settings["seed"], initial_state_sha256=repro["initial_state_sha256"],
+                          sample_order_sha256=order)
         try:
             os.link(folder/"best.pth", folder/"checkpoint_best.pth")
         except OSError:
@@ -135,6 +186,28 @@ def run_suite(plan_path, output_root, ground_truth=None, gpus=1, device="cuda"):
                    "--reference-kind", reference_kind]
         result = subprocess.run(metrics, cwd=str(repo))
         status["metrics_exit_code"] = result.returncode
+        if result.returncode == 0 and plan.get("paired_initialization"):
+            results = json.loads((output/"metrics/metrics.json").read_text(encoding="utf-8"))["results"]
+            groups = {}
+            metadata = {arm["method"]: arm for arm in plan["arms"]}
+            for row in results:
+                arm = metadata[row["method"]]
+                whole = json.loads((output/(row["method"]+"_eval")/"full_image_summary.json").read_text(encoding="utf-8"))
+                groups.setdefault(arm["comparison_group"], []).append({"seed": arm["training"]["seed"],
+                    "balanced_accuracy": row["balanced_accuracy"], "negative_recall": row["negative_recall"],
+                    "iou": row["iou"], "auroc": row["score_diagnostics"]["approximate_auroc"],
+                    "full_image_fraction": whole["scene_macro_predicted_shadow_fraction"]})
+            summaries = {}
+            for group, rows in groups.items():
+                summaries[group] = {"seeds": rows, "metrics": {}}
+                for key in ("balanced_accuracy", "negative_recall", "iou", "auroc", "full_image_fraction"):
+                    values = [row[key] for row in rows if row[key] is not None]
+                    summaries[group]["metrics"][key] = {"n": len(values),
+                        "mean": statistics.mean(values) if values else None,
+                        "std": statistics.stdev(values) if len(values) > 1 else None,
+                        "min": min(values) if values else None, "max": max(values) if values else None}
+            write_json(output/"paired_seed_summary.json", {"groups": summaries,
+                "scope": "paired-seed teacher agreement, not true shadow accuracy"})
     status["all_arms_completed"] = all(row["status"] == ("inferred" if eval_path else "trained") for row in status["arms"])
     write_json(output/"suite_status.json", status)
     with (output/"training_status.csv").open("w", newline="", encoding="utf-8") as handle:

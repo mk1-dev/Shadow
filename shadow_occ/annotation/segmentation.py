@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import contextlib
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -146,7 +148,7 @@ class ShadowDataset(Dataset):
         negative_weight = float(row.get("negative_weight", 1.0))
         if not np.isfinite(negative_weight) or not 0 < negative_weight <= 1:
             raise ValueError("negative_weight must be in (0, 1]")
-        return {"image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"], "sample_weight": sample_weight,
+        return {"sample_id": str(row.get("id", row["image"])), "image": tensor(image), "previous_image": tensor(previous), "target": torch.from_numpy(target.astype(np.int64)), "temporal_grid": torch.from_numpy(grid), "temporal_weight": torch.from_numpy(weight), "source": row["label_source"], "sample_weight": sample_weight,
                 "negative_weight": negative_weight,
                 "supervision_tier": torch.from_numpy(tier), "pixel_confidence": torch.from_numpy(confidence),
                 "receiver_previous": tensor(receiver_previous), "receiver_next": tensor(receiver_next),
@@ -189,7 +191,7 @@ def set_segmenter_train_mode(model, freeze_backbone_stats=False):
                 module.eval()
 
 
-def class_balanced_masked_loss(logits, target, dice_weight, weights=None, negative_weights=None, *, return_components=False):
+def class_balanced_masked_loss(logits, target, dice_weight, weights=None, negative_weights=None, *, return_components=False, pixel_confidence=None):
     logits = logits[:, 0].float()
     truth = target == 1
     reliability = torch.ones_like(logits)
@@ -197,6 +199,8 @@ def class_balanced_masked_loss(logits, target, dice_weight, weights=None, negati
         reliability = reliability*weights.to(logits).reshape(-1, 1, 1)
     if negative_weights is not None:
         reliability = torch.where(target == 0, reliability*negative_weights.to(logits).reshape(-1, 1, 1), reliability)
+    if pixel_confidence is not None:
+        reliability = reliability*pixel_confidence.to(logits)
     bce_map = F.binary_cross_entropy_with_logits(logits, truth.float(), reduction="none")
     probability = logits.sigmoid()
     mass = [reliability*(target == value) for value in (0, 1)]
@@ -218,6 +222,35 @@ def class_balanced_masked_loss(logits, target, dice_weight, weights=None, negati
     dice = (1-.5*(positive_dice+negative_dice))*((negative_mass > 0) & (positive_mass > 0))
     loss = bce+dice_weight*dice
     return (loss, {"bce": bce, "dice": dice}) if return_components else loss
+
+
+def continuous_weighted_loss(logits, target, tier, confidence, dice_weight, weights=None,
+                             negative_weights=None, *, inherited_weight=.7, expanded_weight=.25):
+    """All non-conflicting positives retain region supervision.
+
+    Class normalization fixes positive/negative scale. Confidence changes relative
+    contributions within a class; it is not an extra class imbalance multiplier.
+    """
+    if not 0 < inherited_weight <= 1 or not 0 < expanded_weight <= 1:
+        raise ValueError("Continuous supervision weights must be in (0,1]")
+    coefficient = torch.ones_like(confidence, dtype=torch.float32)
+    coefficient = torch.where(tier == 4, inherited_weight, coefficient)
+    coefficient = torch.where(tier == 2, confidence.float().clamp(max=expanded_weight), coefficient)
+    coefficient = torch.where(target == 255, 0., coefficient)
+    loss, parts = class_balanced_masked_loss(logits, target, dice_weight, weights, negative_weights,
+        pixel_confidence=coefficient, return_components=True)
+    zero = loss.new_zeros(())
+    return loss, {**parts, "expansion": zero, "inherited": zero}
+
+
+def model_state_sha256(model):
+    value = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        array = tensor.detach().cpu().contiguous().numpy()
+        value.update(name.encode())
+        value.update(str((array.shape, array.dtype)).encode())
+        value.update(array.tobytes())
+    return value.hexdigest()
 
 
 def masked_loss(logits, target, dice_weight, weights=None, class_weights=None, negative_weights=None, *, return_components=False, objective="legacy"):
@@ -364,6 +397,11 @@ def train_main():
                         help="Inverse-frequency weighting for the legacy objective only")
     parser.add_argument("--scene-sampling", choices=["image", "uniform", "supervision"], default="image")
     parser.add_argument("--loss-mode", choices=["class-balanced", "legacy"], default="class-balanced")
+    parser.add_argument("--supervision-mode", choices=["v93", "v94", "continuous"], default="v94")
+    parser.add_argument("--inherited-weight", type=float, default=.7)
+    parser.add_argument("--expanded-weight", type=float, default=.25)
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--amp", choices=["auto", "off"], default="auto")
     parser.add_argument("--selection-metric", choices=["balanced_accuracy", "mean_iou", "iou"], default="balanced_accuracy")
     parser.add_argument("--positive-only-ablation", action="store_true",
                         help="Run the positive-only training control against unchanged two-class dev labels")
@@ -379,6 +417,12 @@ def train_main():
     parser.add_argument("--backbone-weights", choices=["none", "imagenet"], default="imagenet")
     parser.add_argument("--init-checkpoint", help="Optional segmenter checkpoint for pretraining -> adaptation")
     args = parser.parse_args()
+    if not 0 < args.inherited_weight <= 1 or not 0 < args.expanded_weight <= 1:
+        raise ValueError("Continuous supervision weights must be in (0,1]")
+    if args.supervision_mode == "continuous" and args.loss_mode != "class-balanced":
+        raise ValueError("Continuous confidence uses the class-balanced objective")
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     if min(args.epochs, args.batch_size, args.accumulation, *args.size) < 1:
         raise ValueError("epochs, batch-size and accumulation must be positive")
     if args.expansion_warmup_epochs < 0 or args.expansion_ramp_epochs < 1:
@@ -456,7 +500,11 @@ def train_main():
     device = torch.device("cuda", local) if args.device == "cuda" else torch.device("cpu")
     if world > 1:
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
-    seed_everything(args.seed)
+    seed_everything(args.seed, deterministic=args.deterministic)
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     output = Path(args.output_root)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new output root")
@@ -484,27 +532,39 @@ def train_main():
         dist.barrier()
     sampler = (SceneBalancedSampler(train, args.seed, rank, world, args.scene_sampling) if args.scene_sampling in {"uniform", "supervision"}
                else DistributedSampler(ShadowDataset(train, args.size), seed=args.seed) if world > 1 else None)
-    loader = DataLoader(ShadowDataset(train, args.size, augment=True, receiver_pairs=args.receiver_pair_weight > 0), batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=device.type == "cuda")
+    loader = DataLoader(ShadowDataset(train, args.size, augment=True, receiver_pairs=args.receiver_pair_weight > 0), batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, num_workers=args.workers, worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(args.seed), pin_memory=device.type == "cuda")
     model = build_segmenter(None if initial_checkpoint is not None else args.backbone_weights).to(device)
     if initial_checkpoint is not None:
         model.load_state_dict(initial_checkpoint["model"])
         del initial_checkpoint
+    initial_state_sha = model_state_sha256(model)
+    if rank == 0:
+        write_json(output/"reproducibility.json", {"initial_state_sha256": initial_state_sha,
+            "seed": args.seed, "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "amp": args.amp, "torch": torch.__version__, "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(), "workers": args.workers,
+            "loader_generator_seed": args.seed, "device": str(device),
+            "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"})
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     if world > 1:
         model = DistributedDataParallel(model, device_ids=[local] if device.type == "cuda" else None)
-    amp = device.type == "cuda"
+    amp = device.type == "cuda" and args.amp != "off"
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     history, best = [], -1.0
     for epoch in range(args.epochs):
+        sample_order = hashlib.sha256()
         if sampler is not None:
             sampler.set_epoch(epoch)
         set_segmenter_train_mode(model, freeze_backbone_stats=args.backbone_weights == "imagenet")
         optimizer.zero_grad(set_to_none=True)
         pair_weight_sum, pair_loss_sum, pair_batches = 0.0, 0.0, 0
         train_totals = torch.zeros(8, device=device, dtype=torch.float64)
-        expansion_scale = min(1., max(0., (epoch-args.expansion_warmup_epochs+1)/args.expansion_ramp_epochs))
+        expansion_scale = (1. if args.supervision_mode == "continuous" else
+            min(1., max(0., (epoch-args.expansion_warmup_epochs+1)/args.expansion_ramp_epochs)))
         optimizer_totals = torch.zeros(3, device=device, dtype=torch.float64)
         for step, batch in enumerate(tqdm(loader, desc=f"segmenter epoch {epoch}", disable=rank != 0)):
+            sample_order.update((json.dumps(batch["sample_id"])+"\n").encode())
             start = (step//args.accumulation)*args.accumulation
             window = min(args.accumulation, len(loader)-start)
             boundary = (step+1) % args.accumulation == 0 or step+1 == len(loader)
@@ -524,9 +584,18 @@ def train_main():
                     logits = predictions[:images.shape[0]]
                     weights = torch.tensor([args.weak_weight if source in WEAK_SOURCES else 1.0 for source in batch["source"]], device=device)
                     weights = weights*batch["sample_weight"].to(device)
-                    loss, terms = layered_masked_loss(logits, batch["target"].to(device), batch["supervision_tier"].to(device),
-                        batch["pixel_confidence"].to(device), args.dice_weight, weights, pixel_weights,
-                        batch["negative_weight"].to(device), expansion_scale=expansion_scale, objective=args.loss_mode)
+                    target, tier = batch["target"].to(device), batch["supervision_tier"].to(device)
+                    if args.supervision_mode == "continuous":
+                        loss, terms = continuous_weighted_loss(logits, target, tier,
+                            batch["pixel_confidence"].to(device), args.dice_weight, weights,
+                            batch["negative_weight"].to(device), inherited_weight=args.inherited_weight,
+                            expanded_weight=args.expanded_weight)
+                    else:
+                        if args.supervision_mode == "v93":
+                            tier = torch.where(tier == 4, 1, tier)
+                        loss, terms = layered_masked_loss(logits, target, tier,
+                            batch["pixel_confidence"].to(device), args.dice_weight, weights, pixel_weights,
+                            batch["negative_weight"].to(device), expansion_scale=expansion_scale, objective=args.loss_mode)
                     temporal_value, pair_value = loss.new_zeros(()), loss.new_zeros(())
                     if use_temporal:
                         previous = predictions[images.shape[0]:2*images.shape[0]]
@@ -551,6 +620,8 @@ def train_main():
             if boundary:
                 scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if not amp and not torch.isfinite(gradient_norm):
+                    raise FloatingPointError("Nonfinite FP32 gradients; refusing to update model weights")
                 previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
@@ -569,6 +640,8 @@ def train_main():
         train_metrics = {name: totals[index]/totals[5] if totals[5] else None
             for index, name in enumerate(("total", "bce", "dice", "temporal", "receiver_pair"))}
         train_metrics.update(images=int(totals[5]), dice_weight=args.dice_weight,
+            sample_order_sha256=sample_order.hexdigest(), initial_state_sha256=initial_state_sha,
+            supervision_mode=args.supervision_mode,
             expansion_loss=totals[6]/max(totals[5], 1), expansion_scale=expansion_scale,
             inherited_weak_loss=totals[7]/max(totals[5], 1),
             temporal_weight=args.temporal_weight, receiver_pair_weight=args.receiver_pair_weight,
@@ -606,7 +679,7 @@ def train_main():
         raise RuntimeError("All segmenter checkpoints failed non-collapse checks; last.pth is diagnostic only, no best.pth exported")
 
 
-def predict_main():
+def predict_main(argv=None):
     parser = argparse.ArgumentParser("Predict pixel masks and evaluate by label provenance.")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -616,7 +689,7 @@ def predict_main():
     parser.add_argument("--allow-train-scenes", action="store_true", help="Explicit in-sample annotation, not held-out evaluation")
     parser.add_argument("--diagnostics-only", action="store_true", help="Inspect collapsed/legacy models; outputs are quarantined from relabeling")
     parser.add_argument("--review-images-per-scene", type=int, default=3)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     rows = read_rows(args.manifest)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     readiness = require_segmenter_checkpoint(checkpoint, args.diagnostics_only)
